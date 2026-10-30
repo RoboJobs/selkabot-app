@@ -1,5 +1,6 @@
 *.mp4
 sw/__pycache__/*
+sw/tests/__pycache__/*
 # Codev
 .agent-farm/
 .consult/

@@ -8,9 +8,15 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from frame_interpolator import FrameInterpolator
+
 ZOOMED_FRAME_RATIO = 0.7
 ZOOM_RATIO = 0.6
 ZOOM_TRANSITION_RATIO = 0.05
+
+INTERPOLATION_START = 0.1
+INTERPOLATION_END = 0.9
+INTERPOLATION_N = 4
 
 
 def iter_video_paths(input_dir: Path) -> list[Path]:
@@ -80,7 +86,9 @@ def enqueue_videos(
     video_paths: Iterable[Path],
     output_queue: mp.Queue,
 ) -> None:
-    """Read frames from videos, apply zoom effect, and enqueue them for inference."""
+    """Read frames from videos, apply zoom effect and interpolation, and enqueue them."""
+    interpolator = FrameInterpolator(n_interpolated_frames=INTERPOLATION_N)
+
     for video_path in video_paths:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -95,13 +103,19 @@ def enqueue_videos(
             ZOOM_TRANSITION_RATIO,
         )
 
+        interp_start_idx = int(total_frames * INTERPOLATION_START)
+        interp_end_idx = int(total_frames * INTERPOLATION_END)
+
         frame_idx = 0
+        output_idx = 0
+        prev_frame: np.ndarray | None = None
+
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             height, width = frame.shape[:2]
-            print(f"{video_path.name} frame {frame_idx}: {width}x{height}")
+            print("Processing: ", frame_idx)
 
             zoom_value = zoomed_map.get(frame_idx)
             if zoom_value is not None and zoom_value < 1.0:
@@ -114,7 +128,23 @@ def enqueue_videos(
                 frame = crop_and_resize(
                     frame, (crop_h, crop_w), (start_row, start_col))
 
-            output_queue.put((video_path.name, frame_idx, frame))
+            # Pair-based interpolation: interpolate (prev, current) when both
+            # fall within the interpolation window.
+            if (
+                prev_frame is not None
+                and (frame_idx - 1) >= interp_start_idx
+                and frame_idx <= interp_end_idx
+            ):
+                interp_frames = interpolator.interpolate(prev_frame, frame)
+                for interp_frame in interp_frames:
+                    output_queue.put(
+                        (video_path.name, output_idx, interp_frame, True)
+                    )
+                    output_idx += 1
+
+            output_queue.put((video_path.name, output_idx, frame, False))
+            output_idx += 1
+            prev_frame = frame
             frame_idx += 1
 
         cap.release()
@@ -174,7 +204,7 @@ def draw_person_masks(
 
 async def inference_loop(
     input_queue: mp.Queue,
-    output_queue: mp.Queue,
+    output_queues: list[mp.Queue],
     model_path: str,
 ) -> None:
     """Run YOLO inference on frames and forward person masks."""
@@ -184,14 +214,23 @@ async def inference_loop(
     while True:
         item = await asyncio.to_thread(input_queue.get)
         if item is None:
-            await asyncio.to_thread(output_queue.put, None)
+            # Signal termination to all downstream consumers (display, writer)
+            for q in output_queues:
+                await asyncio.to_thread(q.put, None)
             break
 
-        video_name, frame_idx, frame = item
-        results = model.predict(frame, verbose=False)
-        result = results[0]
-        masks = extract_person_masks(result, person_class_id)
-        await asyncio.to_thread(output_queue.put, (video_name, frame_idx, frame, masks))
+        video_name, output_idx, frame, is_interpolated = item
+
+        if is_interpolated:
+            masks: list[np.ndarray] = []
+        else:
+            results = model.predict(frame, verbose=False)
+            result = results[0]
+            masks = extract_person_masks(result, person_class_id)
+
+        # Fan out: each consumer gets its own copy of the result
+        for q in output_queues:
+            await asyncio.to_thread(q.put, (video_name, output_idx, frame, masks))
 
 
 async def display_loop(output_queue: mp.Queue, window_name: str) -> None:
@@ -211,18 +250,63 @@ async def display_loop(output_queue: mp.Queue, window_name: str) -> None:
     cv2.destroyAllWindows()
 
 
+async def video_writer_loop(
+    writer_queue: mp.Queue,
+    input_dir: Path,
+    fps: float = 30.0,
+) -> None:
+    """Write annotated frames to mp4 video files."""
+    current_video_name: str | None = None
+    writer: cv2.VideoWriter | None = None
+
+    while True:
+        item = await asyncio.to_thread(writer_queue.get)
+        if item is None:
+            break
+
+        video_name, _, frame, masks = item
+        annotated = frame # draw_person_masks(frame, masks)
+
+        # New video detected: close previous writer and open a new one
+        if video_name != current_video_name:
+            if writer is not None:
+                writer.release()
+            current_video_name = video_name
+            stem = Path(video_name).stem
+            output_path = input_dir / f"{stem}_post.mp4"
+            h, w = annotated.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+            print(f"Writing output video: {output_path}")
+
+        writer.write(annotated)
+
+    # Release the last writer when the queue is drained
+    if writer is not None:
+        writer.release()
+
+
 def run_inference_process(
     input_queue: mp.Queue,
-    output_queue: mp.Queue,
+    output_queues: list[mp.Queue],
     model_path: str,
 ) -> None:
     """Entry point for the inference process."""
-    asyncio.run(inference_loop(input_queue, output_queue, model_path))
+    asyncio.run(inference_loop(input_queue, output_queues, model_path))
 
 
 def run_display_process(output_queue: mp.Queue, window_name: str) -> None:
     """Entry point for the display process."""
     asyncio.run(display_loop(output_queue, window_name))
+
+
+def run_video_writer_process(
+    writer_queue: mp.Queue,
+    input_dir: Path,
+    fps: float = 30.0,
+) -> None:
+    """Entry point for the video writer process."""
+    asyncio.run(video_writer_loop(writer_queue, input_dir, fps))
 
 
 def main() -> None:
@@ -262,27 +346,37 @@ def main() -> None:
 
     mp.set_start_method("spawn", force=True)
 
+    # Pipeline: enqueue_videos -> inference -> [display, writer]
     input_queue = mp.Queue(maxsize=args.queue_size)
-    output_queue = mp.Queue(maxsize=args.queue_size)
+    display_queue = mp.Queue(maxsize=args.queue_size)
+    writer_queue = mp.Queue(maxsize=args.queue_size)
 
+    # Inference fans out to both display and video writer queues
     inference_process = mp.Process(
         target=run_inference_process,
-        args=(input_queue, output_queue, args.model),
+        args=(input_queue, [display_queue, writer_queue], args.model),
         daemon=True,
     )
     display_process = mp.Process(
         target=run_display_process,
-        args=(output_queue, args.window_name),
+        args=(display_queue, args.window_name),
+        daemon=True,
+    )
+    video_writer_process = mp.Process(
+        target=run_video_writer_process,
+        args=(writer_queue, args.input_dir),
         daemon=True,
     )
 
     inference_process.start()
     display_process.start()
+    video_writer_process.start()
 
     enqueue_videos(video_paths, input_queue)
 
     inference_process.join()
     display_process.join()
+    video_writer_process.join()
 
 
 if __name__ == "__main__":
