@@ -40,6 +40,7 @@ import threading
 import time
 import tkinter as tk
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import ttk
@@ -51,6 +52,9 @@ from open_gopro import WiredGoPro
 from open_gopro.models import constants, proto
 from open_gopro.models.constants import settings
 from PIL import Image, ImageTk
+
+from sw.uploader import make_qr, upload_video
+from sw.watermark import add_watermark
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,15 @@ FPS = settings.FramesPerSecond.NUM_60_0
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "videos"
 DISPLAY_WIDTH = 960
 KEEP_ALIVE_PERIOD_S = 3.0
+
+
+@dataclass
+class Shared:
+    """A downloaded clip after watermarking, upload and QR code creation."""
+
+    video: Path
+    url: str
+    qr: Path
 
 
 class PreviewReader:
@@ -183,17 +196,31 @@ class GoProController:
         await self._start_preview()
         return new_files
 
-    async def download(self, camera_files: list[str], progress: Callable[[str], None]) -> list[Path]:
-        """Download camera files into output_dir with timestamped names."""
+    async def download(self, camera_files: list[str], progress: Callable[[str], None]) -> list[Shared]:
+        """Download, watermark, upload and make a QR code for each camera file.
+
+        The original download is kept as `<name>_original.mp4`; the watermarked
+        copy is `<name>.mp4` and is the one uploaded.
+        """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        saved: list[Path] = []
+        shared: list[Shared] = []
         for i, camera_file in enumerate(camera_files, start=1):
-            progress(f"Downloading {camera_file} ({i}/{len(camera_files)})…")
-            local_file = self.output_dir / f"{stamp}_{Path(camera_file).stem}.mp4"
-            _check(await self.gopro.http_command.download_file(camera_file=camera_file, local_file=local_file))
-            saved.append(local_file)
-        return saved
+            label = f"({i}/{len(camera_files)})"
+            base = f"{stamp}_{Path(camera_file).stem}"
+            original = self.output_dir / f"{base}_original.mp4"
+            watermarked = self.output_dir / f"{base}.mp4"
+            qr_file = self.output_dir / f"{base}_qr.png"
+
+            progress(f"Downloading {camera_file} {label}…")
+            _check(await self.gopro.http_command.download_file(camera_file=camera_file, local_file=original))
+            progress(f"Adding watermark {label}…")
+            await asyncio.to_thread(add_watermark, original, watermarked)
+            progress(f"Uploading {watermarked.name} {label}…")
+            url = await asyncio.to_thread(upload_video, watermarked)
+            await asyncio.to_thread(make_qr, url, qr_file)
+            shared.append(Shared(video=watermarked, url=url, qr=qr_file))
+        return shared
 
     async def shutdown(self) -> None:
         """Stop any recording, the preview stream and the loop."""
@@ -370,8 +397,10 @@ class LivestreamApp:
         def progress(message: str) -> None:
             self._events.put(lambda: self.status.set(message))
 
-        def done(saved: list[Path]) -> None:
-            self.status.set("Saved " + ", ".join(str(p) for p in saved))
+        def done(shared: list[Shared]) -> None:
+            self.status.set("Ready: " + "  ".join(item.url for item in shared))
+            for item in shared:
+                logger.info("Video %s available at %s (QR: %s)", item.video, item.url, item.qr)
 
         self._run(
             self.controller.download(camera_files, progress),

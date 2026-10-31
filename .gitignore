@@ -7,3 +7,4 @@ sw/tests/__pycache__/*
 codev/.update-hashes.json
 .builders/
 *.FCBak
+.env
