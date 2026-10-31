@@ -282,6 +282,7 @@ class LivestreamApp:
         self._record_started = 0.0
         self._photo: ImageTk.PhotoImage | None = None
         self._last_frame: Any = None
+        self._qr_window: tk.Toplevel | None = None
 
         root.title("GoPro Livestream")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -401,6 +402,8 @@ class LivestreamApp:
             self.status.set("Ready: " + "  ".join(item.url for item in shared))
             for item in shared:
                 logger.info("Video %s available at %s (QR: %s)", item.video, item.url, item.qr)
+            if shared:
+                self._open_qr_window(shared[-1])
 
         self._run(
             self.controller.download(camera_files, progress),
@@ -445,6 +448,19 @@ class LivestreamApp:
         image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         self._photo = ImageTk.PhotoImage(image)  # Keep a reference or Tk drops the image
         self.video.config(image=self._photo, text="")
+
+    def _open_qr_window(self, item: Shared) -> None:
+        """Show the QR code for a clip in its own window, until the user closes it."""
+        if self._qr_window is not None and self._qr_window.winfo_exists():
+            self._qr_window.destroy()
+        window = tk.Toplevel(self.root)
+        window.title("QR code")
+        image = ImageTk.PhotoImage(Image.open(item.qr).convert("RGB"))
+        label = tk.Label(window, image=image, bg="white")
+        label.image = image  # Keep a reference or Tk drops the image
+        label.pack(padx=16, pady=(16, 8))
+        tk.Label(window, text=item.url, wraplength=420, justify="center").pack(padx=16, pady=(0, 16))
+        self._qr_window = window
 
     def _show_message(self, text: str, color: tuple[int, int, int] = (220, 220, 220)) -> None:
         """Show text over the dimmed last frame, or a black frame if there is none yet."""
