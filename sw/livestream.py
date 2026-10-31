@@ -25,7 +25,7 @@ Notes:
   available on WiredGoPro, so the HTTP preview command is used directly.
 
 Usage:
-    uv run python -m sw.livestream [--output-dir videos] [--port 8554]
+    uv run python -m sw.livestream [--output-dir videos] [--port 8554] [--no-upload]
 """
 
 from __future__ import annotations
@@ -81,8 +81,8 @@ class Shared:
     """A downloaded clip after watermarking, upload and QR code creation."""
 
     video: Path
-    url: str
-    qr: Path
+    url: str | None = None  # None when uploading is disabled
+    qr: Path | None = None
 
 
 class PreviewReader:
@@ -129,10 +129,11 @@ class PreviewReader:
 class GoProController:
     """Runs all camera operations on a dedicated asyncio event loop thread."""
 
-    def __init__(self, output_dir: Path, port: int, serial: str | None) -> None:
+    def __init__(self, output_dir: Path, port: int, serial: str | None, upload: bool = True) -> None:
         self.output_dir = output_dir
         self.port = port
         self._serial = serial
+        self.upload = upload
         self._gopro: WiredGoPro | None = None
         self._media_before: set[str] = set()
         self._recording = False
@@ -197,7 +198,7 @@ class GoProController:
         return new_files
 
     async def download(self, camera_files: list[str], progress: Callable[[str], None]) -> list[Shared]:
-        """Download, watermark, upload and make a QR code for each camera file.
+        """Download, watermark, and (if enabled) upload and make a QR code for each camera file.
 
         The original download is kept as `<name>_original.mp4`; the watermarked
         copy is `<name>.mp4` and is the one uploaded.
@@ -216,6 +217,9 @@ class GoProController:
             _check(await self.gopro.http_command.download_file(camera_file=camera_file, local_file=original))
             progress(f"Adding watermark {label}…")
             await asyncio.to_thread(add_watermark, original, watermarked)
+            if not self.upload:
+                shared.append(Shared(video=watermarked))
+                continue
             progress(f"Uploading {watermarked.name} {label}…")
             url = await asyncio.to_thread(upload_video, watermarked)
             await asyncio.to_thread(make_qr, url, qr_file)
@@ -399,11 +403,16 @@ class LivestreamApp:
             self._events.put(lambda: self.status.set(message))
 
         def done(shared: list[Shared]) -> None:
-            self.status.set("Ready: " + "  ".join(item.url for item in shared))
-            for item in shared:
-                logger.info("Video %s available at %s (QR: %s)", item.video, item.url, item.qr)
-            if shared:
-                self._open_qr_window(shared[-1])
+            if self.controller.upload:
+                self.status.set("Ready: " + "  ".join(item.url for item in shared))
+                for item in shared:
+                    logger.info("Video %s available at %s (QR: %s)", item.video, item.url, item.qr)
+                if shared:
+                    self._open_qr_window(shared[-1])
+            else:
+                self.status.set("Saved: " + "  ".join(item.video.name for item in shared))
+                for item in shared:
+                    logger.info("Video saved to %s (upload disabled)", item.video)
 
         self._run(
             self.controller.download(camera_files, progress),
@@ -498,6 +507,9 @@ def main() -> None:
     parser.add_argument(
         "--serial", default=None, help="Camera serial number. Auto-discovered via mDNS if not set"
     )
+    parser.add_argument(
+        "--no-upload", action="store_true", help="Only download and watermark; skip the upload and QR code"
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -509,7 +521,7 @@ def main() -> None:
     logging.getLogger("open_gopro").setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
     root = tk.Tk()
-    LivestreamApp(root, GoProController(args.output_dir, args.port, args.serial))
+    LivestreamApp(root, GoProController(args.output_dir, args.port, args.serial, upload=not args.no_upload))
     root.mainloop()
 
 
