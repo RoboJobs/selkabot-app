@@ -56,6 +56,7 @@ from open_gopro.models import constants, proto
 from open_gopro.models.constants import settings
 from PIL import Image, ImageTk
 
+from sw.sync_uploads import sync_uploads
 from sw.uploader import make_qr, public_url, upload_video
 from sw.watermark import add_watermark
 
@@ -118,36 +119,46 @@ class PostProcessor:
         self._on_ready = on_ready
         self._on_done = on_done
         self._on_error = on_error
-        self._jobs: queue.Queue[Clip | None] = queue.Queue()
-        # Not a daemon thread: the process waits for queued clips to finish before exiting.
+        self._jobs: queue.Queue[Callable[[], Any] | None] = queue.Queue()
+        # Not a daemon thread: the process waits for queued jobs to finish before exiting.
         self._thread = threading.Thread(target=self._run, name="postprocess")
         self._thread.start()
 
     def submit(self, clip: Clip) -> None:
-        self._jobs.put(clip)
+        self._jobs.put(functools.partial(self._process, clip))
+
+    def submit_job(self, job: Callable[[], Any]) -> None:
+        """Run `job` on the worker, after the jobs already queued."""
+        self._jobs.put(job)
 
     def stop(self) -> None:
-        """Queue a stop after the clips already submitted. Returns without waiting for them."""
-        logger.info("Finishing %d queued clip(s) before exiting", self._jobs.qsize())
+        """Queue a stop after the jobs already submitted. Returns without waiting for them."""
+        logger.info("Finishing %d queued job(s) before exiting", self._jobs.qsize())
         self._jobs.put(None)
 
     def _run(self) -> None:
-        while (clip := self._jobs.get()) is not None:
+        while (job := self._jobs.get()) is not None:
             try:
-                add_watermark(clip.original, clip.watermarked)
-                shared = Shared(video=clip.watermarked)
-                if self.upload:
-                    # The URL is known before the upload, so the QR code can be shown while it runs.
-                    url = public_url(clip.watermarked)
-                    make_qr(url, clip.qr_file)
-                    shared = Shared(video=clip.watermarked, url=url, qr=clip.qr_file)
-                    self._events.put(functools.partial(self._on_ready, shared))
-                    upload_video(clip.watermarked)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.exception("Post-processing %s failed", clip.original)
-                self._events.put(functools.partial(self._on_error, clip, e))
-            else:
-                self._events.put(functools.partial(self._on_done, shared))
+                job()
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("Background job failed")
+
+    def _process(self, clip: Clip) -> None:
+        try:
+            add_watermark(clip.original, clip.watermarked)
+            shared = Shared(video=clip.watermarked)
+            if self.upload:
+                # The URL is known before the upload, so the QR code can be shown while it runs.
+                url = public_url(clip.watermarked)
+                make_qr(url, clip.qr_file)
+                shared = Shared(video=clip.watermarked, url=url, qr=clip.qr_file)
+                self._events.put(functools.partial(self._on_ready, shared))
+                upload_video(clip.watermarked)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.exception("Post-processing %s failed", clip.original)
+            self._events.put(functools.partial(self._on_error, clip, e))
+        else:
+            self._events.put(functools.partial(self._on_done, shared))
 
 
 class PreviewReader:
@@ -265,7 +276,7 @@ class GoProController:
         """Download each camera file and return the clips to post-process.
 
         The original download is kept as `<name>_original.mp4`; the watermarked
-        copy is `<name>.mp4`, written later by the PostProcessor.
+        copy is `<name>_watermarked.mp4`, written later by the PostProcessor.
         """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -274,7 +285,7 @@ class GoProController:
             label = f"({i}/{len(camera_files)})"
             base = f"{stamp}_{Path(camera_file).stem}"
             original = self.output_dir / f"{base}_original.mp4"
-            watermarked = self.output_dir / f"{base}.mp4"
+            watermarked = self.output_dir / f"{base}_watermarked.mp4"
             qr_file = self.output_dir / f"{base}_qr.png"
 
             progress(f"Downloading {camera_file} {label}…")
@@ -340,6 +351,8 @@ class LivestreamApp:
         self.postprocessor = PostProcessor(
             upload, self._events, self._on_ready, self._on_processed, self._on_process_error
         )
+        # Check the bucket on startup; uploads it finds missing go through the same queue.
+        self.postprocessor.submit_job(functools.partial(sync_uploads, controller.output_dir, upload))
         self._recording = False
         self._busy = True  # Connecting
         self._record_started = 0.0
