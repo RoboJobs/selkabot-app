@@ -1,0 +1,4 @@
+[submodule "shotcut-mcp"]
+	path = shotcut-mcp
+	url = https://github.com/matrodrigs/shotcut-mcp.git
+	branch = main
