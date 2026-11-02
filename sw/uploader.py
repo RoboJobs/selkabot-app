@@ -29,17 +29,21 @@ def _client():
     )
 
 
-def upload_video(local_file: Path) -> str:
-    """Upload a file to the R2 bucket and return its public URL."""
+def public_url(local_file: Path) -> str:
+    """Return the public URL that `upload_video` will give `local_file`. Known before uploading."""
     load_dotenv(ENV_FILE)
-    key = local_file.name
+    return f"{os.environ['R2_PUBLIC_BASE_URL'].rstrip('/')}/{quote(local_file.name)}"
+
+
+def upload_video(local_file: Path) -> None:
+    """Upload a file to the R2 bucket, under the key that `public_url` gives it."""
+    load_dotenv(ENV_FILE)
     _client().upload_file(
         str(local_file),
         os.environ["R2_BUCKET"],
-        key,
+        local_file.name,
         ExtraArgs={"ContentType": "video/mp4", "ContentDisposition": "attachment"},
     )
-    return f"{os.environ['R2_PUBLIC_BASE_URL'].rstrip('/')}/{quote(key)}"
 
 
 def make_qr(url: str, output: Path) -> Path:

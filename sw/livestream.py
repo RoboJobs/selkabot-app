@@ -9,6 +9,8 @@ computer as soon as recording stops.
 Threading model:
 - Main thread: Tkinter UI. Only this thread touches widgets.
 - Asyncio thread: owns the WiredGoPro client; all camera commands run here.
+- Post-process thread: watermarks (and optionally uploads) clips one at a time,
+  in the order they were downloaded, so the camera is free to record meanwhile.
 - Frame thread: reads the UDP preview stream with OpenCV, keeps latest frame.
 Results from the asyncio thread reach the UI through a queue polled by Tk.
 
@@ -33,6 +35,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import functools
 import logging
 import os
 import queue
@@ -53,7 +56,7 @@ from open_gopro.models import constants, proto
 from open_gopro.models.constants import settings
 from PIL import Image, ImageTk
 
-from sw.uploader import make_qr, upload_video
+from sw.uploader import make_qr, public_url, upload_video
 from sw.watermark import add_watermark
 
 logger = logging.getLogger(__name__)
@@ -83,6 +86,68 @@ class Shared:
     video: Path
     url: str | None = None  # None when uploading is disabled
     qr: Path | None = None
+
+
+@dataclass
+class Clip:
+    """A downloaded original waiting to be watermarked."""
+
+    original: Path
+    watermarked: Path
+    qr_file: Path
+
+
+class PostProcessor:
+    """Watermarks, and optionally uploads, clips one at a time on a background thread.
+
+    Clips are handled in the order they were submitted, so recording and downloading
+    can continue while earlier clips are still being processed. Results reach the
+    UI through `events`, so the callbacks run on the Tk thread.
+    """
+
+    def __init__(
+        self,
+        upload: bool,
+        events: queue.Queue[Callable[[], None]],
+        on_ready: Callable[[Shared], None],
+        on_done: Callable[[Shared], None],
+        on_error: Callable[[Clip, Exception], None],
+    ) -> None:
+        self.upload = upload
+        self._events = events
+        self._on_ready = on_ready
+        self._on_done = on_done
+        self._on_error = on_error
+        self._jobs: queue.Queue[Clip | None] = queue.Queue()
+        # Not a daemon thread: the process waits for queued clips to finish before exiting.
+        self._thread = threading.Thread(target=self._run, name="postprocess")
+        self._thread.start()
+
+    def submit(self, clip: Clip) -> None:
+        self._jobs.put(clip)
+
+    def stop(self) -> None:
+        """Queue a stop after the clips already submitted. Returns without waiting for them."""
+        logger.info("Finishing %d queued clip(s) before exiting", self._jobs.qsize())
+        self._jobs.put(None)
+
+    def _run(self) -> None:
+        while (clip := self._jobs.get()) is not None:
+            try:
+                add_watermark(clip.original, clip.watermarked)
+                shared = Shared(video=clip.watermarked)
+                if self.upload:
+                    # The URL is known before the upload, so the QR code can be shown while it runs.
+                    url = public_url(clip.watermarked)
+                    make_qr(url, clip.qr_file)
+                    shared = Shared(video=clip.watermarked, url=url, qr=clip.qr_file)
+                    self._events.put(functools.partial(self._on_ready, shared))
+                    upload_video(clip.watermarked)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.exception("Post-processing %s failed", clip.original)
+                self._events.put(functools.partial(self._on_error, clip, e))
+            else:
+                self._events.put(functools.partial(self._on_done, shared))
 
 
 class PreviewReader:
@@ -129,11 +194,10 @@ class PreviewReader:
 class GoProController:
     """Runs all camera operations on a dedicated asyncio event loop thread."""
 
-    def __init__(self, output_dir: Path, port: int, serial: str | None, upload: bool = True) -> None:
+    def __init__(self, output_dir: Path, port: int, serial: str | None) -> None:
         self.output_dir = output_dir
         self.port = port
         self._serial = serial
-        self.upload = upload
         self._gopro: WiredGoPro | None = None
         self._media_before: set[str] = set()
         self._recording = False
@@ -197,15 +261,15 @@ class GoProController:
         await self._start_preview()
         return new_files
 
-    async def download(self, camera_files: list[str], progress: Callable[[str], None]) -> list[Shared]:
-        """Download, watermark, and (if enabled) upload and make a QR code for each camera file.
+    async def download(self, camera_files: list[str], progress: Callable[[str], None]) -> list[Clip]:
+        """Download each camera file and return the clips to post-process.
 
         The original download is kept as `<name>_original.mp4`; the watermarked
-        copy is `<name>.mp4` and is the one uploaded.
+        copy is `<name>.mp4`, written later by the PostProcessor.
         """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        shared: list[Shared] = []
+        clips: list[Clip] = []
         for i, camera_file in enumerate(camera_files, start=1):
             label = f"({i}/{len(camera_files)})"
             base = f"{stamp}_{Path(camera_file).stem}"
@@ -215,16 +279,8 @@ class GoProController:
 
             progress(f"Downloading {camera_file} {label}…")
             _check(await self.gopro.http_command.download_file(camera_file=camera_file, local_file=original))
-            progress(f"Adding watermark {label}…")
-            await asyncio.to_thread(add_watermark, original, watermarked)
-            if not self.upload:
-                shared.append(Shared(video=watermarked))
-                continue
-            progress(f"Uploading {watermarked.name} {label}…")
-            url = await asyncio.to_thread(upload_video, watermarked)
-            await asyncio.to_thread(make_qr, url, qr_file)
-            shared.append(Shared(video=watermarked, url=url, qr=qr_file))
-        return shared
+            clips.append(Clip(original=original, watermarked=watermarked, qr_file=qr_file))
+        return clips
 
     async def shutdown(self) -> None:
         """Stop any recording, the preview stream and the loop."""
@@ -276,11 +332,14 @@ def _check(response: Any) -> None:
 class LivestreamApp:
     """Tkinter window with the live preview, resolution selector and record button."""
 
-    def __init__(self, root: tk.Tk, controller: GoProController) -> None:
+    def __init__(self, root: tk.Tk, controller: GoProController, upload: bool) -> None:
         self.root = root
         self.controller = controller
         self.reader = PreviewReader(controller.port)
         self._events: queue.Queue[Callable[[], None]] = queue.Queue()
+        self.postprocessor = PostProcessor(
+            upload, self._events, self._on_ready, self._on_processed, self._on_process_error
+        )
         self._recording = False
         self._busy = True  # Connecting
         self._record_started = 0.0
@@ -402,23 +461,32 @@ class LivestreamApp:
         def progress(message: str) -> None:
             self._events.put(lambda: self.status.set(message))
 
-        def done(shared: list[Shared]) -> None:
-            if self.controller.upload:
-                self.status.set("Ready: " + "  ".join(item.url for item in shared))
-                for item in shared:
-                    logger.info("Video %s available at %s (QR: %s)", item.video, item.url, item.qr)
-                if shared:
-                    self._open_qr_window(shared[-1])
-            else:
-                self.status.set("Saved: " + "  ".join(item.video.name for item in shared))
-                for item in shared:
-                    logger.info("Video saved to %s (upload disabled)", item.video)
+        def done(clips: list[Clip]) -> None:
+            for clip in clips:
+                self.postprocessor.submit(clip)
+            self.status.set(f"Watermarking {len(clips)} clip(s) in background…")
 
         self._run(
             self.controller.download(camera_files, progress),
             "Transferring video from camera…",
             done,
         )
+
+    def _on_ready(self, shared: Shared) -> None:
+        """Show the QR code as soon as the upload starts; the link goes live when the upload ends."""
+        self.status.set(f"Uploading {shared.video.name}…")
+        self._open_qr_window(shared)
+
+    def _on_processed(self, shared: Shared) -> None:
+        if shared.url is None:
+            self.status.set(f"Saved: {shared.video.name}")
+            logger.info("Video saved to %s", shared.video)
+            return
+        self.status.set(f"Uploaded: {shared.url}")
+        logger.info("Video %s available at %s (QR: %s)", shared.video, shared.url, shared.qr)
+
+    def _on_process_error(self, clip: Clip, error: Exception) -> None:
+        self.status.set(f"Error processing {clip.original.name}: {error}")
 
     # UI ----------------------------------------------------------------------------------------------
 
@@ -495,6 +563,7 @@ class LivestreamApp:
             self.controller.submit(self.controller.shutdown()).result(timeout=15)
         except Exception:  # pylint: disable=broad-except
             logger.exception("Shutdown did not complete cleanly")
+        self.postprocessor.stop()
         self.root.destroy()
 
 
@@ -521,7 +590,7 @@ def main() -> None:
     logging.getLogger("open_gopro").setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
     root = tk.Tk()
-    LivestreamApp(root, GoProController(args.output_dir, args.port, args.serial, upload=not args.no_upload))
+    LivestreamApp(root, GoProController(args.output_dir, args.port, args.serial), upload=not args.no_upload)
     root.mainloop()
 
 
