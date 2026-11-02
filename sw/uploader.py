@@ -46,6 +46,33 @@ def upload_video(local_file: Path) -> None:
     )
 
 
+def list_objects() -> dict[str, int]:
+    """Return {key: size in bytes} for every object in the bucket."""
+    load_dotenv(ENV_FILE)
+    sizes: dict[str, int] = {}
+    pages = _client().get_paginator("list_objects_v2").paginate(Bucket=os.environ["R2_BUCKET"])
+    for page in pages:
+        for obj in page.get("Contents", []):
+            sizes[obj["Key"]] = obj["Size"]
+    return sizes
+
+
+def incomplete_uploads() -> list[tuple[str, str]]:
+    """Return (key, upload id) for every multipart upload that was started but never completed."""
+    load_dotenv(ENV_FILE)
+    uploads: list[tuple[str, str]] = []
+    pages = _client().get_paginator("list_multipart_uploads").paginate(Bucket=os.environ["R2_BUCKET"])
+    for page in pages:
+        uploads += [(u["Key"], u["UploadId"]) for u in page.get("Uploads", [])]
+    return uploads
+
+
+def abort_upload(key: str, upload_id: str) -> None:
+    """Discard an incomplete multipart upload and the parts it has stored."""
+    load_dotenv(ENV_FILE)
+    _client().abort_multipart_upload(Bucket=os.environ["R2_BUCKET"], Key=key, UploadId=upload_id)
+
+
 def make_qr(url: str, output: Path) -> Path:
     """Write a PNG QR code that encodes `url`."""
     qrcode.make(url).save(output)
