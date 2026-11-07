@@ -360,9 +360,10 @@ def edit_clip(
     watermarks: list[tuple[Path, tuple[str, ...]]] | None = None,
     fadein_image: Path | None = None,
     fadeout_image: Path | None = None,
-    keep_project: Path | None = None,
 ) -> Path:
     """Edit `original` (watermarks, fades, slow motion) and render it to `output` with melt.
+
+    The editable Shotcut project is saved next to `output` as `<output stem>.mlt`.
 
     Args:
         original: Input video file.
@@ -370,7 +371,6 @@ def edit_clip(
         watermarks: Pairs of (image, corners); defaults to the always-used watermark alone.
         fadein_image: Still image to fade in from, or None for no opening fade.
         fadeout_image: Still image to fade out to, or None for no closing fade.
-        keep_project: If given, the generated .mlt project is also written here (for inspection).
 
     Returns:
         The output path.
@@ -387,7 +387,9 @@ def edit_clip(
     probe = probe_video(original)
     xml = build_project_xml(original, probe, watermarks, fadein_image, fadeout_image)
 
-    project_path = keep_project or output.with_suffix(".generated.mlt")
+    # The project is kept next to the rendered video (<name>_watermarked.mlt) so it can be
+    # opened in Shotcut and edited afterwards. It is never deleted.
+    project_path = output.with_suffix(".mlt")
     project_path.write_text(xml, encoding="utf-8")
     try:
         subprocess.run(
@@ -411,9 +413,6 @@ def edit_clip(
     except subprocess.CalledProcessError as e:
         logger.error("melt failed for %s:\n%s", original, e.stderr)
         raise
-    finally:
-        if keep_project is None:
-            project_path.unlink(missing_ok=True)
     return output
 
 
@@ -432,19 +431,11 @@ def main() -> None:
     parser.add_argument("--image", help="Extra watermark image (file name), in addition to selkabot.png")
     parser.add_argument("--fadein-image", type=Path, default=None)
     parser.add_argument("--fadeout-image", type=Path, default=None)
-    parser.add_argument("--keep-project", type=Path, default=None, help="Also save the generated .mlt here")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    edit_clip(
-        args.input,
-        args.output,
-        watermarks_for(args.image),
-        args.fadein_image,
-        args.fadeout_image,
-        args.keep_project,
-    )
-    print(f"wrote {args.output}")
+    edit_clip(args.input, args.output, watermarks_for(args.image), args.fadein_image, args.fadeout_image)
+    print(f"wrote {args.output} and {args.output.with_suffix('.mlt')}")
 
 
 if __name__ == "__main__":
