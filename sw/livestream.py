@@ -63,7 +63,7 @@ from PIL import Image, ImageTk
 
 from sw.sync_uploads import sync_uploads
 from sw.uploader import make_qr, public_url, upload_video
-from sw.watermark import add_watermark, watermarks_for
+from sw.shotcut_pipeline import edit_clip, watermarks_for
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,8 @@ class Clip:
     qr_file: Path
     key: str  # Bucket key of the watermarked file, e.g. "<folder>/<name>.mp4"
     watermarks: list[tuple[Path, tuple[str, ...]]]
+    fadein_image: Path | None
+    fadeout_image: Path | None
 
 
 class PostProcessor:
@@ -155,7 +157,7 @@ class PostProcessor:
 
     def _process(self, clip: Clip) -> None:
         try:
-            add_watermark(clip.original, clip.watermarked, clip.watermarks)
+            edit_clip(clip.original, clip.watermarked, clip.watermarks, clip.fadein_image, clip.fadeout_image)
             shared = Shared(video=clip.watermarked)
             if self.upload:
                 # The URL is known before the upload, so the QR code can be shown while it runs.
@@ -222,6 +224,8 @@ class GoProController:
         self._gopro: WiredGoPro | None = None
         self._clip_dir = output_dir  # Folder for the clips of the current recording
         self._watermarks = watermarks_for(None)  # Watermarks of the current recording
+        self._fadein_image: Path | None = None
+        self._fadeout_image: Path | None = None
         self._media_before: set[str] = set()
         self._recording = False
         self._keep_alive_task: asyncio.Task | None = None
@@ -263,16 +267,25 @@ class GoProController:
         finally:
             await self._start_preview()
 
-    async def start_recording(self, clip_dir: Path, image: str | None) -> None:
+    async def start_recording(
+        self,
+        clip_dir: Path,
+        image: str | None,
+        fadein_image: Path | None,
+        fadeout_image: Path | None,
+    ) -> None:
         """Pause the preview and start recording (see module notes).
 
         The clips of this recording are downloaded to `clip_dir`, which is created if missing,
-        and watermarked with `image` (a file name in the current directory) in addition to the
-        always-used watermarks. Pass None to use only the always-used watermarks.
+        and edited with Shotcut's engine: watermarked with `image` (a file name in the current
+        directory) in addition to the always-used watermark, and faded in/out via
+        `fadein_image`/`fadeout_image` (None for no fade on that side).
         """
         clip_dir.mkdir(parents=True, exist_ok=True)
         self._clip_dir = clip_dir
         self._watermarks = watermarks_for(image)
+        self._fadein_image = fadein_image
+        self._fadeout_image = fadeout_image
         self._media_before = await self._media_filenames()
         await self._stop_preview()
         try:
@@ -318,6 +331,8 @@ class GoProController:
                     qr_file=qr_file,
                     key=key,
                     watermarks=self._watermarks,
+                    fadein_image=self._fadein_image,
+                    fadeout_image=self._fadeout_image,
                 )
             )
         return clips
@@ -620,6 +635,19 @@ class LivestreamApp:
         else:
             self.status.set(f"Recordings will be saved in {self.controller.output_dir / folder}")
 
+    def _fade_image_path(self, name: str) -> Path | None:
+        """Resolve a fadein_image/fadeout_image config value to a path, or None to skip that fade.
+
+        A missing file is treated the same as an empty name (skip), logged rather than shown in
+        the UI, since there is no textbox for these yet to show an error in.
+        """
+        if not name:
+            return None
+        if image_missing(name):
+            logger.warning("Fade image %r not found in %s; skipping that fade", name, Path.cwd())
+            return None
+        return Path.cwd() / name
+
     def _on_record(self) -> None:
         if not self._recording:
             name = self._folder_name()
@@ -637,8 +665,10 @@ class LivestreamApp:
             else:
                 status = "Starting recording…"
                 watermark_image = image or None
+            fadein_path = self._fade_image_path(self.fadein_image)
+            fadeout_path = self._fade_image_path(self.fadeout_image)
             self._run(
-                self.controller.start_recording(clip_dir, watermark_image),
+                self.controller.start_recording(clip_dir, watermark_image, fadein_path, fadeout_path),
                 status,
                 self._on_recording_started,
             )
