@@ -7,6 +7,7 @@ Credentials and settings are read from the repo-root `.env` file:
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from urllib.parse import quote
@@ -14,6 +15,8 @@ from urllib.parse import quote
 import boto3
 import qrcode
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
@@ -29,19 +32,38 @@ def _client():
     )
 
 
-def public_url(local_file: Path) -> str:
-    """Return the public URL that `upload_video` will give `local_file`. Known before uploading."""
+def public_url(key: str) -> str:
+    """Return the public URL of the object `key` (e.g. "trip/clip.mp4"). Known before uploading."""
     load_dotenv(ENV_FILE)
-    return f"{os.environ['R2_PUBLIC_BASE_URL'].rstrip('/')}/{quote(local_file.name)}"
+    return f"{os.environ['R2_PUBLIC_BASE_URL'].rstrip('/')}/{quote(key)}"
 
 
-def upload_video(local_file: Path) -> None:
-    """Upload a file to the R2 bucket, under the key that `public_url` gives it."""
+def ensure_folder(folder: str) -> None:
+    """Create the folder `folder` in the bucket if no object is stored under it yet.
+
+    R2 has no real folders: a folder is a key prefix. An empty object named "<folder>/"
+    is written so the folder also shows up in the dashboard.
+    """
     load_dotenv(ENV_FILE)
+    client = _client()
+    bucket = os.environ["R2_BUCKET"]
+    prefix = f"{folder}/"
+    listing = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    if listing.get("KeyCount", 0) == 0:
+        client.put_object(Bucket=bucket, Key=prefix, Body=b"")
+        logger.info("Created folder %s in bucket %s", prefix, bucket)
+
+
+def upload_video(local_file: Path, key: str) -> None:
+    """Upload a file to the R2 bucket under `key`, creating the key's folder first if needed."""
+    load_dotenv(ENV_FILE)
+    folder, sep, _ = key.rpartition("/")
+    if sep:
+        ensure_folder(folder)
     _client().upload_file(
         str(local_file),
         os.environ["R2_BUCKET"],
-        local_file.name,
+        key,
         ExtraArgs={"ContentType": "video/mp4", "ContentDisposition": "attachment"},
     )
 

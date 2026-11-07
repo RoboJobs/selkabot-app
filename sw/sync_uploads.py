@@ -1,13 +1,16 @@
-"""Check which local videos are in the R2 bucket and upload the ones that are not.
+"""Check which local videos of one folder are in the R2 bucket and upload the ones that are not.
+
+Only the active folder is checked: the `<output-dir>/<folder>` folder, whose videos
+are stored in the bucket under `<folder>/<name>.mp4`. Other folders are not touched.
 
 Runs on startup of the livestream app, and can also run on its own:
-    uv run python -m sw.sync_uploads [--report-only]
+    uv run python -m sw.sync_uploads --folder <name> [--report-only]
 
 Steps:
-1. Abort incomplete multipart uploads, but only where the local video exists.
+1. Abort incomplete multipart uploads of this folder, but only where the local video exists.
    Uploads with no local video are kept, so their partial data is not thrown away.
 2. List the bucket once. A local video counts as uploaded only when the bucket has
-   an object with the same file name and the same size.
+   an object with the same key and the same size.
 3. Upload the videos that are missing, or whose size differs (a partial object).
 
 For now only plain `<name>.mp4` files are synced. The `_original` files are never
@@ -32,7 +35,7 @@ EXCLUDED_SUFFIXES = ("_original.mp4", "_watermarked.mp4")
 
 @dataclass
 class Summary:
-    """What the sync found and did. Lists hold file names."""
+    """What the sync found and did. Lists hold bucket keys (folder/name)."""
 
     stale: list[str] = field(default_factory=list)  # Incomplete uploads that have a local video
     aborted: list[str] = field(default_factory=list)
@@ -51,17 +54,20 @@ class Summary:
         logger.info("  Failed: %d %s", len(self.failed), self.failed)
 
 
-def sync_uploads(output_dir: Path, upload: bool = True) -> Summary:
-    """Reconcile the local videos with the bucket. With upload=False, only report."""
+def sync_uploads(output_dir: Path, folder: str, upload: bool = True) -> Summary:
+    """Reconcile the videos of `output_dir/folder` with the bucket. With upload=False, only report."""
     summary = Summary()
-    # Recursive: the livestream app saves each recording into a subfolder of output_dir.
+    prefix = f"{folder}/"
+    # Bucket keys of this folder, e.g. "<folder>/<name>.mp4". Other folders are ignored.
     local = {
-        path.name: path
-        for path in sorted(output_dir.rglob("*.mp4"))
+        f"{prefix}{path.name}": path
+        for path in sorted((output_dir / folder).glob("*.mp4"))
         if not path.name.endswith(EXCLUDED_SUFFIXES)
     }
 
     for key, upload_id in incomplete_uploads():
+        if not key.startswith(prefix):
+            continue
         if key not in local:
             logger.info("Keeping incomplete upload of %s: no local file", key)
             continue
@@ -71,18 +77,18 @@ def sync_uploads(output_dir: Path, upload: bool = True) -> Summary:
             summary.aborted.append(key)
 
     remote = list_objects()
-    for name, path in local.items():
-        if remote.get(name) == path.stat().st_size:
-            summary.present.append(name)
+    for key, path in local.items():
+        if remote.get(key) == path.stat().st_size:
+            summary.present.append(key)
         elif not upload:
-            summary.pending.append(name)
+            summary.pending.append(key)
         else:
             try:
-                upload_video(path)
-                summary.uploaded.append(name)
+                upload_video(path, key)
+                summary.uploaded.append(key)
             except Exception as e:  # pylint: disable=broad-except
-                logger.exception("Upload of %s failed", name)
-                summary.failed[name] = str(e)
+                logger.exception("Upload of %s failed", key)
+                summary.failed[key] = str(e)
 
     summary.log()
     return summary
@@ -90,12 +96,13 @@ def sync_uploads(output_dir: Path, upload: bool = True) -> Summary:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Upload local videos that are missing from the R2 bucket.")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Folder with the videos")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Base folder with the videos")
+    parser.add_argument("--folder", required=True, help="Folder inside --output-dir to check")
     parser.add_argument("--report-only", action="store_true", help="Only report; do not abort or upload")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    sync_uploads(args.output_dir, upload=not args.report_only)
+    sync_uploads(args.output_dir, args.folder, upload=not args.report_only)
 
 
 if __name__ == "__main__":

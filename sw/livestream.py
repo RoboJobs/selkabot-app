@@ -102,6 +102,7 @@ class Clip:
     original: Path
     watermarked: Path
     qr_file: Path
+    key: str  # Bucket key of the watermarked file, e.g. "<folder>/<name>.mp4"
 
 
 class PostProcessor:
@@ -155,11 +156,11 @@ class PostProcessor:
             shared = Shared(video=clip.watermarked)
             if self.upload:
                 # The URL is known before the upload, so the QR code can be shown while it runs.
-                url = public_url(clip.watermarked)
+                url = public_url(clip.key)
                 make_qr(url, clip.qr_file)
                 shared = Shared(video=clip.watermarked, url=url, qr=clip.qr_file)
                 self._events.put(functools.partial(self._on_ready, shared))
-                upload_video(clip.watermarked)
+                upload_video(clip.watermarked, clip.key)
         except Exception as e:  # pylint: disable=broad-except
             logger.exception("Post-processing %s failed", clip.original)
             self._events.put(functools.partial(self._on_error, clip, e))
@@ -302,7 +303,8 @@ class GoProController:
 
             progress(f"Downloading {camera_file} {label}…")
             _check(await self.gopro.http_command.download_file(camera_file=camera_file, local_file=original))
-            clips.append(Clip(original=original, watermarked=watermarked, qr_file=qr_file))
+            key = watermarked.relative_to(self.output_dir).as_posix()
+            clips.append(Clip(original=original, watermarked=watermarked, qr_file=qr_file, key=key))
         return clips
 
     async def shutdown(self) -> None:
@@ -400,7 +402,7 @@ class LivestreamApp:
             upload, self._events, self._on_ready, self._on_processed, self._on_process_error
         )
         # Check the bucket on startup; uploads it finds missing go through the same queue.
-        self.postprocessor.submit_job(functools.partial(sync_uploads, controller.output_dir, upload))
+        self.postprocessor.submit_job(functools.partial(sync_uploads, controller.output_dir, folder, upload))
         self._recording = False
         self._busy = True  # Connecting
         self._record_started = 0.0
