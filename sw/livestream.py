@@ -404,27 +404,41 @@ def _stored(data: dict, key: str, default: str, error: Callable[[str], str | Non
     return default
 
 
-def load_config(config_file: Path) -> tuple[str, str]:
-    """Return (folder, image) stored in the config file.
+def load_config(config_file: Path) -> tuple[str, str, str, str]:
+    """Return (folder, image, fadein_image, fadeout_image) stored in the config file.
 
     A missing file, or a value that is missing or unusable, falls back to its default.
+    fadein_image/fadeout_image name the stills used for the Shotcut edit pipeline's opening
+    and closing fades; like `image`, "" means none and there is no UI box for them yet, so
+    they are only ever set by editing the config file directly.
     """
     try:
         data = json.loads(config_file.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return DEFAULT_FOLDER, DEFAULT_IMAGE
+        data = {}
     except (OSError, ValueError):
         logger.warning("Ignoring unreadable config file %s", config_file, exc_info=True)
-        return DEFAULT_FOLDER, DEFAULT_IMAGE
+        data = {}
     if not isinstance(data, dict):
         data = {}
-    return _stored(data, "folder", DEFAULT_FOLDER, folder_error), _stored(data, "image", DEFAULT_IMAGE, image_error)
+    return (
+        _stored(data, "folder", DEFAULT_FOLDER, folder_error),
+        _stored(data, "image", DEFAULT_IMAGE, image_error),
+        _stored(data, "fadein_image", DEFAULT_IMAGE, image_error),
+        _stored(data, "fadeout_image", DEFAULT_IMAGE, image_error),
+    )
 
 
-def save_config(config_file: Path, folder: str, image: str) -> None:
-    """Store the recording folder and watermark image in the config file, creating it if needed."""
+def save_config(config_file: Path, folder: str, image: str, fadein_image: str, fadeout_image: str) -> None:
+    """Store the recording folder, watermark image and fade stills in the config file."""
     try:
-        config_file.write_text(json.dumps({"folder": folder, "image": image}, indent=2) + "\n", encoding="utf-8")
+        config = {
+            "folder": folder,
+            "image": image,
+            "fadein_image": fadein_image,
+            "fadeout_image": fadeout_image,
+        }
+        config_file.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     except OSError:
         logger.exception("Could not save the config file %s", config_file)
 
@@ -439,11 +453,16 @@ class LivestreamApp:
         upload: bool,
         folder: str,
         image: str,
+        fadein_image: str,
+        fadeout_image: str,
         config_file: Path,
     ) -> None:
         self.root = root
         self.controller = controller
         self.config_file = config_file
+        # No UI box for these yet; preserved as-is whenever folder/image are saved.
+        self.fadein_image = fadein_image
+        self.fadeout_image = fadeout_image
         self.reader = PreviewReader(controller.port)
         self._events: queue.Queue[Callable[[], None]] = queue.Queue()
         self.postprocessor = PostProcessor(
@@ -594,7 +613,7 @@ class LivestreamApp:
             return
         if (folder, image) == self._saved_config:
             return
-        save_config(self.config_file, folder, image)
+        save_config(self.config_file, folder, image, self.fadein_image, self.fadeout_image)
         self._saved_config = (folder, image)
         if image_missing(image):
             self.status.set(f"Image {image!r} not found in {Path.cwd()}. Only selkabot.png will be used.")
@@ -774,7 +793,7 @@ def main() -> None:
     # The SDK logs every HTTP request/response at INFO; keep the console readable.
     logging.getLogger("open_gopro").setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
-    folder, image = load_config(CONFIG_FILE)
+    folder, image, fadein_image, fadeout_image = load_config(CONFIG_FILE)
     root = tk.Tk()
     LivestreamApp(
         root,
@@ -782,6 +801,8 @@ def main() -> None:
         upload=not args.no_upload,
         folder=folder,
         image=image,
+        fadein_image=fadein_image,
+        fadeout_image=fadeout_image,
         config_file=CONFIG_FILE,
     )
     root.mainloop()
