@@ -6,8 +6,9 @@ SDK, shows the camera's preview stream in a Tkinter window and lets the user
 start/stop video recording. Each recorded clip is downloaded to the local
 computer as soon as recording stops, into the folder named in the "Folder"
 text box (a subfolder of the output directory, created if missing). The last
-folder used is stored in sw/livestream_config.json and restored on startup;
-without that file the folder is "default".
+folder and watermark image used are stored in sw/livestream_config.json and
+restored on startup; without that file the folder is "default" and no extra
+watermark image is used.
 
 Threading model:
 - Main thread: Tkinter UI. Only this thread touches widgets.
@@ -62,7 +63,7 @@ from PIL import Image, ImageTk
 
 from sw.sync_uploads import sync_uploads
 from sw.uploader import make_qr, public_url, upload_video
-from sw.watermark import add_watermark
+from sw.watermark import add_watermark, watermarks_for
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ FPS = settings.FramesPerSecond.NUM_60_0
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "videos"
 DEFAULT_FOLDER = "default"
+DEFAULT_IMAGE = ""  # Optional watermark, a file name in the current directory; "" means none
 CONFIG_FILE = Path(__file__).resolve().parent / "livestream_config.json"
 DISPLAY_WIDTH = 960
 KEEP_ALIVE_PERIOD_S = 3.0
@@ -103,6 +105,7 @@ class Clip:
     watermarked: Path
     qr_file: Path
     key: str  # Bucket key of the watermarked file, e.g. "<folder>/<name>.mp4"
+    watermarks: list[tuple[Path, tuple[str, ...]]]
 
 
 class PostProcessor:
@@ -152,7 +155,7 @@ class PostProcessor:
 
     def _process(self, clip: Clip) -> None:
         try:
-            add_watermark(clip.original, clip.watermarked)
+            add_watermark(clip.original, clip.watermarked, clip.watermarks)
             shared = Shared(video=clip.watermarked)
             if self.upload:
                 # The URL is known before the upload, so the QR code can be shown while it runs.
@@ -218,6 +221,7 @@ class GoProController:
         self._serial = serial
         self._gopro: WiredGoPro | None = None
         self._clip_dir = output_dir  # Folder for the clips of the current recording
+        self._watermarks = watermarks_for(None)  # Watermarks of the current recording
         self._media_before: set[str] = set()
         self._recording = False
         self._keep_alive_task: asyncio.Task | None = None
@@ -259,13 +263,16 @@ class GoProController:
         finally:
             await self._start_preview()
 
-    async def start_recording(self, clip_dir: Path) -> None:
+    async def start_recording(self, clip_dir: Path, image: str | None) -> None:
         """Pause the preview and start recording (see module notes).
 
-        The clips of this recording are downloaded to `clip_dir`, which is created if missing.
+        The clips of this recording are downloaded to `clip_dir`, which is created if missing,
+        and watermarked with `image` (a file name in the current directory) in addition to the
+        always-used watermarks. Pass None to use only the always-used watermarks.
         """
         clip_dir.mkdir(parents=True, exist_ok=True)
         self._clip_dir = clip_dir
+        self._watermarks = watermarks_for(image)
         self._media_before = await self._media_filenames()
         await self._stop_preview()
         try:
@@ -304,7 +311,15 @@ class GoProController:
             progress(f"Downloading {camera_file} {label}…")
             _check(await self.gopro.http_command.download_file(camera_file=camera_file, local_file=original))
             key = watermarked.relative_to(self.output_dir).as_posix()
-            clips.append(Clip(original=original, watermarked=watermarked, qr_file=qr_file, key=key))
+            clips.append(
+                Clip(
+                    original=original,
+                    watermarked=watermarked,
+                    qr_file=qr_file,
+                    key=key,
+                    watermarks=self._watermarks,
+                )
+            )
         return clips
 
     async def shutdown(self) -> None:
@@ -363,26 +378,53 @@ def folder_error(name: str) -> str | None:
     return None
 
 
-def load_folder(config_file: Path) -> str:
-    """Return the folder stored in the config file, or DEFAULT_FOLDER if the file is missing or unusable."""
+def image_error(name: str) -> str | None:
+    """Return why `name` cannot be used as the watermark image name, or None if the format is fine.
+
+    An empty name is fine: it means no extra watermark image.
+    """
+    if not name:
+        return None
+    if Path(name).name != name or "\\" in name:
+        return "the image name must be a single file name, without / or \\."
+    return None
+
+
+def image_missing(name: str) -> bool:
+    """True if the watermark image `name` is set but is not a file in the current directory."""
+    return bool(name) and not (Path.cwd() / name).is_file()
+
+
+def _stored(data: dict, key: str, default: str, error: Callable[[str], str | None]) -> str:
+    value = data.get(key)
+    if isinstance(value, str) and error(value.strip()) is None:
+        return value.strip()
+    if value is not None:
+        logger.warning("Ignoring invalid %r in the config file; using %r", key, default)
+    return default
+
+
+def load_config(config_file: Path) -> tuple[str, str]:
+    """Return (folder, image) stored in the config file.
+
+    A missing file, or a value that is missing or unusable, falls back to its default.
+    """
     try:
         data = json.loads(config_file.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return DEFAULT_FOLDER
+        return DEFAULT_FOLDER, DEFAULT_IMAGE
     except (OSError, ValueError):
         logger.warning("Ignoring unreadable config file %s", config_file, exc_info=True)
-        return DEFAULT_FOLDER
-    folder = data.get("folder") if isinstance(data, dict) else None
-    if not isinstance(folder, str) or folder_error(folder.strip()) is not None:
-        logger.warning("Ignoring invalid folder in %s; using %r", config_file, DEFAULT_FOLDER)
-        return DEFAULT_FOLDER
-    return folder.strip()
+        return DEFAULT_FOLDER, DEFAULT_IMAGE
+    if not isinstance(data, dict):
+        data = {}
+    return _stored(data, "folder", DEFAULT_FOLDER, folder_error), _stored(data, "image", DEFAULT_IMAGE, image_error)
 
 
-def save_folder(config_file: Path, folder: str) -> None:
-    """Store the recording folder in the config file, creating the file if needed."""
+def save_config(config_file: Path, folder: str, image: str) -> None:
+    """Store the recording folder and watermark image in the config file, creating it if needed."""
     try:
-        config_file.write_text(json.dumps({"folder": folder}, indent=2) + "\n", encoding="utf-8")
+        config_file.write_text(json.dumps({"folder": folder, "image": image}, indent=2) + "\n", encoding="utf-8")
     except OSError:
         logger.exception("Could not save the config file %s", config_file)
 
@@ -391,7 +433,13 @@ class LivestreamApp:
     """Tkinter window with the live preview, resolution selector, folder box and record button."""
 
     def __init__(
-        self, root: tk.Tk, controller: GoProController, upload: bool, folder: str, config_file: Path
+        self,
+        root: tk.Tk,
+        controller: GoProController,
+        upload: bool,
+        folder: str,
+        image: str,
+        config_file: Path,
     ) -> None:
         self.root = root
         self.controller = controller
@@ -437,12 +485,19 @@ class LivestreamApp:
 
         # Packed right-to-left, so the label sits left of the box, which sits left of the button.
         self.folder = tk.StringVar(value=folder)
-        self._saved_folder = folder
         self.folder_entry = ttk.Entry(controls, textvariable=self.folder, width=16)
         self.folder_entry.pack(side="right", padx=(0, 8))
-        self.folder_entry.bind("<Return>", self._on_folder_commit)
-        self.folder_entry.bind("<FocusOut>", self._on_folder_commit)
+        self.folder_entry.bind("<Return>", self._on_config_commit)
+        self.folder_entry.bind("<FocusOut>", self._on_config_commit)
         ttk.Label(controls, text="Folder:").pack(side="right", padx=(8, 4))
+
+        self.image = tk.StringVar(value=image)
+        self._saved_config = (folder, image)
+        self.image_entry = ttk.Entry(controls, textvariable=self.image, width=14)
+        self.image_entry.pack(side="right", padx=(0, 8))
+        self.image_entry.bind("<Return>", self._on_config_commit)
+        self.image_entry.bind("<FocusOut>", self._on_config_commit)
+        ttk.Label(controls, text="Image:").pack(side="right", padx=(8, 4))
 
         self.status = tk.StringVar()
         ttk.Label(root, textvariable=self.status, anchor="w").pack(fill="x", padx=8, pady=(0, 8))
@@ -522,23 +577,52 @@ class LivestreamApp:
             return None
         return name
 
-    def _on_folder_commit(self, _event: Any = None) -> None:
-        """Remember a changed folder name in the config file, so the next start uses it."""
-        name = self._folder_name()
-        if name is None or name == self._saved_folder:
+    def _image_name(self) -> str | None:
+        """The watermark image typed in the box, or None (with the reason in the status line) if its name is unusable."""
+        name = self.image.get().strip()
+        error = image_error(name)
+        if error is not None:
+            self.status.set(f"Image: {error}")
+            return None
+        return name
+
+    def _on_config_commit(self, _event: Any = None) -> None:
+        """Remember changed folder and image names in the config file, so the next start uses them."""
+        folder = self._folder_name()
+        image = self._image_name()
+        if folder is None or image is None:
             return
-        save_folder(self.config_file, name)
-        self._saved_folder = name
-        self.status.set(f"Recordings will be saved in {self.controller.output_dir / name}")
+        if (folder, image) == self._saved_config:
+            return
+        save_config(self.config_file, folder, image)
+        self._saved_config = (folder, image)
+        if image_missing(image):
+            self.status.set(f"Image {image!r} not found in {Path.cwd()}. Only selkabot.png will be used.")
+        else:
+            self.status.set(f"Recordings will be saved in {self.controller.output_dir / folder}")
 
     def _on_record(self) -> None:
         if not self._recording:
             name = self._folder_name()
             if name is None:
                 return
-            self._on_folder_commit()
+            image = self._image_name()
+            if image is None:
+                return
+            self._on_config_commit()
             clip_dir = self.controller.output_dir / name
-            self._run(self.controller.start_recording(clip_dir), "Starting recording…", self._on_recording_started)
+            if image_missing(image):
+                # The image is not used, so the recording only gets the always-used watermarks.
+                status = f"Image {image!r} not found in {Path.cwd()}; only selkabot.png is used. Starting recording…"
+                watermark_image = None
+            else:
+                status = "Starting recording…"
+                watermark_image = image or None
+            self._run(
+                self.controller.start_recording(clip_dir, watermark_image),
+                status,
+                self._on_recording_started,
+            )
         else:
             self._run(self.controller.stop_recording(), "Stopping recording…", self._on_recording_stopped)
 
@@ -594,8 +678,9 @@ class LivestreamApp:
         radio_state = "disabled" if self._busy or self._recording else "normal"
         for button in self.resolution_buttons:
             button.config(state=radio_state)
-        # The folder is fixed for the duration of a recording and its download.
+        # The folder and image are fixed for the duration of a recording and its download.
         self.folder_entry.config(state=radio_state)
+        self.image_entry.config(state=radio_state)
 
     def _poll(self) -> None:
         while True:
@@ -689,12 +774,14 @@ def main() -> None:
     # The SDK logs every HTTP request/response at INFO; keep the console readable.
     logging.getLogger("open_gopro").setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
+    folder, image = load_config(CONFIG_FILE)
     root = tk.Tk()
     LivestreamApp(
         root,
         GoProController(args.output_dir, args.port, args.serial),
         upload=not args.no_upload,
-        folder=load_folder(CONFIG_FILE),
+        folder=folder,
+        image=image,
         config_file=CONFIG_FILE,
     )
     root.mainloop()

@@ -11,11 +11,12 @@ import subprocess
 from pathlib import Path
 
 WATERMARK_WIDTH_PCT = 0.10  # Watermark width as a fraction of the video width
-# (image, corners it appears in). Images are relative to the current working directory.
+# Always-used watermarks: (image, corners it appears in). Images are relative to the current working directory.
 WATERMARKS: list[tuple[Path, tuple[str, ...]]] = [
     (Path("selkabot.png"), ("bottom-left", "top-right")),
-    (Path("jdc.jpg"), ("top-left", "bottom-right")),
 ]
+# Corners of the optional, user-chosen image (the corners jdc.jpg always used).
+IMAGE_CORNERS = ("top-left", "bottom-right")
 # Overlay x:y for each corner of the video.
 CORNERS = {
     "top-left": ("0", "0"),
@@ -23,6 +24,13 @@ CORNERS = {
     "bottom-left": ("0", "main_h-overlay_h"),
     "bottom-right": ("main_w-overlay_w", "main_h-overlay_h"),
 }
+
+
+def watermarks_for(image: str | None) -> list[tuple[Path, tuple[str, ...]]]:
+    """Return WATERMARKS, plus the file `image` in IMAGE_CORNERS when one is given."""
+    if not image:
+        return list(WATERMARKS)
+    return [*WATERMARKS, (Path(image), IMAGE_CORNERS)]
 
 
 def video_width(video: Path) -> int:
