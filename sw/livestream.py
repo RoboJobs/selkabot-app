@@ -122,13 +122,11 @@ class PostProcessor:
         self,
         upload: bool,
         events: queue.Queue[Callable[[], None]],
-        on_ready: Callable[[Shared], None],
         on_done: Callable[[Shared], None],
         on_error: Callable[[Clip, Exception], None],
     ) -> None:
         self.upload = upload
         self._events = events
-        self._on_ready = on_ready
         self._on_done = on_done
         self._on_error = on_error
         self._jobs: queue.Queue[Callable[[], Any] | None] = queue.Queue()
@@ -160,12 +158,10 @@ class PostProcessor:
             edit_clip(clip.original, clip.watermarked, clip.watermarks, clip.fadein_image, clip.fadeout_image)
             shared = Shared(video=clip.watermarked)
             if self.upload:
-                # The URL is known before the upload, so the QR code can be shown while it runs.
-                url = public_url(clip.key)
-                make_qr(url, clip.qr_file)
-                shared = Shared(video=clip.watermarked, url=url, qr=clip.qr_file)
-                self._events.put(functools.partial(self._on_ready, shared))
+                # The URL and QR code were made from clip.key when the download finished (see
+                # LivestreamApp._on_recording_stopped), so they are not recomputed here.
                 upload_video(clip.watermarked, clip.key)
+                shared = Shared(video=clip.watermarked, url=public_url(clip.key), qr=clip.qr_file)
         except Exception as e:  # pylint: disable=broad-except
             logger.exception("Post-processing %s failed", clip.original)
             self._events.put(functools.partial(self._on_error, clip, e))
@@ -481,7 +477,7 @@ class LivestreamApp:
         self.reader = PreviewReader(controller.port)
         self._events: queue.Queue[Callable[[], None]] = queue.Queue()
         self.postprocessor = PostProcessor(
-            upload, self._events, self._on_ready, self._on_processed, self._on_process_error
+            upload, self._events, self._on_processed, self._on_process_error
         )
         # Check the bucket on startup; uploads it finds missing go through the same queue.
         self.postprocessor.submit_job(functools.partial(sync_uploads, controller.output_dir, folder, upload))
@@ -690,20 +686,23 @@ class LivestreamApp:
             self._events.put(lambda: self.status.set(message))
 
         def done(clips: list[Clip]) -> None:
+            link = ""
             for clip in clips:
+                if self.postprocessor.upload:
+                    # The link depends only on the bucket key, so the QR code is shown now, before
+                    # the watermarking and upload run. The link is live once the upload finishes.
+                    url = public_url(clip.key)
+                    make_qr(url, clip.qr_file)
+                    self._open_qr_window(Shared(video=clip.watermarked, url=url, qr=clip.qr_file))
+                    link = f" Link (live after upload): {url}"
                 self.postprocessor.submit(clip)
-            self.status.set(f"Watermarking {len(clips)} clip(s) in background…")
+            self.status.set(f"Watermarking {len(clips)} clip(s) in background…{link}")
 
         self._run(
             self.controller.download(camera_files, progress),
             "Transferring video from camera…",
             done,
         )
-
-    def _on_ready(self, shared: Shared) -> None:
-        """Show the QR code as soon as the upload starts; the link goes live when the upload ends."""
-        self.status.set(f"Uploading {shared.video.name}…")
-        self._open_qr_window(shared)
 
     def _on_processed(self, shared: Shared) -> None:
         if shared.url is None:
