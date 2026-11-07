@@ -4,7 +4,10 @@ GoPro livestream recorder — preview, record and download over USB.
 Connects to a GoPro HERO10 over the wired (USB) interface with the Open GoPro
 SDK, shows the camera's preview stream in a Tkinter window and lets the user
 start/stop video recording. Each recorded clip is downloaded to the local
-computer as soon as recording stops.
+computer as soon as recording stops, into the folder named in the "Folder"
+text box (a subfolder of the output directory, created if missing). The last
+folder used is stored in sw/livestream_config.json and restored on startup;
+without that file the folder is "default".
 
 Threading model:
 - Main thread: Tkinter UI. Only this thread touches widgets.
@@ -36,6 +39,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import functools
+import json
 import logging
 import os
 import queue
@@ -76,6 +80,8 @@ DEFAULT_RESOLUTION = "2.7K 16:9"
 FPS = settings.FramesPerSecond.NUM_60_0
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "videos"
+DEFAULT_FOLDER = "default"
+CONFIG_FILE = Path(__file__).resolve().parent / "livestream_config.json"
 DISPLAY_WIDTH = 960
 KEEP_ALIVE_PERIOD_S = 3.0
 
@@ -210,6 +216,7 @@ class GoProController:
         self.port = port
         self._serial = serial
         self._gopro: WiredGoPro | None = None
+        self._clip_dir = output_dir  # Folder for the clips of the current recording
         self._media_before: set[str] = set()
         self._recording = False
         self._keep_alive_task: asyncio.Task | None = None
@@ -251,8 +258,13 @@ class GoProController:
         finally:
             await self._start_preview()
 
-    async def start_recording(self) -> None:
-        """Pause the preview and start recording (see module notes)."""
+    async def start_recording(self, clip_dir: Path) -> None:
+        """Pause the preview and start recording (see module notes).
+
+        The clips of this recording are downloaded to `clip_dir`, which is created if missing.
+        """
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        self._clip_dir = clip_dir
         self._media_before = await self._media_filenames()
         await self._stop_preview()
         try:
@@ -278,15 +290,15 @@ class GoProController:
         The original download is kept as `<name>_original.mp4`; the watermarked
         copy is `<name>_watermarked.mp4`, written later by the PostProcessor.
         """
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._clip_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         clips: list[Clip] = []
         for i, camera_file in enumerate(camera_files, start=1):
             label = f"({i}/{len(camera_files)})"
             base = f"{stamp}_{Path(camera_file).stem}"
-            original = self.output_dir / f"{base}_original.mp4"
-            watermarked = self.output_dir / f"{base}_watermarked.mp4"
-            qr_file = self.output_dir / f"{base}_qr.png"
+            original = self._clip_dir / f"{base}_original.mp4"
+            watermarked = self._clip_dir / f"{base}_watermarked.mp4"
+            qr_file = self._clip_dir / f"{base}_qr.png"
 
             progress(f"Downloading {camera_file} {label}…")
             _check(await self.gopro.http_command.download_file(camera_file=camera_file, local_file=original))
@@ -340,12 +352,48 @@ def _check(response: Any) -> None:
         raise RuntimeError(f"{response.identifier} failed: {response.status}")
 
 
-class LivestreamApp:
-    """Tkinter window with the live preview, resolution selector and record button."""
+def folder_error(name: str) -> str | None:
+    """Return why `name` cannot be used as a recording folder, or None if it can."""
+    if not name:
+        return "enter a folder name."
+    if name in (".", "..") or Path(name).name != name or "\\" in name:
+        return "the folder name must be a single name, without / or \\."
+    return None
 
-    def __init__(self, root: tk.Tk, controller: GoProController, upload: bool) -> None:
+
+def load_folder(config_file: Path) -> str:
+    """Return the folder stored in the config file, or DEFAULT_FOLDER if the file is missing or unusable."""
+    try:
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return DEFAULT_FOLDER
+    except (OSError, ValueError):
+        logger.warning("Ignoring unreadable config file %s", config_file, exc_info=True)
+        return DEFAULT_FOLDER
+    folder = data.get("folder") if isinstance(data, dict) else None
+    if not isinstance(folder, str) or folder_error(folder.strip()) is not None:
+        logger.warning("Ignoring invalid folder in %s; using %r", config_file, DEFAULT_FOLDER)
+        return DEFAULT_FOLDER
+    return folder.strip()
+
+
+def save_folder(config_file: Path, folder: str) -> None:
+    """Store the recording folder in the config file, creating the file if needed."""
+    try:
+        config_file.write_text(json.dumps({"folder": folder}, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        logger.exception("Could not save the config file %s", config_file)
+
+
+class LivestreamApp:
+    """Tkinter window with the live preview, resolution selector, folder box and record button."""
+
+    def __init__(
+        self, root: tk.Tk, controller: GoProController, upload: bool, folder: str, config_file: Path
+    ) -> None:
         self.root = root
         self.controller = controller
+        self.config_file = config_file
         self.reader = PreviewReader(controller.port)
         self._events: queue.Queue[Callable[[], None]] = queue.Queue()
         self.postprocessor = PostProcessor(
@@ -384,6 +432,15 @@ class LivestreamApp:
 
         self.record_button = tk.Button(controls, text="Start recording", width=16, command=self._on_record)
         self.record_button.pack(side="right")
+
+        # Packed right-to-left, so the label sits left of the box, which sits left of the button.
+        self.folder = tk.StringVar(value=folder)
+        self._saved_folder = folder
+        self.folder_entry = ttk.Entry(controls, textvariable=self.folder, width=16)
+        self.folder_entry.pack(side="right", padx=(0, 8))
+        self.folder_entry.bind("<Return>", self._on_folder_commit)
+        self.folder_entry.bind("<FocusOut>", self._on_folder_commit)
+        ttk.Label(controls, text="Folder:").pack(side="right", padx=(8, 4))
 
         self.status = tk.StringVar()
         ttk.Label(root, textvariable=self.status, anchor="w").pack(fill="x", padx=8, pady=(0, 8))
@@ -454,9 +511,32 @@ class LivestreamApp:
             failed,
         )
 
+    def _folder_name(self) -> str | None:
+        """The folder typed in the box, or None (with the reason in the status line) if it is unusable."""
+        name = self.folder.get().strip()
+        error = folder_error(name)
+        if error is not None:
+            self.status.set(f"Folder: {error}")
+            return None
+        return name
+
+    def _on_folder_commit(self, _event: Any = None) -> None:
+        """Remember a changed folder name in the config file, so the next start uses it."""
+        name = self._folder_name()
+        if name is None or name == self._saved_folder:
+            return
+        save_folder(self.config_file, name)
+        self._saved_folder = name
+        self.status.set(f"Recordings will be saved in {self.controller.output_dir / name}")
+
     def _on_record(self) -> None:
         if not self._recording:
-            self._run(self.controller.start_recording(), "Starting recording…", self._on_recording_started)
+            name = self._folder_name()
+            if name is None:
+                return
+            self._on_folder_commit()
+            clip_dir = self.controller.output_dir / name
+            self._run(self.controller.start_recording(clip_dir), "Starting recording…", self._on_recording_started)
         else:
             self._run(self.controller.stop_recording(), "Stopping recording…", self._on_recording_stopped)
 
@@ -512,6 +592,8 @@ class LivestreamApp:
         radio_state = "disabled" if self._busy or self._recording else "normal"
         for button in self.resolution_buttons:
             button.config(state=radio_state)
+        # The folder is fixed for the duration of a recording and its download.
+        self.folder_entry.config(state=radio_state)
 
     def _poll(self) -> None:
         while True:
@@ -583,7 +665,10 @@ class LivestreamApp:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live preview and record video from a GoPro over USB.")
     parser.add_argument(
-        "--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Where downloaded videos are saved"
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Base folder for downloaded videos; each recording goes into a subfolder of it",
     )
     parser.add_argument("--port", type=int, default=8554, help="UDP port for the preview stream")
     parser.add_argument(
@@ -603,7 +688,13 @@ def main() -> None:
     logging.getLogger("open_gopro").setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
     root = tk.Tk()
-    LivestreamApp(root, GoProController(args.output_dir, args.port, args.serial), upload=not args.no_upload)
+    LivestreamApp(
+        root,
+        GoProController(args.output_dir, args.port, args.serial),
+        upload=not args.no_upload,
+        folder=load_folder(CONFIG_FILE),
+        config_file=CONFIG_FILE,
+    )
     root.mainloop()
 
 

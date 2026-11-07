@@ -54,9 +54,10 @@ class Summary:
 def sync_uploads(output_dir: Path, upload: bool = True) -> Summary:
     """Reconcile the local videos with the bucket. With upload=False, only report."""
     summary = Summary()
+    # Recursive: the livestream app saves each recording into a subfolder of output_dir.
     local = {
         path.name: path
-        for path in sorted(output_dir.glob("*.mp4"))
+        for path in sorted(output_dir.rglob("*.mp4"))
         if not path.name.endswith(EXCLUDED_SUFFIXES)
     }
 

@@ -1,0 +1,305 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mlt LC_NUMERIC="C" version="7.41.0" title="Shotcut version 26.8.1" producer="tractor0" root="/home/juan/Documents/photobot/videos/shotcut">
+  <profile description="1920x1080 59.940 fps" width="1920" height="1080" progressive="1" sample_aspect_num="1" sample_aspect_den="1" display_aspect_num="16" display_aspect_den="9" frame_rate_num="60000" frame_rate_den="1001" colorspace="709" />
+  <producer id="black" in="0" out="1784">
+    <property name="length">1785</property>
+    <property name="eof">pause</property>
+    <property name="resource">0</property>
+    <property name="mlt_service">color</property>
+    <property name="mlt_image_format">rgba</property>
+    <property name="set.test_audio">0</property>
+  </producer>
+  <producer id="producer_97ffaf239bc1" in="0" out="1535">
+    <property name="length">1536</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_231310_GX012283.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">prep B</property>
+    <property name="shotcut:hash">f6d575f35bfc8ebf6b0b6a348e28ee3c</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_00b496cfff2f" in="0" out="1394">
+    <property name="length">1395</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_215215_GX012269.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">prep C</property>
+    <property name="shotcut:hash">660588ba3bef4c0c534827c58d1687d3</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_4590961b17ca" in="0" out="1423">
+    <property name="length">1424</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_215838_GX012270.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">X prep + MOI 0-4</property>
+    <property name="shotcut:hash">c8e3232acf5abff425e12be4b6d165c6</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_66ebb0f1fc7b" in="0" out="1244">
+    <property name="length">1245</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_214756_GX012268.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">montage 1</property>
+    <property name="shotcut:hash">a8320138bcb73fa2294d62b655faed36</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_0b2ce42a88ef" in="0" out="1439">
+    <property name="length">1440</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_232900_GX012285.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">montage 2</property>
+    <property name="shotcut:hash">0be97f66528e286bdb940ec56674024c</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_a790268a052a" in="0" out="1341">
+    <property name="length">1342</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_222424_GX012275.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">montage 3 (4.5 s)</property>
+    <property name="shotcut:hash">60b4f82593b9ca665efd1c6f8de0e53e</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_21bec5239020" in="0" out="1244">
+    <property name="length">1245</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_212415_GX012261.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 2 a</property>
+    <property name="shotcut:hash">7804929baee5d4230490f2ffddf9435d</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_c332c4ccb7f8" in="0" out="1547">
+    <property name="length">1548</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_232140_GX012284.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 2 b</property>
+    <property name="shotcut:hash">4975966df11823570ae2f191569814cb</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_00f4f8d28b84" in="0" out="1641">
+    <property name="length">1642</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_213821_GX012265.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 2 c</property>
+    <property name="shotcut:hash">b4da1de84b8da94751861f73a1c57c6a</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_a6c71591a142" in="0" out="1349">
+    <property name="length">1350</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_220312_GX012272.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 2 d (2 s)</property>
+    <property name="shotcut:hash">c8e1b83e7681656a32eac7adf4c7d4c9</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_af2c2a0a6a1e" in="0" out="1487">
+    <property name="length">1488</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_221757_GX012273.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 3 a</property>
+    <property name="shotcut:hash">1e479037a6479336c3c5a242a16e0e0f</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_93f5230e2347" in="0" out="4460">
+    <property name="length">4461</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_213250_GX012264.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 3 b</property>
+    <property name="shotcut:hash">2ddc4b3e718f658b4b267d645761c51f</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_9ea35325c78a" in="0" out="1519">
+    <property name="length">1520</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_223839_GX012276.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 3 c</property>
+    <property name="shotcut:hash">7547957561a4752d389a793bb15dcff4</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_cb4578669306" in="0" out="2012">
+    <property name="length">2013</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_213002_GX012263.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 3 d</property>
+    <property name="shotcut:hash">f673dacd4466b1f224b2de9f4bd80406</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_4f178652b0ba" in="0" out="1253">
+    <property name="length">1254</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_224423_GX012278.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">stage 3 e</property>
+    <property name="shotcut:hash">7b80e408e876ad86d99f95aa125e59f0</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+  </producer>
+  <producer id="producer_3423ed6e07c5" in="0" out="1416">
+    <property name="length">1417</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_224110_GX012277.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">final</property>
+    <property name="shotcut:hash">2bef6c937f2c1f7528485135e318c38a</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+    <filter id="filter_59034ecc0f9e" in="1047" out="1416">
+      <property name="mlt_service">volume</property>
+      <property name="shotcut:mcpVolume">1</property>
+      <property name="shotcut:filter">audioGain</property>
+      <property name="level">0=0;190=0;369=-70</property>
+    </filter>
+  </producer>
+  <producer id="producer_332f91273108" in="0" out="1689">
+    <property name="length">1690</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/20261031_214011_GX012266.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">dissolve into prep A</property>
+    <property name="shotcut:hash">87d1c3eb15346741327bde286e966e73</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+    <filter id="filter_007e5d84433a" in="274" out="315">
+      <property name="mlt_service">brightness</property>
+      <property name="shotcut:mcpOpacity">1</property>
+      <property name="level">1</property>
+      <property name="alpha">0=0;41=1</property>
+    </filter>
+    <filter id="filter_f61d58c40c29" in="274" out="315">
+      <property name="mlt_service">volume</property>
+      <property name="shotcut:mcpVolume">1</property>
+      <property name="shotcut:filter">audioGain</property>
+      <property name="level">0=-70;41=0</property>
+    </filter>
+  </producer>
+  <producer id="producer_56059bef5cbf" in="0" out="221">
+    <property name="length">222</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/shotcut/still_jdc_3p7s_1080p.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">JDC still 3.7 s</property>
+    <property name="shotcut:hash">10138ca36b5139b56b0f56d0ae3a5aa2</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+    <filter id="filter_f0dcd22a54e4" in="0" out="221">
+      <property name="mlt_service">brightness</property>
+      <property name="shotcut:mcpOpacity">1</property>
+      <property name="level">1</property>
+      <property name="alpha">0~=0;60~=1</property>
+    </filter>
+  </producer>
+  <producer id="producer_dd6c1b822b7d" in="0" out="179">
+    <property name="length">180</property>
+    <property name="eof">pause</property>
+    <property name="resource">/home/juan/Documents/photobot/videos/shotcut/still_selkabot_3s_1080p.mp4</property>
+    <property name="mlt_service">avformat-novalidate</property>
+    <property name="shotcut:caption">SelkaBot end card</property>
+    <property name="shotcut:hash">f85f506d00b26f80cd2a2ceb29ff3742</property>
+    <property name="seekable">1</property>
+    <property name="shotcut:skipConvert">1</property>
+    <filter id="filter_c1d82b0d565c" in="0" out="179">
+      <property name="mlt_service">brightness</property>
+      <property name="shotcut:mcpOpacity">1</property>
+      <property name="level">1</property>
+      <property name="alpha">0=0;179=1</property>
+    </filter>
+  </producer>
+  <playlist id="background">
+    <entry producer="black" in="0" out="1784" />
+  </playlist>
+  <playlist id="playlist_v1">
+    <property name="shotcut:video">1</property>
+    <property name="shotcut:name">V1</property>
+    <entry producer="producer_56059bef5cbf" in="0" out="221" />
+    <entry producer="producer_97ffaf239bc1" in="143" out="184" />
+    <entry producer="producer_00b496cfff2f" in="136" out="177" />
+    <entry producer="producer_4590961b17ca" in="173" out="441" />
+    <entry producer="producer_66ebb0f1fc7b" in="380" out="469" />
+    <entry producer="producer_0b2ce42a88ef" in="439" out="528" />
+    <entry producer="producer_a790268a052a" in="453" out="722" />
+    <entry producer="producer_21bec5239020" in="642" out="701" />
+    <entry producer="producer_c332c4ccb7f8" in="828" out="887" />
+    <entry producer="producer_00f4f8d28b84" in="797" out="856" />
+    <entry producer="producer_a6c71591a142" in="824" out="943" />
+    <entry producer="producer_af2c2a0a6a1e" in="964" out="981" />
+    <entry producer="producer_93f5230e2347" in="945" out="962" />
+    <entry producer="producer_9ea35325c78a" in="979" out="996" />
+    <entry producer="producer_cb4578669306" in="1057" out="1074" />
+    <entry producer="producer_4f178652b0ba" in="995" out="1012" />
+    <entry producer="producer_3423ed6e07c5" in="1047" out="1416" />
+  </playlist>
+  <playlist id="playlist_5e486db1f292">
+    <property name="shotcut:video">1</property>
+    <property name="shotcut:name">Overlay</property>
+    <blank length="180" />
+    <entry producer="producer_332f91273108" in="274" out="315" />
+    <blank length="1383" />
+    <entry producer="producer_dd6c1b822b7d" in="0" out="179" />
+  </playlist>
+  <tractor id="tractor0" in="0" out="1784">
+    <property name="shotcut">1</property>
+    <property name="shotcut:projectAudioChannels">2</property>
+    <property name="shotcut:processingMode">Native8Cpu</property>
+    <property name="shotcut:projectNote">Recreation of the v6 compilation pipeline (build_moi_v5.py). Sources: non-_original clips. Stage timings are in MOI seconds relative to each source's start time.</property>
+    <track producer="background" />
+    <track producer="playlist_v1" />
+    <track producer="playlist_5e486db1f292" />
+    <transition id="transition_8f6510a2190d">
+      <property name="a_track">0</property>
+      <property name="b_track">1</property>
+      <property name="always_active">1</property>
+      <property name="sum">1</property>
+      <property name="mlt_service">mix</property>
+      <property name="shotcut:mcpDefault">1</property>
+    </transition>
+    <transition id="transition_a96a9c3e1fc9">
+      <property name="a_track">0</property>
+      <property name="b_track">1</property>
+      <property name="threads">0</property>
+      <property name="mlt_service">qtblend</property>
+      <property name="disable">1</property>
+      <property name="shotcut:mcpDefault">1</property>
+    </transition>
+    <transition id="transition_2b07c52d9acf">
+      <property name="a_track">0</property>
+      <property name="b_track">2</property>
+      <property name="always_active">1</property>
+      <property name="sum">1</property>
+      <property name="mlt_service">mix</property>
+      <property name="shotcut:mcpDefault">1</property>
+    </transition>
+    <transition id="transition_996b0515b657">
+      <property name="a_track">1</property>
+      <property name="b_track">2</property>
+      <property name="threads">0</property>
+      <property name="mlt_service">qtblend</property>
+      <property name="disable">0</property>
+      <property name="shotcut:mcpDefault">1</property>
+    </transition>
+  </tractor>
+</mlt>
