@@ -1,7 +1,9 @@
 """Watermark and edit recordings with Shotcut's engine, as a script or from the livestream app.
 
-Public API (the same shape as sw/watermark.py, so it can replace that module):
+Public API (used by sw/livestream.py and the command line):
     add_watermark(video, output, watermarks=None, settings=None) -> Path
+    settings_for_recording(fadein_image, fadeout_image) -> EditSettings
+    watermarks_for(image) -> list of (image, corners)
 
 Settings (EditSettings in sw/shotcut_pipeline.py) are read from sw/livestream_config.json and
 can be overridden per run: from the command line, or in the window (--gui).
@@ -31,6 +33,7 @@ import logging
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +138,17 @@ def save_config(values: dict[str, Any], config_file: Path = CONFIG_FILE) -> None
         logger.exception("Could not save the config file %s", config_file)
 
 
+def settings_for_recording(fadein_image: Path | None, fadeout_image: Path | None) -> EditSettings:
+    """Settings for a live recording: the stored config (slowdowns, exposure, soundtrack, ...) plus
+    the fade stills of the livestream app. A config value that cannot be used falls back to defaults."""
+    try:
+        settings = settings_from(load_config())
+    except ValueError:
+        logger.exception("Ignoring the edit settings in %s; using the defaults", CONFIG_FILE)
+        settings = EditSettings()
+    return replace(settings, fadein_image=fadein_image, fadeout_image=fadeout_image)
+
+
 def add_watermark(
     video: Path,
     output: Path,
@@ -142,7 +156,7 @@ def add_watermark(
     settings: EditSettings | None = None,
     progress: ProgressFn | None = None,
 ) -> Path:
-    """Write an edited, watermarked copy of `video` to `output` (same contract as sw/watermark.py).
+    """Write an edited, watermarked copy of `video` to `output`.
 
     Args:
         video: Input video file.
@@ -219,7 +233,6 @@ def _settings_values(args: argparse.Namespace, stored: dict[str, Any]) -> dict[s
         "clip_length",
         "smoothing",
         "chunks",
-        "exposure",
         "fadein_image",
         "fadeout_image",
         "soundtrack",

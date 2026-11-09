@@ -63,7 +63,7 @@ from PIL import Image, ImageTk
 
 from sw.sync_uploads import sync_uploads
 from sw.uploader import make_qr, public_url, upload_video
-from sw.shotcut_pipeline import edit_clip, watermarks_for
+from sw import shotcut_watermark
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +155,12 @@ class PostProcessor:
 
     def _process(self, clip: Clip) -> None:
         try:
-            edit_clip(clip.original, clip.watermarked, clip.watermarks, clip.fadein_image, clip.fadeout_image)
+            shotcut_watermark.add_watermark(
+                clip.original,
+                clip.watermarked,
+                clip.watermarks,
+                shotcut_watermark.settings_for_recording(clip.fadein_image, clip.fadeout_image),
+            )
             shared = Shared(video=clip.watermarked)
             if self.upload:
                 # The URL and QR code were made from clip.key when the download finished (see
@@ -219,7 +224,7 @@ class GoProController:
         self._serial = serial
         self._gopro: WiredGoPro | None = None
         self._clip_dir = output_dir  # Folder for the clips of the current recording
-        self._watermarks = watermarks_for(None)  # Watermarks of the current recording
+        self._watermarks = shotcut_watermark.watermarks_for(None)  # Watermarks of the current recording
         self._fadein_image: Path | None = None
         self._fadeout_image: Path | None = None
         self._media_before: set[str] = set()
@@ -279,7 +284,7 @@ class GoProController:
         """
         clip_dir.mkdir(parents=True, exist_ok=True)
         self._clip_dir = clip_dir
-        self._watermarks = watermarks_for(image)
+        self._watermarks = shotcut_watermark.watermarks_for(image)
         self._fadein_image = fadein_image
         self._fadeout_image = fadeout_image
         self._media_before = await self._media_filenames()

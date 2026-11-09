@@ -58,6 +58,7 @@ def test_watermarked_name(original, expected):
 def test_add_watermark_delegates(monkeypatch, tmp_path):
     called = {}
     monkeypatch.setattr(w, "edit_clip", lambda *args, **kwargs: called.update(args=args, kwargs=kwargs) or args[1])
+    monkeypatch.setattr(w, "load_config", lambda *a, **k: {})  # No extra watermark image in the config
     out = w.add_watermark(tmp_path / "in.mp4", tmp_path / "out.mp4")
     assert out.name == "out.mp4" and called["args"][2] == w.watermarks_for(None)
 
@@ -75,7 +76,7 @@ def test_batch_skips_existing_and_supports_redo(monkeypatch, tmp_path):
 
 
 def test_settings_values_only_overrides_explicit_flags():
-    args = argparse.Namespace(**{name: None for name in ("slowdowns", "speed", "clip_start", "clip_length", "smoothing", "chunks", "fadein_image", "fadeout_image", "soundtrack", "soundtrack_start")})
+    args = argparse.Namespace(**{name: None for name in ("exposure", "slowdowns", "speed", "clip_start", "clip_length", "smoothing", "chunks", "fadein_image", "fadeout_image", "soundtrack", "soundtrack_start")})
     args.speed = 0.7
     assert w._settings_values(args, {"speed": 0.2, "chunks": 3}) == {"speed": 0.7, "chunks": 3}
 

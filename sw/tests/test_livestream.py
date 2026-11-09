@@ -32,7 +32,8 @@ def test_check_and_postprocessor(monkeypatch):
     class Response: ok = False; identifier = "x"; status = "bad"
     with pytest.raises(RuntimeError, match="x failed"): l._check(Response())
     events = queue.Queue(); done = []; errors = []
-    monkeypatch.setattr(l, "edit_clip", lambda *a, **k: None)
+    monkeypatch.setattr(l.shotcut_watermark, "add_watermark", lambda *a, **k: None)
+    monkeypatch.setattr(l.shotcut_watermark, "settings_for_recording", lambda *a: None)
     pp = l.PostProcessor(False, events, done.append, lambda c, e: errors.append(e))
     clip = l.Clip(Path("a"), Path("b"), Path("q"), "k", [], None, None)
     pp.submit(clip); pp.stop(); pp._thread.join(2)
@@ -42,7 +43,8 @@ def test_check_and_postprocessor(monkeypatch):
 
 def test_postprocessor_error_and_upload(monkeypatch):
     events = queue.Queue(); done = []; errors = []
-    monkeypatch.setattr(l, "edit_clip", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad edit")))
+    monkeypatch.setattr(l.shotcut_watermark, "settings_for_recording", lambda *a: None)
+    monkeypatch.setattr(l.shotcut_watermark, "add_watermark", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad edit")))
     pp = l.PostProcessor(False, events, done.append, lambda c, e: errors.append((c, e)))
     clip = l.Clip(Path("a"), Path("b"), Path("q"), "k", [], None, None)
     pp.submit(clip); pp.stop(); pp._thread.join(2)
