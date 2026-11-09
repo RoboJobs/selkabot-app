@@ -12,3 +12,4 @@ codev/.update-hashes.json
 *.mlt
 *.guard
 shotcut-mcp/*
+videos/*
