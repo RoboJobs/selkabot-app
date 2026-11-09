@@ -8,3 +8,4 @@ codev/.update-hashes.json
 .builders/
 *.FCBak
 .env
+*.pyc
