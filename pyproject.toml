@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=2.4.2",
     "opencv-python>=4.13.0.92",
     "pytest>=9.0.2",
+    "pytest-cov>=6.0.0",
     "rpi-hardware-pwm>=0.3.1",
     "tensorflow-hub>=0.16.1",
     "tensorflow[and-cuda]>=2.21.0",
