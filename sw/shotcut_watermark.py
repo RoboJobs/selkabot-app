@@ -31,11 +31,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from sw.shotcut_pipeline import SMOOTHING_MODES, EditSettings, ProgressFn, edit_clip, watermarks_for
+from sw.shotcut_pipeline import DEFAULT_CHUNKS, SMOOTHING_MODES, EditSettings, ProgressFn, edit_clip, watermarks_for
 
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = Path(__file__).resolve().parent / "livestream_config.json"
+DEFAULT_JOBS = 4  # Videos edited at the same time in a batch
 ORIGINAL_SUFFIX = "_original.mp4"
 WATERMARKED_SUFFIX = "_watermarked.mp4"
 
@@ -83,6 +84,9 @@ def settings_from(values: dict[str, Any]) -> EditSettings:
     smoothing = str(values.get("smoothing", "high")).strip() or "high"
     if smoothing not in SMOOTHING_MODES:
         raise ValueError(f"smoothing must be one of {', '.join(SMOOTHING_MODES)}, not {smoothing!r}")
+    chunks_text = _optional_float(values.get("chunks", DEFAULT_CHUNKS), "chunks")
+    if chunks_text is None or chunks_text < 1 or chunks_text != int(chunks_text):
+        raise ValueError(f"chunks must be a whole number of at least 1, not {values.get('chunks')!r}")
     fadein = str(values.get("fadein_image") or "").strip()
     fadeout = str(values.get("fadeout_image") or "").strip()
     try:
@@ -92,6 +96,7 @@ def settings_from(values: dict[str, Any]) -> EditSettings:
             clip_start=clip_start or 0.0,
             clip_length=_optional_float(values.get("clip_length"), "clip_length"),
             smoothing=smoothing,
+            chunks=int(chunks_text),
             fadein_image=Path(fadein) if fadein else None,
             fadeout_image=Path(fadeout) if fadeout else None,
         )
@@ -157,7 +162,7 @@ def batch(
     settings: EditSettings,
     watermarks: list | None = None,
     redo: bool = False,
-    jobs: int = 2,
+    jobs: int = DEFAULT_JOBS,
     progress: ProgressFn | None = None,
 ) -> list[Path]:
     """Edit every `*_original.mp4` in `folder` that has no watermarked version yet (or all, with redo).
@@ -196,7 +201,7 @@ def _emit(progress: ProgressFn | None, message: str) -> None:
 def _settings_values(args: argparse.Namespace, stored: dict[str, Any]) -> dict[str, Any]:
     """Stored config values, overridden by any flag given on the command line."""
     values = dict(stored)
-    for name in ("slowdowns", "speed", "clip_start", "clip_length", "smoothing", "fadein_image", "fadeout_image"):
+    for name in ("slowdowns", "speed", "clip_start", "clip_length", "smoothing", "chunks", "fadein_image", "fadeout_image"):
         value = getattr(args, name)
         if value is not None:
             values[name] = value
@@ -234,12 +239,16 @@ def run_gui(stored: dict[str, Any]) -> None:
     ttk.Combobox(frame, textvariable=smoothing, values=list(SMOOTHING_MODES), state="readonly").grid(
         row=len(fields), column=1, sticky="w", pady=2
     )
+    chunks = tk.StringVar(value=str(stored.get("chunks", DEFAULT_CHUNKS)))
+    ttk.Label(frame, text="Parallel chunks per slowdown").grid(row=len(fields) + 1, column=0, sticky="w", pady=2)
+    ttk.Entry(frame, textvariable=chunks, width=6).grid(row=len(fields) + 1, column=1, sticky="w", pady=2)
     status = tk.StringVar(value="Ready")
-    ttk.Label(frame, textvariable=status, wraplength=420).grid(row=len(fields) + 2, column=0, columnspan=2, sticky="w")
+    ttk.Label(frame, textvariable=status, wraplength=420).grid(row=len(fields) + 3, column=0, columnspan=2, sticky="w")
 
     def values() -> dict[str, Any]:
         result: dict[str, Any] = {key: var.get() for key, var in entries.items()}
         result["smoothing"] = smoothing.get()
+        result["chunks"] = chunks.get()
         return result
 
     updates: queue.Queue[str] = queue.Queue()
@@ -300,7 +309,7 @@ def run_gui(stored: dict[str, Any]) -> None:
         poll()
 
     button = ttk.Button(frame, text="Run", command=run)
-    button.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    button.grid(row=len(fields) + 2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
     root.mainloop()
 
 
@@ -310,13 +319,14 @@ def main() -> None:
     parser.add_argument("output", nargs="?", type=Path, help="Output file (default: …_watermarked.mp4)")
     parser.add_argument("--folder", type=Path, help="Edit every …_original.mp4 in this folder")
     parser.add_argument("--redo", action="store_true", help="With --folder, also redo videos already edited")
-    parser.add_argument("--jobs", type=int, default=2, help="With --folder, videos rendered at once (default 2)")
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"With --folder, videos rendered at once (default {DEFAULT_JOBS})")
     parser.add_argument("--gui", action="store_true", help="Open the window with textboxes for the settings")
     parser.add_argument("--slowdowns", help='Slow-motion windows, e.g. "8-12, 14-16" (seconds from clip start)')
     parser.add_argument("--speed", type=float, help="Speed inside slowdowns (default 0.3)")
     parser.add_argument("--clip-start", dest="clip_start", type=float, help="Clip start in the recording (s)")
     parser.add_argument("--clip-length", dest="clip_length", type=float, help="Clip length (s); default: the rest")
     parser.add_argument("--smoothing", choices=SMOOTHING_MODES, help="high (ffmpeg, slow) or shotcut (instant)")
+    parser.add_argument("--chunks", type=int, help=f"Parallel chunks per slowdown in high smoothing (default {DEFAULT_CHUNKS})")
     parser.add_argument("--fadein-image", dest="fadein_image", help="Still for the opening fade (file name)")
     parser.add_argument("--fadeout-image", dest="fadeout_image", help="Still for the closing fade (file name)")
     parser.add_argument("--image", help="Extra watermark image (file name), in addition to selkabot.png")

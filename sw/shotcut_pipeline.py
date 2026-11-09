@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -106,6 +107,11 @@ WATERMARK_SIZE_PCT = 10  # Each watermark's bounding box, as a percentage of the
 # sync uploads every .mp4 it finds in a recording folder).
 SMOOTH_CACHE_DIR = ROOT / "videos" / "shotcut" / "smoothed"
 SMOOTHING_MODES = ("high", "shotcut")
+# ffmpeg minterpolate is single-threaded, so each slowdown is split into this many chunks that
+# are rendered in parallel. Chunks overlap by CHUNK_CONTEXT_FRAMES source frames on each side.
+DEFAULT_CHUNKS = 4
+CHUNK_CONTEXT_FRAMES = 2
+MIN_CHUNK_SECONDS = 0.5  # Shorter windows get fewer chunks
 
 FADE_STILL_SECONDS = 2.0  # Full length of each fade still, before the crossfade eats into it
 FADE_TRANSITION_SECONDS = 1.0  # Crossfade length, split evenly between the still and the clip
@@ -141,6 +147,7 @@ class EditSettings:
     clip_start: float = 0.0
     clip_length: float | None = None
     smoothing: str = "high"
+    chunks: int = DEFAULT_CHUNKS  # Parallel pieces per slowdown in "high" smoothing
     fadein_image: Path | None = None
     fadeout_image: Path | None = None
 
@@ -149,6 +156,8 @@ class EditSettings:
             raise ValueError(f"smoothing must be one of {SMOOTHING_MODES}, not {self.smoothing!r}")
         if not 0 < self.speed <= 1:
             raise ValueError(f"speed must be in (0, 1], not {self.speed}")
+        if self.chunks < 1:
+            raise ValueError("chunks must be at least 1")
         if self.clip_start < 0:
             raise ValueError("clip_start cannot be negative")
         if self.clip_length is not None and self.clip_length <= 0:
@@ -244,6 +253,21 @@ def _atempo_chain(speed: float) -> str:
     return ",".join(filters)
 
 
+def _has_audio(path: Path) -> bool:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return bool(out.strip())
+
+
+def _effective_chunks(frames: int, fps: float, chunks: int) -> int:
+    """At most `chunks`, and never so many that a chunk is shorter than MIN_CHUNK_SECONDS."""
+    return max(1, min(chunks, int(frames / fps / MIN_CHUNK_SECONDS)))
+
+
 def smooth_segment(
     source: Path,
     probe: Probe,
@@ -252,13 +276,18 @@ def smooth_segment(
     speed: float,
     cache_dir: Path = SMOOTH_CACHE_DIR,
     progress: ProgressFn | None = None,
+    chunks: int = DEFAULT_CHUNKS,
 ) -> Path:
     """Return a file holding source frames [start_frame, end_frame) slowed to `speed`, smoothed.
 
     Motion-compensated interpolation (minterpolate, mci/aobmc, bidirectional, OBMC-based
     variable-size block matching) to an intermediate rate of fps/speed, then slowed to `speed`
-    and resampled back to the source frame rate. Audio is slowed with atempo (pitch kept).
-    Results are cached by their inputs, so an identical window is never rendered twice.
+    and resampled back to the source frame rate.
+
+    The window is cut into `chunks` pieces that are interpolated in parallel, each with a little
+    extra source footage on either side so the seams are interpolated with real neighbours; the
+    extra output frames are trimmed off and the pieces are joined. Audio is slowed in one pass
+    with atempo (pitch kept). Results are cached by their inputs.
     """
     fps = probe.fps_num / probe.fps_den
     stat = source.stat()
@@ -266,9 +295,10 @@ def smooth_segment(
         f"minterpolate=fps={round(fps / speed)}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
         f"setpts=PTS/{speed},fps={probe.fps_num}/{probe.fps_den}"
     )
-    # "v2": the trim is an input option (v1 trimmed after slowing down, cutting the segment short).
-    key_parts = ["v2", str(source.resolve()), str(stat.st_size), str(stat.st_mtime_ns), str(start_frame), str(end_frame)]
-    key_parts += [str(speed), video_filter, _atempo_chain(speed)]
+    chunks = _effective_chunks(end_frame - start_frame, fps, chunks)
+    # "v3": chunked rendering. The key covers everything that changes the output.
+    key_parts = ["v3", str(source.resolve()), str(stat.st_size), str(stat.st_mtime_ns), str(start_frame), str(end_frame)]
+    key_parts += [str(speed), video_filter, _atempo_chain(speed), f"chunks={chunks}"]
     key = hashlib.sha1("|".join(key_parts).encode()).hexdigest()[:16]
     output = cache_dir / f"smooth_{source.stem}_{start_frame}-{end_frame}_{key}.mp4"
     if output.exists():
@@ -276,51 +306,27 @@ def smooth_segment(
         return output
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+    work = cache_dir / f"{output.stem}.parts"
     temp = output.with_name(output.stem + ".tmp.mp4")
     expected_out = (end_frame - start_frame) / fps / speed
-    _report(progress, f"ffmpeg started: {end_frame - start_frame} source frames -> {expected_out:.1f}s at {speed}x")
+    _report(progress, f"ffmpeg started: {end_frame - start_frame} source frames -> {expected_out:.1f}s at {speed}x, {chunks} chunk(s)")
     started = time.monotonic()
     try:
-        _run_ffmpeg(
-            [
-                FFMPEG,
-                "-v",
-                "error",
-                "-y",
-                "-ss",
-                f"{start_frame / fps:.6f}",
-                "-t",
-                f"{(end_frame - start_frame) / fps:.6f}",
-                "-i",
-                str(source),
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a:0?",
-                "-vf",
-                video_filter,
-                "-af",
-                _atempo_chain(speed),
-                "-c:v",
-                "libx264",
-                "-crf",
-                "18",
-                "-preset",
-                "medium",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                str(temp),
-            ],
-            expected_out,
-            progress,
-        )
+        work.mkdir(parents=True, exist_ok=True)
+        parts = _render_chunks(source, probe, start_frame, end_frame, speed, video_filter, chunks, work, progress)
+        joined = work / "video.mp4"
+        _concat_parts(parts, joined, work)
+        if _has_audio(source):
+            audio = work / "audio.m4a"
+            _render_audio(source, probe, start_frame, end_frame, speed, audio)
+            _mux(joined, audio, temp)
+        else:
+            shutil.copyfile(joined, temp)
     except BaseException:
         temp.unlink(missing_ok=True)
+        shutil.rmtree(work, ignore_errors=True)
         raise
+    shutil.rmtree(work, ignore_errors=True)
     expected = round((end_frame - start_frame) / speed)
     actual = _video_frames(temp)
     if abs(actual - expected) > 2:
@@ -329,6 +335,143 @@ def smooth_segment(
     os.replace(temp, output)
     _report(progress, f"ffmpeg finished in {time.monotonic() - started:.0f}s")
     return output
+
+
+def _render_chunks(
+    source: Path,
+    probe: Probe,
+    start_frame: int,
+    end_frame: int,
+    speed: float,
+    video_filter: str,
+    chunks: int,
+    work: Path,
+    progress: ProgressFn | None,
+) -> list[Path]:
+    """Interpolate the window in `chunks` parallel pieces; returns them in order, trimmed exactly.
+
+    Piece i covers source frames [lo, hi) of the window, read with CHUNK_CONTEXT_FRAMES extra on
+    each side. Its output is trimmed to the output frames that belong to [lo, hi). The trim counts
+    are taken from the window's own frame grid (round(offset / speed)), so the pieces add up to
+    exactly the length of the whole window.
+    """
+    fps = probe.fps_num / probe.fps_den
+    length = end_frame - start_frame
+    bounds = [start_frame + round(i * length / chunks) for i in range(chunks + 1)]
+    jobs = []
+    for i, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
+        a = max(start_frame, lo - CHUNK_CONTEXT_FRAMES)
+        b = min(end_frame, hi + CHUNK_CONTEXT_FRAMES)
+        trim_start = round((lo - start_frame) / speed) - round((a - start_frame) / speed)
+        trim_end = round((hi - start_frame) / speed) - round((a - start_frame) / speed)
+        jobs.append((i, a, b, trim_start, trim_end))
+
+    def render(job: tuple[int, int, int, int, int]) -> Path:
+        i, a, b, trim_start, trim_end = job
+        out = work / f"part_{i:02d}.mp4"
+        vf = f"{video_filter},trim=start_frame={trim_start}:end_frame={trim_end},setpts=PTS-STARTPTS"
+        chunk_seconds = (trim_end - trim_start) / fps
+        _run_ffmpeg(
+            [
+                FFMPEG,
+                "-v",
+                "error",
+                "-y",
+                "-ss",
+                f"{a / fps:.6f}",
+                "-t",
+                f"{(b - a) / fps:.6f}",
+                "-i",
+                str(source),
+                "-an",
+                "-vf",
+                vf,
+                "-c:v",
+                "libx264",
+                "-crf",
+                "18",
+                "-preset",
+                "medium",
+                "-pix_fmt",
+                "yuv420p",
+                str(out),
+            ],
+            chunk_seconds,
+            None if progress is None else (lambda m, i=i: progress(f"chunk {i + 1}/{chunks} {m}")),
+        )
+        return out
+
+    with ThreadPoolExecutor(max_workers=chunks) as pool:
+        return list(pool.map(render, jobs))
+
+
+def _concat_parts(parts: list[Path], output: Path, work: Path) -> None:
+    listing = work / "parts.txt"
+    listing.write_text("".join(f"file '{part.resolve()}'\n" for part in parts), encoding="utf-8")
+    subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(output)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _render_audio(source: Path, probe: Probe, start_frame: int, end_frame: int, speed: float, output: Path) -> None:
+    fps = probe.fps_num / probe.fps_den
+    subprocess.run(
+        [
+            FFMPEG,
+            "-v",
+            "error",
+            "-y",
+            "-ss",
+            f"{start_frame / fps:.6f}",
+            "-t",
+            f"{(end_frame - start_frame) / fps:.6f}",
+            "-i",
+            str(source),
+            "-vn",
+            # Pad to the video's length: the slowed audio can be a few frames short, and the mux
+            # must not cut the video down to it.
+            "-af",
+            f"{_atempo_chain(speed)},apad",
+            "-t",
+            f"{(end_frame - start_frame) / fps / speed:.6f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _mux(video: Path, audio: Path, output: Path) -> None:
+    subprocess.run(
+        [
+            FFMPEG,
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(video),
+            "-i",
+            str(audio),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c",
+            "copy",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _clip_window(lo_frame: int, hi_frame: int, fps: float, start_s: float, end_s: float) -> tuple[int, int] | None:
@@ -679,7 +822,13 @@ def edit_clip(
             k, (start, end) = item
             label = f"slowdown {k}/{len(windows)}"
             return smooth_segment(
-                original, probe, start, end, settings.speed, progress=lambda m: _emit(progress, f"{name}: {label}: {m}")
+                original,
+                probe,
+                start,
+                end,
+                settings.speed,
+                progress=lambda m: _emit(progress, f"{name}: {label}: {m}"),
+                chunks=settings.chunks,
             )
 
         # The windows are rendered in parallel: each ffmpeg process is single-threaded.
