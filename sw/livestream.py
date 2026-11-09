@@ -443,12 +443,22 @@ def load_config(config_file: Path) -> tuple[str, str, str, str]:
 def save_config(config_file: Path, folder: str, image: str, fadein_image: str, fadeout_image: str) -> None:
     """Store the recording folder, watermark image and fade stills in the config file."""
     try:
-        config = {
-            "folder": folder,
-            "image": image,
-            "fadein_image": fadein_image,
-            "fadeout_image": fadeout_image,
-        }
+        # Merge into the existing file so keys this app does not edit (such as the slowdown and
+        # clip settings read by sw/shotcut_watermark.py) are kept.
+        try:
+            config = json.loads(config_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        config.update(
+            {
+                "folder": folder,
+                "image": image,
+                "fadein_image": fadein_image,
+                "fadeout_image": fadeout_image,
+            }
+        )
         config_file.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     except OSError:
         logger.exception("Could not save the config file %s", config_file)

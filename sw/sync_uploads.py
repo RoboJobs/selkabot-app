@@ -13,15 +13,19 @@ Steps:
    an object with the same key and the same size.
 3. Upload the videos that are missing, or whose size differs (a partial object).
 
-For now only plain `<name>.mp4` files are synced. The `_original` files are never
-uploaded, and `_watermarked` files came after these recordings, so they are not
-handled yet.
+Which local files are synced: every `.mp4` in the folder except `_original.mp4` (the raw
+camera download, never uploaded) and `.rendering.mp4` (a render still in progress). The
+`_watermarked.mp4` files are the ones uploaded by the livestream app. A `_watermarked.mp4`
+whose duration is well short of its original's is skipped and reported, because it is a
+truncated render (for example after the app was stopped mid-render).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,7 +34,10 @@ from sw.uploader import abort_upload, incomplete_uploads, list_objects, upload_v
 logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "videos"
-EXCLUDED_SUFFIXES = ("_original.mp4", "_watermarked.mp4")
+EXCLUDED_SUFFIXES = ("_original.mp4", ".rendering.mp4")
+# A watermarked clip is never shorter than its original (the slowdowns and fades only add time),
+# so anything well shorter is a truncated render.
+MIN_DURATION_RATIO = 0.9
 
 
 @dataclass
@@ -43,6 +50,7 @@ class Summary:
     uploaded: list[str] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)  # Missing or wrong size, not uploaded (report only)
     failed: dict[str, str] = field(default_factory=dict)  # Name -> error
+    skipped: list[str] = field(default_factory=list)  # Truncated renders, not uploaded
 
     def log(self) -> None:
         logger.info("Upload sync summary")
@@ -52,6 +60,36 @@ class Summary:
         logger.info("  Uploaded now: %d %s", len(self.uploaded), self.uploaded)
         logger.info("  Pending (not uploaded): %d %s", len(self.pending), self.pending)
         logger.info("  Failed: %d %s", len(self.failed), self.failed)
+        logger.info("  Skipped (truncated render): %d %s", len(self.skipped), self.skipped)
+
+
+def media_duration(path: Path) -> float:
+    """Duration of a media file in seconds, from ffprobe."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return float(json.loads(out)["format"]["duration"])
+
+
+def is_complete_render(path: Path) -> bool:
+    """False if `path` is a `_watermarked.mp4` much shorter than its `_original.mp4`."""
+    if not path.name.endswith("_watermarked.mp4"):
+        return True  # Only watermarked renders have an original to compare against
+    sidecar = path.with_suffix(".edit.json")  # Written by sw/shotcut_pipeline.py with the expected length
+    if sidecar.exists():
+        try:
+            expected = float(json.loads(sidecar.read_text(encoding="utf-8"))["expected_seconds"])
+        except (OSError, ValueError, KeyError):
+            expected = None
+        if expected is not None:
+            return media_duration(path) >= MIN_DURATION_RATIO * expected
+    original = path.with_name(path.name.replace("_watermarked.mp4", "_original.mp4"))
+    if not original.exists():
+        return True
+    return media_duration(path) >= MIN_DURATION_RATIO * media_duration(original)
 
 
 def sync_uploads(output_dir: Path, folder: str, upload: bool = True) -> Summary:
@@ -59,11 +97,15 @@ def sync_uploads(output_dir: Path, folder: str, upload: bool = True) -> Summary:
     summary = Summary()
     prefix = f"{folder}/"
     # Bucket keys of this folder, e.g. "<folder>/<name>.mp4". Other folders are ignored.
-    local = {
-        f"{prefix}{path.name}": path
-        for path in sorted((output_dir / folder).glob("*.mp4"))
-        if not path.name.endswith(EXCLUDED_SUFFIXES)
-    }
+    local = {}
+    for path in sorted((output_dir / folder).glob("*.mp4")):
+        if path.name.endswith(EXCLUDED_SUFFIXES):
+            continue
+        if not is_complete_render(path):
+            logger.warning("Not uploading %s: much shorter than its original, so the render is incomplete", path)
+            summary.skipped.append(f"{prefix}{path.name}")
+            continue
+        local[f"{prefix}{path.name}"] = path
 
     for key, upload_id in incomplete_uploads():
         if not key.startswith(prefix):
