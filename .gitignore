@@ -9,3 +9,5 @@ codev/.update-hashes.json
 *.FCBak
 .env
 *.pyc
+*.mlt
+*.guard

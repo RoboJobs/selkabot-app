@@ -1,0 +1,15 @@
+{
+  "folder": "likegym20261108",
+  "image": "likegym_watermark.png",
+  "fadein_image": "likegym.png",
+  "fadeout_image": "selkabot.png",
+  "slowdowns": "3.5-4.5, 8.5-10",
+  "speed": "0.3",
+  "clip_start": "0",
+  "clip_length": "16",
+  "smoothing": "high",
+  "chunks": "4",
+  "soundtrack": "/home/juan/Downloads/Telegram Desktop/1108.MP3",
+  "soundtrack_start": "1",
+  "exposure": 0.7
+}
