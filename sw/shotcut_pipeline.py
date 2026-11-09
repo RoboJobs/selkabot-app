@@ -121,13 +121,33 @@ FADE_TRANSITION_SECONDS = 1.0  # Crossfade length, split evenly between the stil
 MELT = os.environ.get("SHOTCUT_MELT_PATH", "melt")
 FFMPEG = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
-# x%, y% of the top-left corner of each watermark's bounding box (box is WATERMARK_SIZE_PCT wide).
-_CORNER_XY = {
-    "top-left": (0, 0),
-    "top-right": (100 - WATERMARK_SIZE_PCT, 0),
-    "bottom-left": (0, 100 - WATERMARK_SIZE_PCT),
-    "bottom-right": (100 - WATERMARK_SIZE_PCT, 100 - WATERMARK_SIZE_PCT),
-}
+
+def _corner_xy(corner: str, box_h: float) -> tuple[float, float]:
+    """x%, y% of the top-left corner of a watermark box WATERMARK_SIZE_PCT wide and `box_h` tall."""
+    x = 0 if corner.endswith("left") else 100 - WATERMARK_SIZE_PCT
+    y = 0 if corner.startswith("top") else 100 - box_h
+    return x, y
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    width, height = (int(v) for v in out.split(","))
+    return width, height
+
+
+def _watermark_box_height(image: Path, probe: "Probe") -> float:
+    """Height of a watermark's box, in % of the frame height, for the image's own aspect ratio.
+
+    The width is WATERMARK_SIZE_PCT of the frame width (the same size rule as sw/watermark.py), so the
+    height follows from the image's shape, and the image fills the box without distortion.
+    """
+    image_w, image_h = _image_size(image)
+    return WATERMARK_SIZE_PCT * (probe.width / probe.height) * (image_h / image_w)
 
 
 @dataclass(frozen=True)
@@ -230,9 +250,11 @@ def _fit_filter(filter_id: str, out: int) -> str:
     )
 
 
-def _watermark_filters(transform_id: str, opacity_id: str, out: int, corner: str, alpha_keyframes: str) -> str:
-    x, y = _CORNER_XY[corner]
-    rect = f"0={x}%/{y}%:{WATERMARK_SIZE_PCT}%x{WATERMARK_SIZE_PCT}%"
+def _watermark_filters(
+    transform_id: str, opacity_id: str, out: int, corner: str, alpha_keyframes: str, box_h: float
+) -> str:
+    x, y = _corner_xy(corner, box_h)
+    rect = f"0={x}%/{y}%:{WATERMARK_SIZE_PCT}%x{box_h:.4f}%"
     return (
         f'    <filter id={quoteattr(transform_id)} in="0" out="{out}">\n'
         f"{_prop('mlt_service', 'affine')}\n"
@@ -696,6 +718,7 @@ def build_project_xml(
 
     watermark_tracks: list[str] = []
     for i, (image, corners) in enumerate(watermarks):
+        box_h = _watermark_box_height(image, probe)
         for j, corner in enumerate(corners):
             wm_id = f"wm_{i}_{j}"
             producers.append(
@@ -703,7 +726,7 @@ def build_project_xml(
                 f"{_prop('length', total_final)}\n"
                 f"{_prop('resource', image)}\n"
                 f"{_prop('mlt_service', 'qimage')}\n"
-                f"{_watermark_filters(f'{wm_id}_t', f'{wm_id}_o', total_final - 1, corner, alpha_keyframes)}\n"
+                f"{_watermark_filters(f'{wm_id}_t', f'{wm_id}_o', total_final - 1, corner, alpha_keyframes, box_h)}\n"
                 f"  </producer>"
             )
             watermark_tracks.append(
@@ -842,6 +865,9 @@ def edit_clip(
     # caller's cwd, so every path written into the XML must be absolute.
     original = original.resolve()
     watermarks = [(image.resolve(), corners) for image, corners in watermarks]
+    for image, _ in watermarks:
+        if not image.is_file():
+            raise FileNotFoundError(f"watermark image not found: {image}")
     fadein_image = fadein_image.resolve() if fadein_image else None
     fadeout_image = fadeout_image.resolve() if fadeout_image else None
 

@@ -155,7 +155,8 @@ def add_watermark(
         The output path.
     """
     if watermarks is None:
-        watermarks = watermarks_for(None)
+        # The extra watermark image stored in the config (the always-used selkabot.png is added too).
+        watermarks = watermarks_for(str(load_config().get("image") or "").strip() or None)
     return edit_clip(video, output, watermarks, settings=settings, progress=progress)
 
 
@@ -248,6 +249,7 @@ def run_gui(stored: dict[str, Any]) -> None:
         ("Fade-in image", "fadein_image", str(stored.get("fadein_image") or "")),
         ("Fade-out image", "fadeout_image", str(stored.get("fadeout_image") or "")),
         ("Soundtrack file", "soundtrack", str(stored.get("soundtrack") or "")),
+        ("Watermark image (top-left, bottom-right)", "image", str(stored.get("image") or "")),
         ("Soundtrack start (s)", "soundtrack_start", str(stored.get("soundtrack_start", 0))),
         ("Video (single run)", "video", ""),
         ("Folder (batch run)", "folder", str(stored.get("folder") or "")),
@@ -317,6 +319,7 @@ def run_gui(stored: dict[str, Any]) -> None:
             status.set(str(e))
             return
         video = Path(vals["video"].strip()) if vals["video"].strip() else None
+        watermarks = watermarks_for(vals["image"].strip() or None)
         folder = Path(vals["folder"].strip()) if vals["folder"].strip() else None
         if video is None and folder is None:
             status.set("Give a video or a folder")
@@ -331,10 +334,10 @@ def run_gui(stored: dict[str, Any]) -> None:
             try:
                 if video:
                     output = watermarked_name(video)
-                    add_watermark(video, output, None, settings, progress=updates.put)
+                    add_watermark(video, output, watermarks, settings, progress=updates.put)
                     message = f"Done: wrote {output}"
                 else:
-                    done = batch(folder, settings, progress=updates.put)
+                    done = batch(folder, settings, watermarks, progress=updates.put)
                     message = f"Done: wrote {len(done)} video(s) to {folder}"
             except Exception as e:  # pylint: disable=broad-except
                 logger.exception("Render failed")
@@ -383,7 +386,8 @@ def main() -> None:
         settings = settings_from(values)
     except ValueError as e:
         parser.error(str(e))
-    watermarks = watermarks_for(args.image)
+    image = args.image if args.image is not None else stored.get("image")
+    watermarks = watermarks_for(str(image or "").strip() or None)
     if args.save:
         save_config(values)
 
