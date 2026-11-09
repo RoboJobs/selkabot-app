@@ -13,6 +13,8 @@ Keys in livestream_config.json (all optional):
     "clip_length":  ""              clip length in seconds; "" = the rest of the recording
     "smoothing":    "high"          "high" (ffmpeg minterpolate) or "shotcut" (MLT timewarp)
     "fadein_image", "fadeout_image", "image": file names in the current directory
+    "soundtrack":   ""              audio file that replaces the recording's sound; "" = keep it
+    "soundtrack_start": 0           where in the soundtrack file the video starts, seconds
 
 Usage:
     uv run python -m sw.shotcut_watermark VIDEO [OUTPUT] [--slowdowns "8-12,14-16"] ...
@@ -87,6 +89,8 @@ def settings_from(values: dict[str, Any]) -> EditSettings:
     chunks_text = _optional_float(values.get("chunks", DEFAULT_CHUNKS), "chunks")
     if chunks_text is None or chunks_text < 1 or chunks_text != int(chunks_text):
         raise ValueError(f"chunks must be a whole number of at least 1, not {values.get('chunks')!r}")
+    soundtrack = str(values.get("soundtrack") or "").strip()
+    soundtrack_start = _optional_float(values.get("soundtrack_start", 0), "soundtrack_start") or 0.0
     fadein = str(values.get("fadein_image") or "").strip()
     fadeout = str(values.get("fadeout_image") or "").strip()
     try:
@@ -99,6 +103,8 @@ def settings_from(values: dict[str, Any]) -> EditSettings:
             chunks=int(chunks_text),
             fadein_image=Path(fadein) if fadein else None,
             fadeout_image=Path(fadeout) if fadeout else None,
+            soundtrack=Path(soundtrack) if soundtrack else None,
+            soundtrack_start=soundtrack_start,
         )
     except ValueError as e:
         raise ValueError(str(e)) from None
@@ -201,7 +207,18 @@ def _emit(progress: ProgressFn | None, message: str) -> None:
 def _settings_values(args: argparse.Namespace, stored: dict[str, Any]) -> dict[str, Any]:
     """Stored config values, overridden by any flag given on the command line."""
     values = dict(stored)
-    for name in ("slowdowns", "speed", "clip_start", "clip_length", "smoothing", "chunks", "fadein_image", "fadeout_image"):
+    for name in (
+        "slowdowns",
+        "speed",
+        "clip_start",
+        "clip_length",
+        "smoothing",
+        "chunks",
+        "fadein_image",
+        "fadeout_image",
+        "soundtrack",
+        "soundtrack_start",
+    ):
         value = getattr(args, name)
         if value is not None:
             values[name] = value
@@ -225,6 +242,8 @@ def run_gui(stored: dict[str, Any]) -> None:
         ("Clip length (s, empty = rest)", "clip_length", "" if stored.get("clip_length") in (None, "") else str(stored["clip_length"])),
         ("Fade-in image", "fadein_image", str(stored.get("fadein_image") or "")),
         ("Fade-out image", "fadeout_image", str(stored.get("fadeout_image") or "")),
+        ("Soundtrack file", "soundtrack", str(stored.get("soundtrack") or "")),
+        ("Soundtrack start (s)", "soundtrack_start", str(stored.get("soundtrack_start", 0))),
         ("Video (single run)", "video", ""),
         ("Folder (batch run)", "folder", str(stored.get("folder") or "")),
     ]
@@ -329,6 +348,8 @@ def main() -> None:
     parser.add_argument("--chunks", type=int, help=f"Parallel chunks per slowdown in high smoothing (default {DEFAULT_CHUNKS})")
     parser.add_argument("--fadein-image", dest="fadein_image", help="Still for the opening fade (file name)")
     parser.add_argument("--fadeout-image", dest="fadeout_image", help="Still for the closing fade (file name)")
+    parser.add_argument("--soundtrack", help="Audio file that replaces the recording's sound")
+    parser.add_argument("--soundtrack-start", dest="soundtrack_start", type=float, help="Where the video starts in the soundtrack (s)")
     parser.add_argument("--image", help="Extra watermark image (file name), in addition to selkabot.png")
     parser.add_argument("--save", action="store_true", help="Store these settings in the config file")
     args = parser.parse_args()

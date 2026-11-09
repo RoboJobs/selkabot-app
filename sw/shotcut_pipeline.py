@@ -150,8 +150,12 @@ class EditSettings:
     chunks: int = DEFAULT_CHUNKS  # Parallel pieces per slowdown in "high" smoothing
     fadein_image: Path | None = None
     fadeout_image: Path | None = None
+    soundtrack: Path | None = None  # Replaces the recording's own sound when set
+    soundtrack_start: float = 0.0  # Where in the soundtrack file the output starts, in seconds
 
     def __post_init__(self) -> None:
+        if self.soundtrack_start < 0:
+            raise ValueError("soundtrack_start cannot be negative")
         if self.smoothing not in SMOOTHING_MODES:
             raise ValueError(f"smoothing must be one of {SMOOTHING_MODES}, not {self.smoothing!r}")
         if not 0 < self.speed <= 1:
@@ -391,7 +395,7 @@ def _render_chunks(
                 "-crf",
                 "18",
                 "-preset",
-                "medium",
+                "fast",
                 "-pix_fmt",
                 "yuv420p",
                 str(out),
@@ -481,6 +485,16 @@ def _clip_window(lo_frame: int, hi_frame: int, fps: float, start_s: float, end_s
     return (start, end) if end > start else None
 
 
+def _duration_seconds(path: Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return float(out.strip())
+
+
 def build_project_xml(
     source: Path,
     probe: Probe,
@@ -490,10 +504,13 @@ def build_project_xml(
     clip: tuple[int, int],
     windows: list[tuple[int, int, Path | None]],
     speed: float,
+    music: tuple[Path, int, int] | None = None,
 ) -> tuple[str, int]:
     """Build the MLT project XML for one edited, watermarked clip; also returns its length in frames.
 
     clip: (first source frame, number of frames) of the clip.
+    music: (soundtrack file, first frame of the soundtrack to use, length of the soundtrack in
+        frames), or None to keep the recording's own sound. Frames are at the project's frame rate.
     windows: slow-motion windows as (start, end) source frames within the clip, each with the
         pre-rendered smoothed file for it, or None to use MLT's timewarp instead.
     """
@@ -675,6 +692,25 @@ def build_project_xml(
 
     corner_pairs = [(i, j) for i, (_, c) in enumerate(watermarks) for j in range(len(c))]
     tracks_xml = "\n".join(f'    <track producer="pl_wm_{i}_{j}" />' for i, j in corner_pairs)
+    # With a soundtrack, the recording's own audio is hidden and the soundtrack is an extra
+    # audio-only track whose playlist entry is exactly the output's length.
+    v1_track = '    <track producer="playlist_v1" />\n'
+    music_xml = ""
+    music_track = ""
+    if music is not None:
+        music_path, music_in, music_len = music
+        v1_track = '    <track producer="playlist_v1" hide="audio" />\n'
+        music_xml = (
+            f'  <producer id="music" in="0" out="{music_len - 1}">\n'
+            f"{_prop('length', music_len)}\n"
+            f"{_prop('resource', music_path)}\n"
+            f"{_prop('mlt_service', 'avformat-novalidate')}\n"
+            f"  </producer>\n"
+            f'  <playlist id="pl_music">\n'
+            f'    <entry producer="music" in="{music_in}" out="{music_in + total_final - 1}" />\n'
+            f"  </playlist>\n"
+        )
+        music_track = '    <track producer="pl_music" />\n'
     composite_transitions = "\n".join(
         f'    <transition id="composite_{i}_{j}">\n'
         f"{_prop('a_track', '0')}\n"
@@ -700,12 +736,14 @@ def build_project_xml(
         + '  <playlist id="playlist_v1">\n'
         + "\n".join(v1_entries)
         + "\n  </playlist>\n"
+        + music_xml
         + "\n".join(watermark_tracks)
         + "\n"
         + f'  <tractor id="tractor0" in="0" out="{total_final - 1}">\n'
-        + '    <track producer="playlist_v1" />\n'
+        + v1_track
         + tracks_xml
         + "\n"
+        + music_track
         + composite_transitions
         + "\n  </tractor>\n"
         "</mlt>\n",
@@ -836,6 +874,17 @@ def edit_clip(
             smoothed = list(pool.map(smooth_one, enumerate(windows, start=1)))
         say("smoothing done")
 
+    music = None
+    soundtrack = None
+    if settings.soundtrack is not None:
+        soundtrack = settings.soundtrack.resolve()
+        if not soundtrack.is_file():
+            raise FileNotFoundError(f"soundtrack not found: {soundtrack}")
+        music = (
+            soundtrack,
+            round(settings.soundtrack_start * fps),
+            round(_duration_seconds(soundtrack) * fps),
+        )
     xml, total_frames = build_project_xml(
         original,
         probe,
@@ -845,7 +894,16 @@ def edit_clip(
         clip,
         [(s, e, path) for (s, e), path in zip(windows, smoothed)],
         settings.speed,
+        music,
     )
+    if music is not None:
+        _, music_in, music_len = music
+        if music_in + total_frames > music_len:
+            say(
+                f"warning: soundtrack {soundtrack.name} ends after "
+                f"{(music_len - music_in) / fps:.1f}s from the start point; the rest of the video is silent"
+            )
+        say(f"soundtrack {soundtrack.name} from {settings.soundtrack_start:g}s")
 
     # The project is kept next to the rendered video (<name>_watermarked.mlt) so it can be
     # opened in Shotcut and edited afterwards. It is never deleted.
