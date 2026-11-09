@@ -147,6 +147,7 @@ class EditSettings:
     clip_start: float = 0.0
     clip_length: float | None = None
     smoothing: str = "high"
+    exposure: float = 0.0  # Stops: negative is darker, positive brighter. Applied to the recording only.
     chunks: int = DEFAULT_CHUNKS  # Parallel pieces per slowdown in "high" smoothing
     fadein_image: Path | None = None
     fadeout_image: Path | None = None
@@ -154,6 +155,8 @@ class EditSettings:
     soundtrack_start: float = 0.0  # Where in the soundtrack file the output starts, in seconds
 
     def __post_init__(self) -> None:
+        if not -3 <= self.exposure <= 3:
+            raise ValueError(f"exposure must be between -3 and 3 stops, not {self.exposure}")
         if self.soundtrack_start < 0:
             raise ValueError("soundtrack_start cannot be negative")
         if self.smoothing not in SMOOTHING_MODES:
@@ -485,6 +488,18 @@ def _clip_window(lo_frame: int, hi_frame: int, fps: float, start_s: float, end_s
     return (start, end) if end > start else None
 
 
+def _exposure_filter(filter_id: str, exposure: float) -> str:
+    """An avfilter exposure adjustment (in stops) for use inside a producer; "" when there is none."""
+    if not exposure:
+        return ""
+    return (
+        f"    <filter id={quoteattr(filter_id)}>\n"
+        f"{_prop('mlt_service', 'avfilter.exposure')}\n"
+        f"{_prop('av.exposure', exposure)}\n"
+        f"    </filter>\n"
+    )
+
+
 def _duration_seconds(path: Path) -> float:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
@@ -505,10 +520,14 @@ def build_project_xml(
     windows: list[tuple[int, int, Path | None]],
     speed: float,
     music: tuple[Path, int, int] | None = None,
+    exposure: float = 0.0,
 ) -> tuple[str, int]:
     """Build the MLT project XML for one edited, watermarked clip; also returns its length in frames.
 
     clip: (first source frame, number of frames) of the clip.
+    exposure: stops to add to the recording's footage (the main clip and the slowdowns). The fade
+        stills and the watermarks are not adjusted. It is applied here, at render time, not in the
+        cached smoothed segments, so changing it does not re-render them.
     music: (soundtrack file, first frame of the soundtrack to use, length of the soundtrack in
         frames), or None to keep the recording's own sound. Frames are at the project's frame rate.
     windows: slow-motion windows as (start, end) source frames within the clip, each with the
@@ -538,6 +557,7 @@ def build_project_xml(
         f"{_prop('length', probe.total_frames)}\n"
         f"{_prop('resource', source)}\n"
         f"{_prop('mlt_service', 'avformat-novalidate')}\n"
+        f"{_exposure_filter('exposure_main', exposure)}"
         f"  </producer>"
     )
 
@@ -595,6 +615,7 @@ def build_project_xml(
             f"{_prop('warp_resource', source)}\n"
             f"{_prop('warp_speed', speed)}\n"
             f"{_prop('warp_pitch', '1')}\n"
+            f"{_exposure_filter('exposure_timewarp', exposure)}"
             f"  </producer>"
         )
     for k, (start, end, smoothed) in enumerate(windows):
@@ -614,6 +635,7 @@ def build_project_xml(
                 f"{_prop('length', length)}\n"
                 f"{_prop('resource', smoothed)}\n"
                 f"{_prop('mlt_service', 'avformat-novalidate')}\n"
+                f"{_exposure_filter(f'exposure_{slow_id}', exposure)}"
                 f"  </producer>"
             )
             add_entry(f'    <entry producer="{slow_id}" in="0" out="{length - 1}" />', length)
@@ -895,7 +917,10 @@ def edit_clip(
         [(s, e, path) for (s, e), path in zip(windows, smoothed)],
         settings.speed,
         music,
+        exposure=settings.exposure,
     )
+    if settings.exposure:
+        say(f"exposure {settings.exposure:+g} stops on the recording")
     if music is not None:
         _, music_in, music_len = music
         if music_in + total_frames > music_len:

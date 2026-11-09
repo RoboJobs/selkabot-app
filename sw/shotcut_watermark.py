@@ -13,6 +13,7 @@ Keys in livestream_config.json (all optional):
     "clip_length":  ""              clip length in seconds; "" = the rest of the recording
     "smoothing":    "high"          "high" (ffmpeg minterpolate) or "shotcut" (MLT timewarp)
     "fadein_image", "fadeout_image", "image": file names in the current directory
+    "exposure":     0               brightness of the recording, stops: -3..3 (negative = darker)
     "soundtrack":   ""              audio file that replaces the recording's sound; "" = keep it
     "soundtrack_start": 0           where in the soundtrack file the video starts, seconds
 
@@ -89,6 +90,7 @@ def settings_from(values: dict[str, Any]) -> EditSettings:
     chunks_text = _optional_float(values.get("chunks", DEFAULT_CHUNKS), "chunks")
     if chunks_text is None or chunks_text < 1 or chunks_text != int(chunks_text):
         raise ValueError(f"chunks must be a whole number of at least 1, not {values.get('chunks')!r}")
+    exposure = _optional_float(values.get("exposure", 0), "exposure") or 0.0
     soundtrack = str(values.get("soundtrack") or "").strip()
     soundtrack_start = _optional_float(values.get("soundtrack_start", 0), "soundtrack_start") or 0.0
     fadein = str(values.get("fadein_image") or "").strip()
@@ -103,6 +105,7 @@ def settings_from(values: dict[str, Any]) -> EditSettings:
             chunks=int(chunks_text),
             fadein_image=Path(fadein) if fadein else None,
             fadeout_image=Path(fadeout) if fadeout else None,
+            exposure=exposure,
             soundtrack=Path(soundtrack) if soundtrack else None,
             soundtrack_start=soundtrack_start,
         )
@@ -208,12 +211,14 @@ def _settings_values(args: argparse.Namespace, stored: dict[str, Any]) -> dict[s
     """Stored config values, overridden by any flag given on the command line."""
     values = dict(stored)
     for name in (
+        "exposure",
         "slowdowns",
         "speed",
         "clip_start",
         "clip_length",
         "smoothing",
         "chunks",
+        "exposure",
         "fadein_image",
         "fadeout_image",
         "soundtrack",
@@ -261,13 +266,26 @@ def run_gui(stored: dict[str, Any]) -> None:
     chunks = tk.StringVar(value=str(stored.get("chunks", DEFAULT_CHUNKS)))
     ttk.Label(frame, text="Parallel chunks per slowdown").grid(row=len(fields) + 1, column=0, sticky="w", pady=2)
     ttk.Entry(frame, textvariable=chunks, width=6).grid(row=len(fields) + 1, column=1, sticky="w", pady=2)
+    exposure = tk.DoubleVar(value=float(stored.get("exposure", 0) or 0))
+    ttk.Label(frame, text="Exposure (- darker, + brighter)").grid(row=len(fields) + 2, column=0, sticky="w", pady=2)
+    tk.Scale(
+        frame,
+        variable=exposure,
+        from_=-2,
+        to=2,
+        resolution=0.1,
+        orient="horizontal",
+        length=240,
+        showvalue=True,
+    ).grid(row=len(fields) + 2, column=1, sticky="w", pady=2)
     status = tk.StringVar(value="Ready")
-    ttk.Label(frame, textvariable=status, wraplength=420).grid(row=len(fields) + 3, column=0, columnspan=2, sticky="w")
+    ttk.Label(frame, textvariable=status, wraplength=420).grid(row=len(fields) + 4, column=0, columnspan=2, sticky="w")
 
     def values() -> dict[str, Any]:
         result: dict[str, Any] = {key: var.get() for key, var in entries.items()}
         result["smoothing"] = smoothing.get()
         result["chunks"] = chunks.get()
+        result["exposure"] = round(exposure.get(), 2)
         return result
 
     updates: queue.Queue[str] = queue.Queue()
@@ -328,7 +346,7 @@ def run_gui(stored: dict[str, Any]) -> None:
         poll()
 
     button = ttk.Button(frame, text="Run", command=run)
-    button.grid(row=len(fields) + 2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    button.grid(row=len(fields) + 3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
     root.mainloop()
 
 
@@ -345,6 +363,7 @@ def main() -> None:
     parser.add_argument("--clip-start", dest="clip_start", type=float, help="Clip start in the recording (s)")
     parser.add_argument("--clip-length", dest="clip_length", type=float, help="Clip length (s); default: the rest")
     parser.add_argument("--smoothing", choices=SMOOTHING_MODES, help="high (ffmpeg, slow) or shotcut (instant)")
+    parser.add_argument("--exposure", type=float, help="Brightness of the recording in stops, -3 to 3 (negative = darker)")
     parser.add_argument("--chunks", type=int, help=f"Parallel chunks per slowdown in high smoothing (default {DEFAULT_CHUNKS})")
     parser.add_argument("--fadein-image", dest="fadein_image", help="Still for the opening fade (file name)")
     parser.add_argument("--fadeout-image", dest="fadeout_image", help="Still for the closing fade (file name)")
