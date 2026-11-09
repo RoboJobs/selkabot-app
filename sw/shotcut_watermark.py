@@ -8,6 +8,9 @@ can be overridden per run: from the command line, or in the window (--gui).
 
 Keys in livestream_config.json (all optional):
     "slowdowns":    "8-12, 14-16"   slow-motion windows, seconds from the clip start
+    "flash_windows": "3-5, 9-10"    camera-flash burst windows; empty disables flashes
+    "flash_min_gap": 0.045          minimum gap between flashes, seconds
+    "flash_max_gap": 0.18           maximum gap between flashes, seconds
     "speed":        0.3             speed inside a slowdown
     "clip_start":   0               where the clip starts in the recording, seconds
     "clip_length":  ""              clip length in seconds; "" = the rest of the recording
@@ -68,6 +71,18 @@ def format_slowdowns(windows: tuple[tuple[float, float], ...]) -> str:
     return ", ".join(f"{start:g}-{end:g}" for start, end in windows)
 
 
+def parse_flash_windows(text: str) -> tuple[tuple[float, float], ...]:
+    """Parse camera-flash burst windows using the slowdown ``start-end`` syntax."""
+    try:
+        return parse_slowdowns(text)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("slowdown", "flash window")) from None
+
+
+def format_flash_windows(windows: tuple[tuple[float, float], ...]) -> str:
+    return format_slowdowns(windows)
+
+
 def _optional_float(text: str | float | None, name: str) -> float | None:
     if text is None or (isinstance(text, str) and not text.strip()):
         return None
@@ -93,11 +108,16 @@ def settings_from(values: dict[str, Any]) -> EditSettings:
     exposure = _optional_float(values.get("exposure", 0), "exposure") or 0.0
     soundtrack = str(values.get("soundtrack") or "").strip()
     soundtrack_start = _optional_float(values.get("soundtrack_start", 0), "soundtrack_start") or 0.0
+    flash_min_gap = _optional_float(values.get("flash_min_gap", 0.045), "flash_min_gap")
+    flash_max_gap = _optional_float(values.get("flash_max_gap", 0.18), "flash_max_gap")
     fadein = str(values.get("fadein_image") or "").strip()
     fadeout = str(values.get("fadeout_image") or "").strip()
     try:
         return EditSettings(
             slowdowns=parse_slowdowns(str(values["slowdowns"])) if values.get("slowdowns") is not None else EditSettings().slowdowns,
+            flash_windows=parse_flash_windows(str(values.get("flash_windows") or "")),
+            flash_min_gap=flash_min_gap if flash_min_gap is not None else 0.045,
+            flash_max_gap=flash_max_gap if flash_max_gap is not None else 0.18,
             speed=speed if speed is not None else 0.3,
             clip_start=clip_start or 0.0,
             clip_length=_optional_float(values.get("clip_length"), "clip_length"),
@@ -224,8 +244,9 @@ def _settings_values(args: argparse.Namespace, stored: dict[str, Any]) -> dict[s
         "fadeout_image",
         "soundtrack",
         "soundtrack_start",
+        "flash_windows",
     ):
-        value = getattr(args, name)
+        value = getattr(args, name, None)
         if value is not None:
             values[name] = value
     return values
@@ -243,6 +264,7 @@ def run_gui(stored: dict[str, Any]) -> None:
 
     fields = [
         ("Slowdowns (start-end, …)", "slowdowns", format_slowdowns(settings_from(stored).slowdowns)),
+        ("Camera flashes (start-end, …)", "flash_windows", format_flash_windows(settings_from(stored).flash_windows)),
         ("Speed in slowdowns", "speed", str(stored.get("speed", 0.3))),
         ("Clip start (s)", "clip_start", str(stored.get("clip_start", 0))),
         ("Clip length (s, empty = rest)", "clip_length", "" if stored.get("clip_length") in (None, "") else str(stored["clip_length"])),
@@ -362,6 +384,7 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"With --folder, videos rendered at once (default {DEFAULT_JOBS})")
     parser.add_argument("--gui", action="store_true", help="Open the window with textboxes for the settings")
     parser.add_argument("--slowdowns", help='Slow-motion windows, e.g. "8-12, 14-16" (seconds from clip start)')
+    parser.add_argument("--flash-windows", dest="flash_windows", help='Camera-flash burst windows, e.g. "3-5, 9-10" (empty disables)')
     parser.add_argument("--speed", type=float, help="Speed inside slowdowns (default 0.3)")
     parser.add_argument("--clip-start", dest="clip_start", type=float, help="Clip start in the recording (s)")
     parser.add_argument("--clip-length", dest="clip_length", type=float, help="Clip length (s); default: the rest")
