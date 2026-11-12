@@ -1,0 +1,8 @@
+# Clips to leave out of the MOI compilation, one per line.
+# A full URL or a bare file name both work; lines starting with # are ignored.
+https://videos.selkabot.com/likegym20261108/20261108_154014_GX012338_watermarked.mp4
+https://videos.selkabot.com/likegym20261108/20261108_154144_GX012339_watermarked.mp4
+https://videos.selkabot.com/likegym20261108/20261108_164519_GX012359_watermarked.mp4
+https://videos.selkabot.com/likegym20261108/20261108_164616_GX012360_watermarked.mp4
+https://videos.selkabot.com/likegym20261108/20261108_171342_GX012367_watermarked.mp4
+20261108_140333_GX012316_watermarked.mp4
