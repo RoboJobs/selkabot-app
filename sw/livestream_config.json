@@ -1,9 +1,9 @@
 {
-  "folder": "likegym20261108",
+  "folder": "/home/juan/Documents/photobot/videos/likegym20261108",
   "image": "likegym_watermark.png",
   "fadein_image": "likegym.png",
   "fadeout_image": "selkabot.png",
-  "slowdowns": "3-4.5, 8.5-10",
+  "slowdowns": "1.5-2.8, 7-8.5",
   "speed": "0.3",
   "clip_start": "0",
   "clip_length": "16",
@@ -11,8 +11,8 @@
   "chunks": "4",
   "soundtrack": "/home/juan/Downloads/Telegram Desktop/1108.MP3",
   "soundtrack_start": "1",
-  "exposure": 0.0,
-  "flash_windows": "3.3-4.3, 5.5-6, 7.3-8, 9.5-10, 11-12.5",
-  "flash_min_gap": 0.045,
-  "flash_max_gap": 0.18
+  "exposure": 0.6,
+  "flash_windows": "3.8-4.7, 5.5-6, 7.3-8, 9.5-10, 11-12.5, 14.3-14.7, 16.2-16.8",
+  "flash_min_gap": 0.08,
+  "flash_max_gap": 0.3
 }

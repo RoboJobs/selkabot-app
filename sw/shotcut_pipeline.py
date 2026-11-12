@@ -538,6 +538,13 @@ FLASH_PULSE_SECONDS = (0.025, 0.085)
 FLASH_LEVELS = (1.8, 4.5)
 
 
+def flash_scale_for_exposure(exposure: float) -> float:
+    """Reduce flash peaks as the base footage exposure rises, while preserving a visible burst."""
+    if exposure <= 0:
+        return 1.0
+    return max(0.35, 2 ** (-1.35 * exposure))
+
+
 def flash_events(
     windows: tuple[tuple[float, float], ...], fps: float, duration_frames: int,
     seed: int = FLASH_SEED, visible_start: int = 0, visible_end: int | None = None,
@@ -563,12 +570,13 @@ def flash_events(
     return events
 
 
-def _flash_filter(events: list[tuple[int, int, float]]) -> str:
+def _flash_filter(events: list[tuple[int, int, float]], scale: float = 1.0) -> str:
     if not events:
         return ""
     keyframes = [f"0=1"]
     for start, end, level in events:
-        keyframes.extend((f"{start}=1", f"{start + 1}={level}", f"{end}=1"))
+        peak = 1 + (level - 1) * scale
+        keyframes.extend((f"{start}=1", f"{start + 1}={peak:.3f}", f"{end}=1"))
     return (
         '  <filter id="camera_flash" in="0" out="999999">\n'
         f"{_prop('mlt_service', 'brightness')}\n"
@@ -768,7 +776,7 @@ def build_project_xml(
         flash_windows, fps, total_final,
         visible_start=fade_in_end, visible_end=fade_out_start + 1,
         min_gap=flash_min_gap, max_gap=flash_max_gap,
-    ))
+    ), flash_scale_for_exposure(exposure))
 
     # One producer per watermark corner, each with its own position and an opacity ramp that
     # matches the fades: invisible under a still, ramping during its crossfade, opaque otherwise.

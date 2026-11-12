@@ -32,6 +32,9 @@ def test_flash_events_are_deterministic_and_clipped():
     assert first == p.flash_events(((0, 2),), 30, 30, seed=7)
     assert first and all(0 <= a < b <= 30 for a, b, _ in first)
     assert p.flash_events(((5, 6),), 30, 30, seed=7) == []
+    assert p.flash_scale_for_exposure(0) == 1.0
+    assert p.flash_scale_for_exposure(0.4) < 1.0
+    assert p.flash_scale_for_exposure(3) >= 0.35
 
 
 def test_build_project_xml_contains_fades_watermarks_and_slowdowns(tmp_path, monkeypatch):
