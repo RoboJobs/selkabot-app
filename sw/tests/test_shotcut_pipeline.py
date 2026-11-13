@@ -24,7 +24,7 @@ def test_probe_and_deterministic_planning():
     assert p.watermarks_for("logo.png")[1] == (Path("logo.png"), p.IMAGE_CORNERS)
     assert 'name="x"' in p._prop("x", "a&b")
     assert "affine" in p._fit_filter("f", 2)
-    assert "bottom-right" not in p._watermark_filters("a", "b", 2, "top-left", "0=0")
+    assert "bottom-right" not in p._watermark_filters("a", "b", 2, "top-left", "0=0", 10.0)
 
 
 def test_flash_events_are_deterministic_and_clipped():
@@ -41,6 +41,7 @@ def test_build_project_xml_contains_fades_watermarks_and_slowdowns(tmp_path, mon
     probe = p.Probe(100, 50, 10, 1, 100)
     smooth = tmp_path / "smooth.mp4"; smooth.touch()
     monkeypatch.setattr(p, "_video_frames", lambda _: 20)
+    monkeypatch.setattr(p, "_watermark_box_height", lambda image, probe: 10.0)  # No real logo.png here
     xml, frames = p.build_project_xml(Path("source.mp4"), probe, p.watermarks_for("logo.png"), Path("in.png"), Path("out.png"), (0, 50), [(10, 20, smooth)], 0.5)
     assert frames > 0
     for fragment in ("fadein_still", "fadeout_still", "slow_0", "logo.png", "qtblend"):

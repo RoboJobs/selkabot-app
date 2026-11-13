@@ -97,10 +97,10 @@ def _run_melt(cmd: list[str], progress: ProgressFn | None) -> None:
         raise subprocess.CalledProcessError(rc, cmd, output="".join(output)[-4000:])
 
 ROOT = Path(__file__).resolve().parents[1]
-# Always-used watermark, plus its two corners (mirrors sw/watermark.py's WATERMARKS).
+# Always-used watermark, plus its two corners.
 ALWAYS_WATERMARK = ROOT / "selkabot.png"
 ALWAYS_CORNERS = ("bottom-left", "top-right")
-# Corners of the optional, user-chosen image (sw/watermark.py's IMAGE_CORNERS).
+# Corners of the optional, user-chosen image.
 IMAGE_CORNERS = ("top-left", "bottom-right")
 WATERMARK_SIZE_PCT = 10  # Each watermark's bounding box, as a percentage of the frame
 
@@ -144,7 +144,7 @@ def _image_size(path: Path) -> tuple[int, int]:
 def _watermark_box_height(image: Path, probe: "Probe") -> float:
     """Height of a watermark's box, in % of the frame height, for the image's own aspect ratio.
 
-    The width is WATERMARK_SIZE_PCT of the frame width (the same size rule as sw/watermark.py), so the
+    The width is WATERMARK_SIZE_PCT of the frame width, so the
     height follows from the image's shape, and the image fills the box without distortion.
     """
     image_w, image_h = _image_size(image)
