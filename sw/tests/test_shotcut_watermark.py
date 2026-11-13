@@ -19,6 +19,14 @@ def test_parse_slowdowns_rejects_bad_ranges(text):
         w.parse_slowdowns(text)
 
 
+def test_parse_flash_windows_and_format():
+    assert w.parse_flash_windows("2-4, 8.5-10") == ((2.0, 4.0), (8.5, 10.0))
+    assert w.parse_flash_windows("") == ()
+    assert w.format_flash_windows(((2, 4.5),)) == "2-4.5"
+    with pytest.raises(ValueError, match="flash window"):
+        w.parse_flash_windows("4-4")
+
+
 def test_format_and_optional_float():
     assert w.format_slowdowns(((1, 2.5),)) == "1-2.5"
     assert w._optional_float(" ", "x") is None
@@ -29,8 +37,9 @@ def test_format_and_optional_float():
 
 def test_settings_from_defaults_and_custom_paths():
     assert w.settings_from({}) == EditSettings()
-    s = w.settings_from({"slowdowns": "1-2", "speed": "0.5", "chunks": "2", "fadein_image": "in.png", "fadeout_image": "out.png"})
+    s = w.settings_from({"slowdowns": "1-2", "flash_windows": "3-4", "speed": "0.5", "chunks": "2", "fadein_image": "in.png", "fadeout_image": "out.png"})
     assert s.slowdowns == ((1.0, 2.0),) and s.fadein_image == Path("in.png")
+    assert s.flash_windows == ((3.0, 4.0),)
     with pytest.raises(ValueError, match="smoothing"):
         w.settings_from({"smoothing": "bad"})
     with pytest.raises(ValueError, match="chunks"):

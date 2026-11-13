@@ -27,6 +27,16 @@ def test_probe_and_deterministic_planning():
     assert "bottom-right" not in p._watermark_filters("a", "b", 2, "top-left", "0=0", 10.0)
 
 
+def test_flash_events_are_deterministic_and_clipped():
+    first = p.flash_events(((0, 2),), 30, 30, seed=7)
+    assert first == p.flash_events(((0, 2),), 30, 30, seed=7)
+    assert first and all(0 <= a < b <= 30 for a, b, _ in first)
+    assert p.flash_events(((5, 6),), 30, 30, seed=7) == []
+    assert p.flash_scale_for_exposure(0) == 1.0
+    assert p.flash_scale_for_exposure(0.4) < 1.0
+    assert p.flash_scale_for_exposure(3) >= 0.35
+
+
 def test_build_project_xml_contains_fades_watermarks_and_slowdowns(tmp_path, monkeypatch):
     probe = p.Probe(100, 50, 10, 1, 100)
     smooth = tmp_path / "smooth.mp4"; smooth.touch()
@@ -36,6 +46,9 @@ def test_build_project_xml_contains_fades_watermarks_and_slowdowns(tmp_path, mon
     assert frames > 0
     for fragment in ("fadein_still", "fadeout_still", "slow_0", "logo.png", "qtblend"):
         assert fragment in xml
+
+    flash_xml, _ = p.build_project_xml(Path("source.mp4"), probe, p.watermarks_for(None), None, None, (0, 50), [], 0.5, flash_windows=((0, 1),))
+    assert 'id="camera_flash"' in flash_xml and 'mlt_service' in flash_xml
 
 
 def test_run_ffmpeg_reports_and_propagates(monkeypatch):

@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import random
 import shutil
 import subprocess
 import time
@@ -173,6 +174,9 @@ class EditSettings:
     fadeout_image: Path | None = None
     soundtrack: Path | None = None  # Replaces the recording's own sound when set
     soundtrack_start: float = 0.0  # Where in the soundtrack file the output starts, in seconds
+    flash_windows: tuple[tuple[float, float], ...] = ()
+    flash_min_gap: float = 0.045
+    flash_max_gap: float = 0.18
 
     def __post_init__(self) -> None:
         if not -3 <= self.exposure <= 3:
@@ -192,6 +196,11 @@ class EditSettings:
         for start, end in self.slowdowns:
             if not 0 <= start < end:
                 raise ValueError(f"slowdown ({start}, {end}) must have 0 <= start < end")
+        for start, end in self.flash_windows:
+            if not 0 <= start < end:
+                raise ValueError(f"flash window ({start}, {end}) must have 0 <= start < end")
+        if not 0 <= self.flash_min_gap <= self.flash_max_gap:
+            raise ValueError("flash_min_gap must be non-negative and no greater than flash_max_gap")
 
 
 @dataclass
@@ -522,6 +531,61 @@ def _exposure_filter(filter_id: str, exposure: float) -> str:
     )
 
 
+FLASH_SEED = 18473
+FLASH_MIN_GAP_SECONDS = 0.045
+FLASH_MAX_GAP_SECONDS = 0.18
+FLASH_PULSE_SECONDS = (0.025, 0.085)
+FLASH_LEVELS = (1.8, 4.5)
+
+
+def flash_scale_for_exposure(exposure: float) -> float:
+    """Reduce flash peaks as the base footage exposure rises, while preserving a visible burst."""
+    if exposure <= 0:
+        return 1.0
+    return max(0.35, 2 ** (-1.35 * exposure))
+
+
+def flash_events(
+    windows: tuple[tuple[float, float], ...], fps: float, duration_frames: int,
+    seed: int = FLASH_SEED, visible_start: int = 0, visible_end: int | None = None,
+    min_gap: float = FLASH_MIN_GAP_SECONDS, max_gap: float = FLASH_MAX_GAP_SECONDS,
+) -> list[tuple[int, int, float]]:
+    """Return irregular (start, end, brightness level) pulses in output-timeline frames."""
+    rng = random.Random(seed)
+    visible_end = duration_frames if visible_end is None else min(duration_frames, visible_end)
+    events: list[tuple[int, int, float]] = []
+    for start_s, end_s in windows:
+        start_s = max(0.0, start_s)
+        end_s = min(end_s, duration_frames / fps)
+        cursor = start_s
+        while cursor < end_s:
+            width = rng.uniform(*FLASH_PULSE_SECONDS)
+            first = max(0, round(cursor * fps))
+            last = min(duration_frames, max(first + 1, round((cursor + width) * fps)))
+            first = max(first, visible_start)
+            last = min(last, visible_end)
+            if first < last:
+                events.append((first, last, round(rng.uniform(*FLASH_LEVELS), 3)))
+            cursor += width + rng.uniform(min_gap, max_gap)
+    return events
+
+
+def _flash_filter(events: list[tuple[int, int, float]], scale: float = 1.0) -> str:
+    if not events:
+        return ""
+    keyframes = [f"0=1"]
+    for start, end, level in events:
+        peak = 1 + (level - 1) * scale
+        keyframes.extend((f"{start}=1", f"{start + 1}={peak:.3f}", f"{end}=1"))
+    return (
+        '  <filter id="camera_flash" in="0" out="999999">\n'
+        f"{_prop('mlt_service', 'brightness')}\n"
+        f"{_prop('level', ';'.join(keyframes))}\n"
+        f"{_prop('alpha', '1')}\n"
+        "  </filter>"
+    )
+
+
 def _duration_seconds(path: Path) -> float:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
@@ -543,6 +607,9 @@ def build_project_xml(
     speed: float,
     music: tuple[Path, int, int] | None = None,
     exposure: float = 0.0,
+    flash_windows: tuple[tuple[float, float], ...] = (),
+    flash_min_gap: float = FLASH_MIN_GAP_SECONDS,
+    flash_max_gap: float = FLASH_MAX_GAP_SECONDS,
 ) -> tuple[str, int]:
     """Build the MLT project XML for one edited, watermarked clip; also returns its length in frames.
 
@@ -705,6 +772,11 @@ def build_project_xml(
         fade_out_start = fade_out_end = cursor - 1  # Watermarks stay at full opacity to the end
 
     total_final = cursor
+    flash_xml = _flash_filter(flash_events(
+        flash_windows, fps, total_final,
+        visible_start=fade_in_end, visible_end=fade_out_start + 1,
+        min_gap=flash_min_gap, max_gap=flash_max_gap,
+    ), flash_scale_for_exposure(exposure))
 
     # One producer per watermark corner, each with its own position and an opacity ramp that
     # matches the fades: invisible under a still, ramping during its crossfade, opaque otherwise.
@@ -790,6 +862,7 @@ def build_project_xml(
         + "\n"
         + music_track
         + composite_transitions
+        + ("\n" + flash_xml if flash_xml else "")
         + "\n  </tractor>\n"
         "</mlt>\n",
         total_final,
@@ -944,6 +1017,9 @@ def edit_clip(
         settings.speed,
         music,
         exposure=settings.exposure,
+        flash_windows=settings.flash_windows,
+        flash_min_gap=settings.flash_min_gap,
+        flash_max_gap=settings.flash_max_gap,
     )
     if settings.exposure:
         say(f"exposure {settings.exposure:+g} stops on the recording")
