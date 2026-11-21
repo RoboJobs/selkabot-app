@@ -1,8 +1,5 @@
 """Pytest configuration for PWMController tests."""
 
-import platform
-import subprocess
-
 import pytest
 
 
@@ -19,7 +16,8 @@ def _is_raspberry_pi_5() -> bool:
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "hardware: mark test as requiring Raspberry Pi 5 hardware (auto-skipped otherwise)",
+        "hardware: mark tests requiring Raspberry Pi 5 hardware "
+        "(auto-skipped otherwise)",
     )
 
 
