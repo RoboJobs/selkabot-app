@@ -4,6 +4,7 @@ They build only the mode rows on a real Tk root and stub out the camera, so
 they need a display. They are skipped when Tk cannot open one.
 """
 
+import concurrent.futures
 import gc
 import tkinter as tk
 from tkinter import ttk
@@ -28,11 +29,12 @@ def root():
 
 
 @pytest.fixture
-def app(root):
+def app(root, tmp_path):
     """A LivestreamApp with only the mode rows built and no camera behind it."""
     ui = l.LivestreamApp.__new__(l.LivestreamApp)
     ui._busy = False
     ui._recording = False
+    ui.config_file = tmp_path / "config.json"
     ui.picker = ModePicker(table.build_catalog())
     ui.status = tk.StringVar(master=root)
     ui.controller = SimpleNamespace(set_mode=lambda mode: None)
@@ -113,8 +115,6 @@ def test_repeating_the_current_value_sends_nothing(app):
 
 def test_full_window_locks_the_selector_until_connected_then_enables_it(root, monkeypatch, tmp_path):
     """Build the real LivestreamApp (not just the rows) against a fake controller."""
-    import concurrent.futures
-
     monkeypatch.setattr(
         l,
         "PreviewReader",
@@ -159,3 +159,45 @@ def test_full_window_locks_the_selector_until_connected_then_enables_it(root, mo
         assert ui.status.get() == "Connected to GoPro GP-TEST. Ready to record at 16:9 2.7K 60fps Wide."
     finally:
         ui.postprocessor.stop()  # its thread would otherwise keep pytest alive
+
+
+def test_window_starts_on_the_saved_mode(root, monkeypatch, tmp_path):
+    from sw.camera.mode_persistence import save_mode
+    from sw.camera.modes import VideoMode
+
+    monkeypatch.setattr(
+        l,
+        "PreviewReader",
+        lambda *a, **k: SimpleNamespace(start=lambda: None, stop=lambda: None, latest_frame=lambda: None),
+    )
+
+    class FakeController:
+        catalog = table.build_catalog()
+        port = 8554
+        output_dir = tmp_path
+
+        async def connect(self, mode):
+            return "GP-TEST"
+
+        def submit(self, coro):
+            coro.close()
+            return concurrent.futures.Future()
+
+    config = tmp_path / "config.json"
+    saved = VideoMode("4:3", "2.7K", 120, "Wide", "2x")
+    assert save_mode(config, saved)
+    ui = l.LivestreamApp(
+        root,
+        FakeController(),
+        upload=False,
+        folder="default",
+        image="",
+        fadein_image="",
+        fadeout_image="",
+        config_file=config,
+    )
+    try:
+        assert ui.picker.mode == saved
+        assert ui._mode_vars["ratio"].get() == "4:3"
+    finally:
+        ui.postprocessor.stop()

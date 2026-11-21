@@ -62,6 +62,7 @@ from PIL import Image, ImageTk
 
 from sw.camera import hero10_table
 from sw.camera.gopro_hero10 import HeroBackend
+from sw.camera.mode_persistence import load_mode, save_mode
 from sw.camera.mode_picker import ModePicker
 from sw.camera.modes import AXES, ModeCatalog, VideoMode
 from sw.sync_uploads import sync_uploads
@@ -511,7 +512,7 @@ class LivestreamApp:
         self.video.pack(fill="both", expand=True, padx=8, pady=8)
         self._show_message("Connecting to GoPro...")
 
-        self.picker = ModePicker(controller.catalog)
+        self.picker = ModePicker(controller.catalog, load_mode(config_file, controller.catalog))
         modes_frame = ttk.Frame(root)
         modes_frame.pack(fill="x", padx=8, pady=(0, 4))
         self._build_mode_rows(modes_frame)
@@ -621,6 +622,7 @@ class LivestreamApp:
 
         def done(_: None) -> None:
             self.picker.commit(target)
+            save_mode(self.config_file, target)
             self._refresh_mode_controls()
             self.status.set(f"Mode set to {target.label}.")
 
