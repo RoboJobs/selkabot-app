@@ -10,7 +10,7 @@ from open_gopro.models.constants import SettingId, StatusId
 from sw.camera import gopro_hero10 as hero
 from sw.camera import hero10_table as table
 from sw.camera.base import CameraBackend
-from sw.camera.modes import NO_ZOOM, VideoMode
+from sw.camera.modes import VideoMode
 
 
 class Resp:
@@ -22,6 +22,9 @@ class Resp:
 class FakeGoPro:
     """Records every command and keeps a camera state that the commands update.
 
+    Like the camera, zoom is available only on zoom lenses, zoom is sent as a
+    percentage, and switching to a lens without zoom resets the level to 0.
+
     Args:
         reject: name of a setting ("resolution", "fps", "lens") to refuse.
         override: maps a setting name to a value to store instead of the one
@@ -29,6 +32,7 @@ class FakeGoPro:
     """
 
     KEYS = {"resolution": SettingId.VIDEO_RESOLUTION, "fps": SettingId.FRAMES_PER_SECOND, "lens": SettingId.VIDEO_LENS}
+    ZOOM_LENSES = (table.LENS_ENUM["Wide"], table.LENS_ENUM["Linear"], table.LENS_ENUM["Linear+HL"])
 
     def __init__(self, reject: str | None = None, override: dict | None = None) -> None:
         self.log: list[tuple[str, object]] = []
@@ -56,9 +60,7 @@ class _Setting:
         stored = gopro._override.get(self._name, value)
         gopro.state[gopro.KEYS[self._name]] = stored
         if self._name == "lens":
-            # Like the camera: zoom is available only on these lenses, and switching
-            # to a lens without zoom resets the zoom level to 0.
-            available = stored in (table.LENS_ENUM["Wide"], table.LENS_ENUM["Linear"], table.LENS_ENUM["Linear+HL"])
+            available = stored in gopro.ZOOM_LENSES
             gopro.state[StatusId.ZOOM_AVAILABLE] = available
             if not available:
                 gopro.state[StatusId.ZOOM_LEVEL] = 0
@@ -71,6 +73,8 @@ class _Command:
 
     async def set_digital_zoom(self, *, percent: int):
         self._gopro.log.append(("zoom", percent))
+        if percent > 100:
+            return Resp(False)
         self._gopro.state[StatusId.ZOOM_LEVEL] = percent
         return Resp(True)
 
@@ -88,14 +92,7 @@ def sync(test):
     return wrapper
 
 
-@pytest.fixture
-def calibrated(monkeypatch):
-    monkeypatch.setitem(table.ZOOM_PERCENT, "1.4x", 42)
-    monkeypatch.setitem(table.ZOOM_PERCENT, "2x", 77)
-    return monkeypatch
-
-
-def _mode(zoom=NO_ZOOM):
+def _mode(zoom=0):
     return VideoMode("16:9", "4K", 120, "Wide", zoom)
 
 
@@ -103,9 +100,9 @@ def _mode(zoom=NO_ZOOM):
 
 
 @sync
-async def test_settings_are_sent_in_order_with_zoom_last(calibrated):
+async def test_settings_are_sent_in_order_with_zoom_last():
     gopro = FakeGoPro()
-    await hero.HeroBackend(gopro).apply_mode(_mode("1.4x"))
+    await hero.HeroBackend(gopro).apply_mode(_mode(42))
     assert gopro.log == [
         ("resolution", table.RESOLUTION_ENUM[("16:9", "4K")]),
         ("fps", table.FPS_ENUM[120]),
@@ -115,37 +112,52 @@ async def test_settings_are_sent_in_order_with_zoom_last(calibrated):
 
 
 @sync
-async def test_no_zoom_is_still_sent_as_zero_and_last(calibrated):
+async def test_no_zoom_is_sent_as_zero_on_a_zoom_lens():
     gopro = FakeGoPro()
-    await hero.HeroBackend(gopro).apply_mode(_mode())
+    await hero.HeroBackend(gopro).apply_mode(_mode(0))
     assert gopro.log[-1] == ("zoom", 0)
     assert len(gopro.log) == 4
 
 
 @sync
-async def test_2x_uses_its_own_calibrated_percent(calibrated):
+async def test_full_range_is_accepted_and_read_back():
+    for percent in (1, 50, 100):
+        gopro = FakeGoPro()
+        await hero.HeroBackend(gopro).apply_mode(_mode(percent))
+        assert gopro.log[-1] == ("zoom", percent)
+
+
+@sync
+async def test_lens_without_zoom_sends_no_zoom_command():
     gopro = FakeGoPro()
-    mode = VideoMode("4:3", "4K", 60, "Wide", "2x")
-    await hero.HeroBackend(gopro).apply_mode(mode)
-    assert gopro.log[-1] == ("zoom", 77)
+    await hero.HeroBackend(gopro).apply_mode(VideoMode("16:9", "2.7K", 120, "SuperView", 0))
+    assert [name for name, _ in gopro.log] == ["resolution", "fps", "lens"]
 
 
 # --- refusals happen before anything is sent --------------------------------
 
 
 @sync
-async def test_invalid_mode_is_refused_without_sending_anything(calibrated):
+async def test_invalid_mode_is_refused_without_sending_anything():
     gopro = FakeGoPro()
     with pytest.raises(ValueError):
-        await hero.HeroBackend(gopro).apply_mode(VideoMode("4:3", "5.3K", 60, "Wide", NO_ZOOM))
+        await hero.HeroBackend(gopro).apply_mode(VideoMode("4:3", "5.3K", 60, "Wide", 0))
     assert gopro.log == []
 
 
 @sync
-async def test_uncalibrated_zoom_is_refused_without_sending_anything():
+async def test_zoom_on_a_lens_without_zoom_is_refused_without_sending_anything():
     gopro = FakeGoPro()
-    with pytest.raises(RuntimeError, match="not calibrated"):
-        await hero.HeroBackend(gopro).apply_mode(_mode("1.4x"))
+    with pytest.raises(ValueError):
+        await hero.HeroBackend(gopro).apply_mode(VideoMode("16:9", "2.7K", 120, "SuperView", 30))
+    assert gopro.log == []
+
+
+@sync
+async def test_zoom_above_100_is_refused_without_sending_anything():
+    gopro = FakeGoPro()
+    with pytest.raises(ValueError):
+        await hero.HeroBackend(gopro).apply_mode(_mode(101))
     assert gopro.log == []
 
 
@@ -153,7 +165,7 @@ async def test_uncalibrated_zoom_is_refused_without_sending_anything():
 
 
 @sync
-async def test_rejected_setting_stops_the_sequence(calibrated):
+async def test_rejected_setting_stops_the_sequence():
     gopro = FakeGoPro(reject="resolution")
     with pytest.raises(RuntimeError, match="video resolution"):
         await hero.HeroBackend(gopro).apply_mode(_mode())
@@ -161,14 +173,14 @@ async def test_rejected_setting_stops_the_sequence(calibrated):
 
 
 @sync
-async def test_readback_detects_a_setting_the_camera_changed(calibrated):
+async def test_readback_detects_a_setting_the_camera_changed():
     gopro = FakeGoPro(override={"fps": table.FPS_ENUM[60]})
     with pytest.raises(RuntimeError, match="fps"):
         await hero.HeroBackend(gopro).apply_mode(_mode())
 
 
 @sync
-async def test_readback_detects_a_missing_setting(calibrated):
+async def test_readback_detects_a_missing_setting():
     gopro = FakeGoPro()
     original = gopro.http_command.get_camera_state
 
@@ -182,45 +194,8 @@ async def test_readback_detects_a_missing_setting(calibrated):
         await hero.HeroBackend(gopro).apply_mode(_mode())
 
 
-# --- mapping and protocol ---------------------------------------------------
-
-
-def test_every_catalog_mode_maps_to_camera_values():
-    for mode in table.build_catalog().modes:
-        resolution, fps, lens = hero.camera_values(mode)
-        assert resolution is not None and fps is not None and lens is not None
-
-
-def test_camera_values_plus_zoom_identify_each_mode():
-    modes = table.build_catalog().modes
-    keys = [(hero.camera_values(m), m.zoom) for m in modes]
-    assert len(set(keys)) == len(modes)
-
-
-def test_state_mismatches_is_empty_for_a_matching_state():
-    mode = _mode()
-    state = {
-        SettingId.VIDEO_RESOLUTION: table.RESOLUTION_ENUM[("16:9", "4K")],
-        SettingId.FRAMES_PER_SECOND: table.FPS_ENUM[120],
-        SettingId.VIDEO_LENS: table.LENS_ENUM["Wide"],
-    }
-    assert hero.state_mismatches(mode, state) == ()
-
-
-def test_zoom_mismatches_are_empty_for_a_matching_zoom_status(calibrated):
-    state = {StatusId.ZOOM_AVAILABLE: True, StatusId.ZOOM_LEVEL: 42}
-    assert hero.zoom_mismatches(_mode("1.4x"), state) == ()
-
-
-def test_zoom_mismatches_report_wrong_level_and_availability():
-    state = {StatusId.ZOOM_AVAILABLE: False, StatusId.ZOOM_LEVEL: 10}
-    problems = hero.zoom_mismatches(_mode("1.4x"), state)
-    assert len(problems) == 2
-    assert problems[0].startswith("zoom available") and problems[1].startswith("zoom level")
-
-
 @sync
-async def test_readback_detects_a_zoom_level_the_camera_did_not_keep(calibrated):
+async def test_readback_detects_a_zoom_level_the_camera_did_not_keep():
     gopro = FakeGoPro()
     original = gopro.http_command.get_camera_state
 
@@ -231,22 +206,42 @@ async def test_readback_detects_a_zoom_level_the_camera_did_not_keep(calibrated)
 
     gopro.http_command.get_camera_state = zoom_reset
     with pytest.raises(RuntimeError, match="zoom level"):
-        await hero.HeroBackend(gopro).apply_mode(_mode("1.4x"))
+        await hero.HeroBackend(gopro).apply_mode(_mode(42))
+
+
+# --- mapping, zoom status and protocol -------------------------------------
+
+
+def test_every_catalog_mode_maps_to_camera_values():
+    for mode in table.build_catalog().modes:
+        assert None not in hero.camera_values(mode)
+
+
+def test_camera_values_identify_each_catalog_mode():
+    modes = table.build_catalog().modes
+    assert len({hero.camera_values(m) for m in modes}) == len(modes)
+
+
+def test_state_mismatches_is_empty_for_a_matching_state():
+    state = {
+        SettingId.VIDEO_RESOLUTION: table.RESOLUTION_ENUM[("16:9", "4K")],
+        SettingId.FRAMES_PER_SECOND: table.FPS_ENUM[120],
+        SettingId.VIDEO_LENS: table.LENS_ENUM["Wide"],
+    }
+    assert hero.state_mismatches(_mode(), state) == ()
+
+
+def test_zoom_mismatches_are_empty_for_a_matching_zoom_status():
+    state = {StatusId.ZOOM_AVAILABLE: True, StatusId.ZOOM_LEVEL: 42}
+    assert hero.zoom_mismatches(_mode(42), state) == ()
+
+
+def test_zoom_mismatches_report_wrong_level_and_availability():
+    state = {StatusId.ZOOM_AVAILABLE: False, StatusId.ZOOM_LEVEL: 10}
+    problems = hero.zoom_mismatches(_mode(42), state)
+    assert len(problems) == 2
+    assert problems[0].startswith("zoom available") and problems[1].startswith("zoom level")
 
 
 def test_backend_satisfies_the_camera_backend_protocol():
     assert isinstance(hero.HeroBackend(FakeGoPro()), CameraBackend)
-
-
-@sync
-async def test_lens_without_zoom_sends_no_zoom_command(calibrated):
-    gopro = FakeGoPro()
-    await hero.HeroBackend(gopro).apply_mode(VideoMode("16:9", "2.7K", 120, "SuperView", NO_ZOOM))
-    assert [name for name, _ in gopro.log] == ["resolution", "fps", "lens"]
-
-
-def test_zoom_supported_follows_the_table():
-    assert table.zoom_supported(VideoMode("16:9", "2.7K", 120, "Wide", NO_ZOOM))
-    assert not table.zoom_supported(VideoMode("16:9", "2.7K", 120, "SuperView", NO_ZOOM))
-    assert not table.zoom_supported(VideoMode("16:9", "4K", 120, "Narrow", NO_ZOOM))
-    assert not table.zoom_supported(VideoMode("16:9", "4K", 120, "Linear", NO_ZOOM))  # only Wide and Linear+HL

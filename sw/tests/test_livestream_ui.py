@@ -15,6 +15,7 @@ import pytest
 from sw import livestream as l
 from sw.camera import hero10_table as table
 from sw.camera.mode_picker import ModePicker
+from sw.camera.modes import VideoMode
 
 
 @pytest.fixture
@@ -55,11 +56,15 @@ def enabled_texts(ui, axis):
     return [text for text, state in states(ui, axis) if state == "normal"]
 
 
+def zoom_state(ui):
+    return str(ui._zoom_scale.cget("state"))
+
+
 def test_default_mode_enables_the_compatible_options(app):
     assert app.picker.mode.label == "16:9 2.7K 60fps Wide"
     assert enabled_texts(app, "ratio") == ["16:9", "4:3"]
     assert enabled_texts(app, "resolution") == ["5.3K", "4K", "2.7K"]
-    assert enabled_texts(app, "zoom") == ["none", "1.4x"]
+    assert zoom_state(app) == "normal"  # Wide lens: the slider can zoom 0-100%
     assert enabled_texts(app, "fps") == ["60", "120", "240"]
     assert ("50", "disabled") in states(app, "fps")
 
@@ -82,11 +87,42 @@ def test_busy_or_recording_disables_every_button(app):
     assert all(state == "disabled" for axis in app._mode_buttons for _, state in states(app, axis))
 
 
-def test_pressing_a_disabled_value_reverts_the_selection(app):
-    app._mode_vars["zoom"].set("2x")  # not allowed on the default Wide 16:9 mode
-    app._on_mode_pick("zoom")
-    assert app._mode_vars["zoom"].get() == "none"
+def test_zoom_on_a_lens_without_zoom_reverts_the_slider(app):
+    app.picker.commit(VideoMode("16:9", "2.7K", 120, "SuperView", 0))
+    app._refresh_mode_controls()
+    assert zoom_state(app) == "disabled"
+    app._zoom_var.set(30)
+    app._on_zoom_release()
+    assert app._zoom_var.get() == 0
     assert app._run_calls == []
+
+
+def test_releasing_the_slider_sends_the_chosen_zoom_and_commits_it(app):
+    app._zoom_var.set(42.4)
+    app._on_zoom_drag()
+    assert app._zoom_label.cget("text") == "42%"
+    assert app._run_calls == []  # dragging alone does not touch the camera
+    app._on_zoom_release()
+    status, done, _failed = app._run_calls[0]
+    assert status == "Switching to 16:9 2.7K 60fps Wide zoom 42%…"
+    done(None)
+    assert app.picker.mode.zoom == 42
+    assert app.status.get() == "Mode set to 16:9 2.7K 60fps Wide zoom 42%."
+
+
+def test_failed_zoom_change_snaps_the_slider_back(app):
+    app._zoom_var.set(42)
+    app._on_zoom_release()
+    _status, _done, failed = app._run_calls[0]
+    failed(RuntimeError("camera rejected digital zoom"))
+    assert app.picker.mode.zoom == 0
+    assert app._zoom_var.get() == 0
+
+
+def test_zoom_slider_is_locked_while_busy(app):
+    app._busy = True
+    app._update_mode_states()
+    assert zoom_state(app) == "disabled"
 
 
 def test_valid_pick_is_sent_and_committed_when_the_camera_accepts(app):
@@ -157,7 +193,7 @@ def test_full_window_locks_the_selector_until_connected_then_enables_it(root, mo
     try:
         controller.future.set_result("GP-TEST")
         ui._poll()
-        assert enabled_texts(ui, "zoom") == ["none", "1.4x"]
+        assert zoom_state(ui) == "normal"
         assert ui.status.get() == "Connected to GoPro GP-TEST. Ready to record at 16:9 2.7K 60fps Wide."
     finally:
         ui.postprocessor.stop()  # its thread would otherwise keep pytest alive
@@ -186,7 +222,7 @@ def test_window_starts_on_the_saved_mode(root, monkeypatch, tmp_path):
             return concurrent.futures.Future()
 
     config = tmp_path / "config.json"
-    saved = VideoMode("4:3", "2.7K", 120, "Wide", "2x")
+    saved = VideoMode("4:3", "2.7K", 120, "Wide", 30)
     assert save_mode(config, saved)
     ui = l.LivestreamApp(
         root,
@@ -201,5 +237,6 @@ def test_window_starts_on_the_saved_mode(root, monkeypatch, tmp_path):
     try:
         assert ui.picker.mode == saved
         assert ui._mode_vars["ratio"].get() == "4:3"
+        assert ui._zoom_var.get() == 30
     finally:
         ui.postprocessor.stop()

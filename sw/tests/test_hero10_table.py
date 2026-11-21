@@ -3,6 +3,7 @@
 import pytest
 
 from sw.camera import hero10_table as t
+from sw.camera.modes import VideoMode
 
 
 def test_table_has_the_requested_rows():
@@ -45,13 +46,13 @@ def test_4_3_has_no_superview():
             assert t.LENS_SUPERVIEW not in row.lenses
 
 
-def test_zoom_factor_follows_resolution_rule():
-    # GoPro: 1.4x for 2.7K and above (16:9), 2x for the 4:3 modes listed.
+def test_zoom_is_continuous_up_to_100_on_zoom_lenses_only():
+    assert t.ZOOM_MAX_PERCENT == 100
     for row in t.ROWS:
-        if row.ratio == "16:9":
-            assert row.zoom == t.ZOOM_1_4X
-        else:
-            assert row.zoom == t.ZOOM_2X
+        for lens in row.lenses:
+            mode = t.VideoMode(row.ratio, row.resolution, row.fps[0], lens)
+            expected = 100 if lens in row.zoom_lenses else 0
+            assert t.zoom_max(mode) == expected
 
 
 def test_every_resolution_has_a_camera_enum():
@@ -75,10 +76,3 @@ def test_enum_maps_have_no_duplicate_camera_values():
     assert len(set(t.RESOLUTION_ENUM.values())) == len(t.RESOLUTION_ENUM)
     assert len(set(t.FPS_ENUM.values())) == len(t.FPS_ENUM)
     assert len(set(t.LENS_ENUM.values())) == len(t.LENS_ENUM)
-
-
-def test_zero_zoom_is_known_and_calibrated_zoom_is_not_guessed():
-    assert t.ZOOM_PERCENT[t.ZOOM_NONE] == 0
-    # Not known yet; must be filled in from a probe run on the camera.
-    assert t.ZOOM_PERCENT[t.ZOOM_1_4X] is None
-    assert t.ZOOM_PERCENT[t.ZOOM_2X] is None

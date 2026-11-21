@@ -11,7 +11,7 @@ from sw.camera.mode_persistence import MODE_KEY, load_mode, mode_from_dict, mode
 from sw.camera.modes import VideoMode
 
 CATALOG = table.build_catalog()
-WIDE_4K = VideoMode("16:9", "4K", 120, "Wide", "1.4x")
+WIDE_4K = VideoMode("16:9", "4K", 120, "Wide", 42)
 
 
 def test_round_trip_restores_the_saved_mode(tmp_path):

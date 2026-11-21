@@ -78,6 +78,9 @@ logger = logging.getLogger(__name__)
 # expected while joining the UDP stream mid-GOP. Read on first VideoCapture.
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
+DISCRETE_AXES: tuple[str, ...] = AXES[:-1]  # zoom is a slider, not buttons
+ZOOM_MAX_PERCENT = 100
+
 MODE_AXIS_TITLES: dict[str, str] = {
     "ratio": "Ratio",
     "resolution": "Resolution",
@@ -597,10 +600,14 @@ class LivestreamApp:
         self.status.set(f"Connected to GoPro {serial}. Ready to record at {self.picker.mode.label}.")
 
     def _build_mode_rows(self, parent: ttk.Frame) -> None:
-        """Create one row per cascade axis. Options the committed mode rules out are disabled, not hidden."""
+        """Create one row per discrete cascade axis, then a zoom slider.
+
+        Options that the committed mode rules out are disabled, not hidden. Zoom is continuous:
+        the slider moves freely, and the camera is only changed when the user lets go of it.
+        """
         self._mode_vars: dict[str, tk.StringVar] = {}
         self._mode_buttons: dict[str, list[ttk.Radiobutton]] = {}
-        for row, axis in enumerate(AXES):
+        for row, axis in enumerate(DISCRETE_AXES):
             ttk.Label(parent, text=MODE_AXIS_TITLES[axis], width=10, anchor="w").grid(row=row, column=0, sticky="w")
             var = tk.StringVar(value=self.picker.selected_text(axis))
             self._mode_vars[axis] = var
@@ -616,6 +623,22 @@ class LivestreamApp:
             ]
             for column, button in enumerate(self._mode_buttons[axis], start=1):
                 button.grid(row=row, column=column, sticky="w", padx=4)
+
+        zoom_row = len(DISCRETE_AXES)
+        ttk.Label(parent, text=MODE_AXIS_TITLES["zoom"], width=10, anchor="w").grid(row=zoom_row, column=0, sticky="w")
+        self._zoom_var = tk.DoubleVar(value=self.picker.mode.zoom)
+        self._zoom_scale = ttk.Scale(
+            parent,
+            from_=0,
+            to=ZOOM_MAX_PERCENT,
+            variable=self._zoom_var,
+            command=self._on_zoom_drag,
+        )
+        self._zoom_scale.grid(row=zoom_row, column=1, columnspan=6, sticky="we", padx=4)
+        self._zoom_scale.bind("<ButtonRelease-1>", self._on_zoom_release)
+        self._zoom_scale.bind("<KeyRelease>", self._on_zoom_release)
+        self._zoom_label = ttk.Label(parent, text=f"{self.picker.mode.zoom}%", width=6)
+        self._zoom_label.grid(row=zoom_row, column=7, sticky="w")
         self._update_mode_states()
 
     def _on_mode_pick(self, axis: str) -> None:
@@ -624,7 +647,25 @@ class LivestreamApp:
         except ValueError:
             self._refresh_mode_controls()
             return
+        self._apply_pick(target)
+
+    def _on_zoom_drag(self, _value: str = "") -> None:
+        """While the slider moves, show the value only. The camera is not changed yet."""
+        self._zoom_label.config(text=f"{round(self._zoom_var.get())}%")
+
+    def _on_zoom_release(self, _event: Any = None) -> None:
+        """The slider was let go: apply the zoom the user chose."""
+        try:
+            target = self.picker.preview_zoom(round(self._zoom_var.get()))
+        except ValueError:
+            self._refresh_mode_controls()
+            return
+        self._apply_pick(target)
+
+    def _apply_pick(self, target: VideoMode) -> None:
+        """Send a picked mode to the camera; commit it only if the camera accepts it."""
         if target == self.picker.mode:
+            self._refresh_mode_controls()
             return
 
         def done(_: None) -> None:
@@ -645,15 +686,19 @@ class LivestreamApp:
 
     def _refresh_mode_controls(self) -> None:
         """Show the committed mode on every axis and enable only the options it allows."""
-        for axis in AXES:
+        for axis in DISCRETE_AXES:
             self._mode_vars[axis].set(self.picker.selected_text(axis))
+        self._zoom_var.set(self.picker.mode.zoom)
+        self._zoom_label.config(text=f"{self.picker.mode.zoom}%")
         self._update_mode_states()
 
     def _update_mode_states(self) -> None:
         locked = self._busy or self._recording
-        for axis in AXES:
+        for axis in DISCRETE_AXES:
             for opt, button in zip(self.picker.options(axis), self._mode_buttons[axis]):
                 button.config(state="normal" if opt.enabled and not locked else "disabled")
+        _, zoom_max = self.picker.zoom_range()
+        self._zoom_scale.config(state="normal" if zoom_max > 0 and not locked else "disabled")
 
     def _folder_name(self) -> str | None:
         """The folder typed in the box, or None (with the reason in the status line) if it is unusable."""

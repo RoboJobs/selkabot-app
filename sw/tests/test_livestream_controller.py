@@ -88,7 +88,6 @@ def controller(tmp_path, monkeypatch):
     FakeWired.instances = []
     FakeWired.reject = None
     monkeypatch.setattr(l, "WiredGoPro", FakeWired)
-    monkeypatch.setitem(table.ZOOM_PERCENT, "1.4x", 42)
     ctl = l.GoProController(tmp_path, port=8554, serial=None)
     yield ctl
     ctl.submit(ctl.shutdown()).result(timeout=5)
@@ -123,7 +122,7 @@ def test_set_mode_restarts_preview_around_the_change(controller):
     controller.submit(controller.connect(table.DEFAULT_MODE)).result(timeout=5)
     gopro = FakeWired.instances[-1]
     gopro.log.clear()
-    controller.submit(controller.set_mode(VideoMode("16:9", "2.7K", 120, "Wide", "1.4x"))).result(timeout=5)
+    controller.submit(controller.set_mode(VideoMode("16:9", "2.7K", 120, "Wide", 42))).result(timeout=5)
     assert _commands(gopro) == ["preview_off", "resolution", "fps", "lens", "zoom", "preview_on"]
 
 
@@ -140,9 +139,3 @@ def test_set_mode_restarts_preview_even_when_the_camera_refuses(controller):
 def test_set_mode_before_connect_is_an_error(controller):
     with pytest.raises(AssertionError):
         controller.submit(controller.set_mode(table.DEFAULT_MODE)).result(timeout=5)
-
-
-def test_connect_refuses_an_uncalibrated_zoom_mode(controller, monkeypatch):
-    monkeypatch.setitem(table.ZOOM_PERCENT, "1.4x", None)
-    with pytest.raises(RuntimeError, match="not calibrated"):
-        controller.submit(controller.connect(VideoMode("16:9", "2.7K", 60, "Wide", "1.4x"))).result(timeout=5)

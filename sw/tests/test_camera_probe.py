@@ -14,7 +14,7 @@ def test_probe_cases_are_unique_and_cover_every_fps_and_lens():
 
 
 def test_probe_cases_from_a_custom_row_list():
-    row = t.TableRow("16:9", "2.7K", (60,), ("Wide",), None, ())
+    row = t.TableRow("16:9", "2.7K", (60,), ("Wide",), ("Wide",))
     cases = probe.probe_cases([row, row])
     assert [c.label for c in cases] == ["16:9 2.7K 60fps Wide"]
 
