@@ -58,9 +58,11 @@ import cv2
 import numpy as np
 from open_gopro import WiredGoPro
 from open_gopro.models import constants, proto
-from open_gopro.models.constants import settings
 from PIL import Image, ImageTk
 
+from sw.camera import hero10_table
+from sw.camera.gopro_hero10 import HeroBackend
+from sw.camera.modes import NO_ZOOM, ModeCatalog, VideoMode
 from sw.sync_uploads import sync_uploads
 from sw.uploader import make_qr, public_url, upload_video
 from sw import shotcut_watermark
@@ -71,14 +73,12 @@ logger = logging.getLogger(__name__)
 # expected while joining the UDP stream mid-GOP. Read on first VideoCapture.
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
-# Label shown in the UI -> GoPro resolution setting
-RESOLUTIONS: dict[str, settings.VideoResolution] = {
-    "2.7K 16:9": settings.VideoResolution.NUM_2_7K,
-    "2.7K 4:3": settings.VideoResolution.NUM_2_7K_4_3,
-    "1080p": settings.VideoResolution.NUM_1080,
+# Label shown in the UI -> video mode. Temporary bridge until the cascading selector replaces it.
+RECORDING_MODES: dict[str, VideoMode] = {
+    "2.7K 16:9": hero10_table.DEFAULT_MODE,
+    "2.7K 4:3": VideoMode(hero10_table.RATIO_4_3, "2.7K", 120, hero10_table.LENS_WIDE, NO_ZOOM),
 }
 DEFAULT_RESOLUTION = "2.7K 16:9"
-FPS = settings.FramesPerSecond.NUM_60_0
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "videos"
 DEFAULT_FOLDER = "default"
@@ -230,6 +230,8 @@ class GoProController:
         self._media_before: set[str] = set()
         self._recording = False
         self._keep_alive_task: asyncio.Task | None = None
+        self._backend: HeroBackend | None = None
+        self.catalog: ModeCatalog = hero10_table.build_catalog()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, name="gopro-loop", daemon=True)
         self._thread.start()
@@ -243,7 +245,7 @@ class GoProController:
         assert self._gopro is not None, "GoPro is not connected"
         return self._gopro
 
-    async def connect(self, resolution: settings.VideoResolution) -> str:
+    async def connect(self, mode: VideoMode) -> str:
         """Connect over USB, configure video mode and start the preview stream.
 
         Returns:
@@ -254,17 +256,19 @@ class GoProController:
         # A previous session may have left the preview running, which blocks setting changes.
         await self._stop_preview()
         _check(await self.gopro.http_command.load_preset_group(group=proto.EnumPresetGroup.PRESET_GROUP_ID_VIDEO))
-        await self._apply_video_settings(resolution)
+        self._backend = HeroBackend(self.gopro, self.catalog)
+        await self._backend.apply_mode(mode)
         await self._start_preview()
         self._keep_alive_task = self._loop.create_task(self._keep_alive())
         # get_camera_name is not supported by HERO10 firmware (404)
         return self.gopro.identifier
 
-    async def set_resolution(self, resolution: settings.VideoResolution) -> None:
-        """Change the recording resolution, restarting the preview around it."""
+    async def set_mode(self, mode: VideoMode) -> None:
+        """Change the recording mode, restarting the preview around it."""
         await self._stop_preview()
         try:
-            await self._apply_video_settings(resolution)
+            assert self._backend is not None, "connect() must run before set_mode()"
+            await self._backend.apply_mode(mode)
         finally:
             await self._start_preview()
 
@@ -351,11 +355,6 @@ class GoProController:
             except Exception:  # pylint: disable=broad-except
                 logger.exception("Error while closing the GoPro connection")
         self._loop.call_soon(self._loop.stop)
-
-    async def _apply_video_settings(self, resolution: settings.VideoResolution) -> None:
-        # Resolution first: the valid fps values depend on it.
-        _check(await self.gopro.http_setting.video_resolution.set(resolution))
-        _check(await self.gopro.http_setting.frames_per_second.set(FPS))
 
     async def _stop_preview(self) -> None:
         # Not checked: the camera returns an error if no stream is running.
@@ -513,14 +512,14 @@ class LivestreamApp:
         controls = ttk.Frame(root)
         controls.pack(fill="x", padx=8, pady=(0, 8))
 
-        ttk.Label(controls, text="Resolution (60 fps):").pack(side="left")
+        ttk.Label(controls, text="Mode:").pack(side="left")
         self.resolution = tk.StringVar(value=DEFAULT_RESOLUTION)
         self._applied_resolution = DEFAULT_RESOLUTION
         self.resolution_buttons = [
             ttk.Radiobutton(
                 controls, text=label, value=label, variable=self.resolution, command=self._on_resolution
             )
-            for label in RESOLUTIONS
+            for label in RECORDING_MODES
         ]
         for button in self.resolution_buttons:
             button.pack(side="left", padx=4)
@@ -549,7 +548,7 @@ class LivestreamApp:
 
         self._update_controls()
         self._run(
-            controller.connect(RESOLUTIONS[DEFAULT_RESOLUTION]),
+            controller.connect(RECORDING_MODES[DEFAULT_RESOLUTION]),
             "Connecting to GoPro over USB…",
             self._on_connected,
         )
@@ -592,7 +591,8 @@ class LivestreamApp:
         # ffmpeg needs several seconds to probe the stream before the first frame.
         self._show_message("Starting preview...")
         self.reader.start()
-        self.status.set(f"Connected to GoPro {serial}. Ready to record at {self._applied_resolution}, 60 fps.")
+        fps = RECORDING_MODES[self._applied_resolution].fps
+        self.status.set(f"Connected to GoPro {serial}. Ready to record at {self._applied_resolution}, {fps} fps.")
 
     def _on_resolution(self) -> None:
         label = self.resolution.get()
@@ -607,7 +607,7 @@ class LivestreamApp:
             self.resolution.set(self._applied_resolution)
 
         self._run(
-            self.controller.set_resolution(RESOLUTIONS[label]),
+            self.controller.set_mode(RECORDING_MODES[label]),
             f"Switching to {label}…",
             done,
             failed,
@@ -754,7 +754,8 @@ class LivestreamApp:
 
         if self._recording and not self._busy:
             elapsed = int(time.monotonic() - self._record_started)
-            self.status.set(f"● Recording {self._applied_resolution} 60 fps — {elapsed // 60:02d}:{elapsed % 60:02d}")
+            fps = RECORDING_MODES[self._applied_resolution].fps
+            self.status.set(f"● Recording {self._applied_resolution} {fps} fps — {elapsed // 60:02d}:{elapsed % 60:02d}")
 
         frame = self.reader.latest_frame()
         # Ignore frames still buffered from before the preview was paused.
