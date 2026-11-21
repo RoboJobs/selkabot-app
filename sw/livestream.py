@@ -521,7 +521,6 @@ class LivestreamApp:
         self.picker = ModePicker(
             controller.catalog,
             load_mode(config_file, controller.catalog),
-            unavailable=hero10_table.UNCONFIRMED_VALUES,
         )
         modes_frame = ttk.Frame(root)
         modes_frame.pack(fill="x", padx=8, pady=(0, 4))

@@ -6,16 +6,21 @@ from sw.camera import hero10_table as t
 from sw.camera.modes import VideoMode
 
 
+def test_table_has_only_ntsc_frame_rates():
+    fps = {f for r in t.ROWS for f in r.fps}
+    assert fps == {60, 120, 240}
+
+
 def test_table_has_the_requested_rows():
     seen = {(r.ratio, r.resolution, r.fps) for r in t.ROWS}
     assert seen == {
-        ("16:9", "5.3K", (60, 50)),
-        ("16:9", "4K", (120, 100)),
-        ("16:9", "2.7K", (240, 200)),
-        ("16:9", "2.7K", (120, 100)),
-        ("16:9", "2.7K", (60, 50)),
-        ("4:3", "4K", (60, 50)),
-        ("4:3", "2.7K", (120, 100)),
+        ("16:9", "5.3K", (60,)),
+        ("16:9", "4K", (120,)),
+        ("16:9", "2.7K", (240,)),
+        ("16:9", "2.7K", (120,)),
+        ("16:9", "2.7K", (60,)),
+        ("4:3", "4K", (60,)),
+        ("4:3", "2.7K", (120,)),
     }
 
 

@@ -41,7 +41,7 @@ class TableRow:
     Attributes:
         ratio: "16:9" or "4:3".
         resolution: Display name, e.g. "2.7K".
-        fps: Frame rates offered by this row, e.g. (120, 100).
+        fps: Frame rates offered by this row, e.g. (120,).
         lenses: Digital lens options offered by this row.
         zoom_lenses: Subset of `lenses` on which digital zoom is allowed.
     """
@@ -58,14 +58,14 @@ _ALL_SV = (LENS_SUPERVIEW,) + _ALL_NO_SV
 
 ROWS: tuple[TableRow, ...] = (
     # 16:9
-    TableRow(RATIO_16_9, "5.3K", (60, 50), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
-    TableRow(RATIO_16_9, "4K", (120, 100), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR_HL)),
-    TableRow(RATIO_16_9, "2.7K", (240, 200), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
-    TableRow(RATIO_16_9, "2.7K", (120, 100), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
-    TableRow(RATIO_16_9, "2.7K", (60, 50), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(RATIO_16_9, "5.3K", (60,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(RATIO_16_9, "4K", (120,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR_HL)),
+    TableRow(RATIO_16_9, "2.7K", (240,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(RATIO_16_9, "2.7K", (120,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(RATIO_16_9, "2.7K", (60,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
     # 4:3 (no SuperView)
-    TableRow(RATIO_4_3, "4K", (60, 50), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
-    TableRow(RATIO_4_3, "2.7K", (120, 100), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(RATIO_4_3, "4K", (60,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(RATIO_4_3, "2.7K", (120,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
 )
 
 # Camera enum for each (ratio, resolution). The aspect ratio is encoded in
@@ -80,11 +80,8 @@ RESOLUTION_ENUM: dict[tuple[str, str], VideoResolution] = {
 
 FPS_ENUM: dict[int, FramesPerSecond] = {
     240: FramesPerSecond.NUM_240_0,
-    200: FramesPerSecond.NUM_200_0,
     120: FramesPerSecond.NUM_120_0,
-    100: FramesPerSecond.NUM_100_0,
     60: FramesPerSecond.NUM_60_0,
-    50: FramesPerSecond.NUM_50_0,
 }
 
 LENS_ENUM: dict[str, VideoLens] = {
@@ -94,10 +91,6 @@ LENS_ENUM: dict[str, VideoLens] = {
     LENS_LINEAR_HL: VideoLens.LINEAR_HORIZON_LEVELING,
     LENS_NARROW: VideoLens.NARROW,
 }
-
-# Values present in the table that the camera did not accept in testing (PAL frame rates
-# on this unit). They stay in the catalog and are disabled in the window until confirmed.
-UNCONFIRMED_VALUES: dict[str, frozenset] = {"fps": frozenset({50, 100, 200})}
 
 DEFAULT_MODE = VideoMode(RATIO_16_9, "2.7K", 60, LENS_WIDE, NO_ZOOM)
 

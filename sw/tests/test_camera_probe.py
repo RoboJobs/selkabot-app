@@ -41,7 +41,7 @@ def test_compare_state_reports_wrong_fps():
 
 
 def test_compare_state_reports_missing_setting():
-    case = probe.ProbeCase("4:3", "4K", 50, "Linear")
+    case = probe.ProbeCase("4:3", "4K", 60, "Linear")
     state = _state_for(case)
     del state[SettingId.VIDEO_LENS]
     assert probe.compare_state(case, state) == ("lens: not reported",)

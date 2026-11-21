@@ -9,7 +9,7 @@ from sw.camera.modes import VideoMode
 
 @pytest.fixture
 def picker() -> ModePicker:
-    return ModePicker(table.build_catalog(), unavailable=table.UNCONFIRMED_VALUES)
+    return ModePicker(table.build_catalog())
 
 
 def enabled_texts(options) -> list[str]:
@@ -42,30 +42,10 @@ def test_only_compatible_resolutions_are_enabled_after_choosing_4_3():
 
 
 def test_fps_options_follow_the_committed_resolution(picker):
-    # 2.7K 16:9 offers every fps in the table, but the PAL rates are not confirmed on this camera.
     assert enabled_texts(picker.options("fps")) == ["60", "120", "240"]
-    assert [o.text for o in picker.options("fps")] == ["60", "50", "120", "100", "240", "200"]
+    assert [o.text for o in picker.options("fps")] == ["60", "120", "240"]
     picker.commit(VideoMode("16:9", "5.3K", 60, "Wide", 0))
     assert enabled_texts(picker.options("fps")) == ["60"]
-
-
-def test_unconfirmed_fps_is_refused_even_when_the_catalog_allows_it(picker):
-    with pytest.raises(ValueError):
-        picker.preview("fps", "50")
-    with pytest.raises(ValueError):
-        picker.preview("fps", "100")
-
-
-def test_a_saved_unconfirmed_mode_falls_back_to_the_default():
-    saved = VideoMode("16:9", "4K", 100, "Wide", 0)
-    picker = ModePicker(table.build_catalog(), saved, unavailable=table.UNCONFIRMED_VALUES)
-    assert picker.mode == table.DEFAULT_MODE
-
-
-def test_without_unavailable_values_pal_rates_stay_selectable():
-    picker = ModePicker(table.build_catalog())
-    assert "50" in enabled_texts(picker.options("fps"))
-    assert picker.preview("fps", "50").fps == 50
 
 
 def test_preview_returns_the_cascaded_mode_without_committing(picker):
@@ -108,7 +88,7 @@ def test_commit_moves_the_selector_to_the_new_mode(picker):
     picker.commit(picker.preview("ratio", "4:3"))
     assert picker.mode.label == "4:3 2.7K 120fps Wide"
     assert picker.selected_text("ratio") == "4:3"
-    assert enabled_texts(picker.options("fps")) == ["120"]  # 100 is an unconfirmed PAL rate
+    assert enabled_texts(picker.options("fps")) == ["120"]
 
 
 def test_commit_refuses_a_mode_outside_the_catalog(picker):
