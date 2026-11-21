@@ -97,6 +97,17 @@ LENS_ENUM: dict[str, VideoLens] = {
     LENS_NARROW: VideoLens.NARROW,
 }
 
+def zoom_supported(mode: VideoMode) -> bool:
+    """True if the table allows digital zoom with this mode's lens, frame rate and resolution."""
+    return any(
+        row.ratio == mode.ratio
+        and row.resolution == mode.resolution
+        and mode.fps in row.fps
+        and mode.lens in row.zoom_lenses
+        for row in ROWS
+    )
+
+
 # Digital zoom is sent as a percentage to `gopro/camera/digital_zoom`.
 # 0 means no zoom. The values for 1.4x and 2x are NOT known yet; they must be
 # calibrated on the camera with sw/camera_probe.py before zoom can be applied.

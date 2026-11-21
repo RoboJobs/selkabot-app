@@ -8,7 +8,7 @@ from typing import Any
 from open_gopro.models.constants import SettingId
 
 from sw.camera import hero10_table as table
-from sw.camera.modes import ModeCatalog, VideoMode
+from sw.camera.modes import NO_ZOOM, ModeCatalog, VideoMode
 
 
 def camera_values(mode: VideoMode) -> tuple[Any, Any, Any]:
@@ -71,8 +71,11 @@ class HeroBackend:
     async def apply_mode(self, mode: VideoMode) -> None:
         if not self._catalog.is_valid(mode):
             raise ValueError(f"{mode.label} is not a valid HERO10 mode")
+        # The camera rejects digital zoom commands with lenses that have no zoom (SuperView, Narrow),
+        # even for 0, so the command is only sent where the table allows zoom.
+        send_zoom = mode.zoom != NO_ZOOM or table.zoom_supported(mode)
         percent = table.ZOOM_PERCENT[mode.zoom]
-        if percent is None:
+        if send_zoom and percent is None:
             raise RuntimeError(
                 f"digital zoom {mode.zoom} is not calibrated yet; "
                 "run sw/camera_probe.py --calibrate-zoom PERCENT and record it in hero10_table.ZOOM_PERCENT"
@@ -82,7 +85,8 @@ class HeroBackend:
         await _send(http.video_resolution.set(resolution), "video resolution")
         await _send(http.frames_per_second.set(fps), "frames per second")
         await _send(http.video_lens.set(lens), "video lens")
-        await _send(self._gopro.http_command.set_digital_zoom(percent=percent), "digital zoom")
+        if send_zoom:
+            await _send(self._gopro.http_command.set_digital_zoom(percent=percent), "digital zoom")
 
         problems = state_mismatches(mode, (await self._gopro.http_command.get_camera_state()).data)
         if problems:

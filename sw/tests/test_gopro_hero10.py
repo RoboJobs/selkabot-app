@@ -201,3 +201,17 @@ def test_state_mismatches_is_empty_for_a_matching_state():
 
 def test_backend_satisfies_the_camera_backend_protocol():
     assert isinstance(hero.HeroBackend(FakeGoPro()), CameraBackend)
+
+
+@sync
+async def test_lens_without_zoom_sends_no_zoom_command(calibrated):
+    gopro = FakeGoPro()
+    await hero.HeroBackend(gopro).apply_mode(VideoMode("16:9", "2.7K", 120, "SuperView", NO_ZOOM))
+    assert [name for name, _ in gopro.log] == ["resolution", "fps", "lens"]
+
+
+def test_zoom_supported_follows_the_table():
+    assert table.zoom_supported(VideoMode("16:9", "2.7K", 120, "Wide", NO_ZOOM))
+    assert not table.zoom_supported(VideoMode("16:9", "2.7K", 120, "SuperView", NO_ZOOM))
+    assert not table.zoom_supported(VideoMode("16:9", "4K", 120, "Narrow", NO_ZOOM))
+    assert not table.zoom_supported(VideoMode("16:9", "4K", 120, "Linear", NO_ZOOM))  # only Wide and Linear+HL
