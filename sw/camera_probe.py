@@ -106,6 +106,26 @@ async def _apply_case(gopro: Any, case: ProbeCase) -> ProbeResult:
     return ProbeResult(case, not mismatches, mismatches)
 
 
+async def _calibrate_zoom(gopro: Any, percent: int) -> int:
+    """Move to a zoom-capable mode, send one zoom percentage and print what the camera reports."""
+    from open_gopro.models.constants import StatusId
+
+    mode = table.DEFAULT_MODE
+    setup = await _apply_case(gopro, ProbeCase(mode.ratio, mode.resolution, mode.fps, mode.lens))
+    if not setup.accepted:
+        print(f"could not select {mode.label}: {setup.error or '; '.join(setup.mismatches)}")
+        return 1
+    state = (await gopro.http_command.get_camera_state()).data
+    if not state.get(StatusId.ZOOM_AVAILABLE):
+        print(f"digital zoom is not available in {mode.label}; check the lens setting")
+        return 1
+    response = await gopro.http_command.set_digital_zoom(percent=percent)
+    level = (await gopro.http_command.get_camera_state()).data.get(StatusId.ZOOM_LEVEL)
+    print(f"{mode.label}: digital zoom {percent}% {'accepted' if response.ok else 'rejected'}, camera reports level {level}")
+    print("Check the display and note the zoom factor (1.4x or 2x) this percentage gives.")
+    return 0 if response.ok else 1
+
+
 async def _run(serial: str | None, calibrate_zoom: int | None) -> int:
     from open_gopro import WiredGoPro
 
@@ -113,9 +133,7 @@ async def _run(serial: str | None, calibrate_zoom: int | None) -> int:
     await gopro.open()
     try:
         if calibrate_zoom is not None:
-            response = await gopro.http_command.set_digital_zoom(percent=calibrate_zoom)
-            print(f"digital zoom {calibrate_zoom}%: {'ok' if response.ok else 'rejected'}")
-            return 0 if response.ok else 1
+            return await _calibrate_zoom(gopro, calibrate_zoom)
         results = [await _apply_case(gopro, case) for case in probe_cases()]
     finally:
         await gopro.close()

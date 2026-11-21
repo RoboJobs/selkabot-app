@@ -5,7 +5,7 @@ import functools
 from types import SimpleNamespace
 
 import pytest
-from open_gopro.models.constants import SettingId
+from open_gopro.models.constants import SettingId, StatusId
 
 from sw.camera import gopro_hero10 as hero
 from sw.camera import hero10_table as table
@@ -55,6 +55,13 @@ class _Setting:
             return Resp(False)
         stored = gopro._override.get(self._name, value)
         gopro.state[gopro.KEYS[self._name]] = stored
+        if self._name == "lens":
+            # Like the camera: zoom is available only on these lenses, and switching
+            # to a lens without zoom resets the zoom level to 0.
+            available = stored in (table.LENS_ENUM["Wide"], table.LENS_ENUM["Linear"], table.LENS_ENUM["Linear+HL"])
+            gopro.state[StatusId.ZOOM_AVAILABLE] = available
+            if not available:
+                gopro.state[StatusId.ZOOM_LEVEL] = 0
         return Resp(True)
 
 
@@ -64,6 +71,7 @@ class _Command:
 
     async def set_digital_zoom(self, *, percent: int):
         self._gopro.log.append(("zoom", percent))
+        self._gopro.state[StatusId.ZOOM_LEVEL] = percent
         return Resp(True)
 
     async def get_camera_state(self):
@@ -197,6 +205,33 @@ def test_state_mismatches_is_empty_for_a_matching_state():
         SettingId.VIDEO_LENS: table.LENS_ENUM["Wide"],
     }
     assert hero.state_mismatches(mode, state) == ()
+
+
+def test_zoom_mismatches_are_empty_for_a_matching_zoom_status(calibrated):
+    state = {StatusId.ZOOM_AVAILABLE: True, StatusId.ZOOM_LEVEL: 42}
+    assert hero.zoom_mismatches(_mode("1.4x"), state) == ()
+
+
+def test_zoom_mismatches_report_wrong_level_and_availability():
+    state = {StatusId.ZOOM_AVAILABLE: False, StatusId.ZOOM_LEVEL: 10}
+    problems = hero.zoom_mismatches(_mode("1.4x"), state)
+    assert len(problems) == 2
+    assert problems[0].startswith("zoom available") and problems[1].startswith("zoom level")
+
+
+@sync
+async def test_readback_detects_a_zoom_level_the_camera_did_not_keep(calibrated):
+    gopro = FakeGoPro()
+    original = gopro.http_command.get_camera_state
+
+    async def zoom_reset():
+        data = (await original()).data
+        data[StatusId.ZOOM_LEVEL] = 0
+        return SimpleNamespace(data=data)
+
+    gopro.http_command.get_camera_state = zoom_reset
+    with pytest.raises(RuntimeError, match="zoom level"):
+        await hero.HeroBackend(gopro).apply_mode(_mode("1.4x"))
 
 
 def test_backend_satisfies_the_camera_backend_protocol():

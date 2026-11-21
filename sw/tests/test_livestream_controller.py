@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
-from open_gopro.models.constants import SettingId, constants
+from open_gopro.models.constants import SettingId, StatusId, constants
 
 from sw import livestream as l
 from sw.camera import hero10_table as table
@@ -51,6 +51,11 @@ class _Setting:
         if self._name == FakeWired.reject:
             return Resp(False)
         self._gopro.state[self._key] = value
+        if self._name == "lens":
+            available = value in (table.LENS_ENUM["Wide"], table.LENS_ENUM["Linear"], table.LENS_ENUM["Linear+HL"])
+            self._gopro.state[StatusId.ZOOM_AVAILABLE] = available
+            if not available:
+                self._gopro.state[StatusId.ZOOM_LEVEL] = 0
         return Resp(True)
 
 
@@ -71,6 +76,7 @@ class _Command:
 
     async def set_digital_zoom(self, percent):
         self._gopro.log.append("zoom")
+        self._gopro.state[StatusId.ZOOM_LEVEL] = percent
         return Resp(True)
 
     async def get_camera_state(self):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Mapping
 from typing import Any
 
-from open_gopro.models.constants import SettingId
+from open_gopro.models.constants import SettingId, StatusId
 
 from sw.camera import hero10_table as table
 from sw.camera.modes import NO_ZOOM, ModeCatalog, VideoMode
@@ -38,6 +38,26 @@ def state_mismatches(mode: VideoMode, state: Mapping[Any, Any]) -> tuple[str, ..
             problems.append(f"{name}: not reported")
         elif state[setting] != wanted:
             problems.append(f"{name}: wanted {wanted.name}, camera reports {state[setting]}")
+    return tuple(problems)
+
+
+def zoom_mismatches(mode: VideoMode, state: Mapping[Any, Any]) -> tuple[str, ...]:
+    """Describe how the camera's zoom status differs from `mode`.
+
+    The camera reports whether digital zoom is available for the current lens, and the
+    zoom level in percent. Switching to a lens without zoom resets the level to 0.
+    """
+    expected_available = table.zoom_supported(mode)
+    expected_level = table.ZOOM_PERCENT[mode.zoom]
+    problems: list[str] = []
+    if StatusId.ZOOM_AVAILABLE not in state:
+        problems.append("zoom available: not reported")
+    elif state[StatusId.ZOOM_AVAILABLE] != expected_available:
+        problems.append(f"zoom available: wanted {expected_available}, camera reports {state[StatusId.ZOOM_AVAILABLE]}")
+    if StatusId.ZOOM_LEVEL not in state:
+        problems.append("zoom level: not reported")
+    elif state[StatusId.ZOOM_LEVEL] != expected_level:
+        problems.append(f"zoom level: wanted {expected_level}, camera reports {state[StatusId.ZOOM_LEVEL]}")
     return tuple(problems)
 
 
@@ -88,6 +108,7 @@ class HeroBackend:
         if send_zoom:
             await _send(self._gopro.http_command.set_digital_zoom(percent=percent), "digital zoom")
 
-        problems = state_mismatches(mode, (await self._gopro.http_command.get_camera_state()).data)
+        state = (await self._gopro.http_command.get_camera_state()).data
+        problems = state_mismatches(mode, state) + zoom_mismatches(mode, state)
         if problems:
             raise RuntimeError(f"camera did not keep {mode.label}: " + "; ".join(problems))
