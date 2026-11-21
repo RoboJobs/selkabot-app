@@ -20,9 +20,12 @@ Results from the asyncio thread reach the UI through a queue polled by Tk.
 
 Notes:
 - The preview stream is a low resolution live view; the recorded file is in
-  the selected resolution (2.7K 16:9 by default) at 60 fps.
-- Resolution can only be changed while not recording or downloading. The
-  preview stream is restarted around the change.
+  the selected video mode (2.7K 16:9 at 60 fps, no zoom, Wide lens by default).
+  Modes come from sw/camera/hero10_table.py and are chosen with the cascading
+  ratio / resolution / fps / lens / zoom rows.
+- The mode can only be changed while not recording or downloading. The
+  preview stream is restarted around the change. The last accepted mode is
+  saved in livestream_config.json.
 - The preview is paused while recording. On HERO10 firmware H21.01.01.62.00,
   starting a recording while the USB preview is running kills the preview
   until the camera is power cycled. Stopping the preview first, and starting
