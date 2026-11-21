@@ -18,10 +18,12 @@ from open_gopro.models.constants.settings import (
     VideoResolution,
 )
 
+from sw.camera.modes import NO_ZOOM, ModeCatalog, VideoMode
+
 RATIO_16_9 = "16:9"
 RATIO_4_3 = "4:3"
 
-ZOOM_NONE = "none"
+ZOOM_NONE = NO_ZOOM
 ZOOM_1_4X = "1.4x"
 ZOOM_2X = "2x"
 
@@ -103,3 +105,22 @@ ZOOM_PERCENT: dict[str, int | None] = {
     ZOOM_1_4X: None,
     ZOOM_2X: None,
 }
+
+
+DEFAULT_MODE = VideoMode(RATIO_16_9, "2.7K", 60, LENS_WIDE, ZOOM_NONE)
+
+
+def build_catalog() -> ModeCatalog:
+    """Expand ROWS into every valid HERO10 video mode.
+
+    A row yields one mode per (fps, lens) pair, and one more mode per
+    (fps, zoom lens) pair with the row's zoom factor applied.
+    """
+    modes: list[VideoMode] = []
+    for row in ROWS:
+        for fps in row.fps:
+            for lens in row.lenses:
+                modes.append(VideoMode(row.ratio, row.resolution, fps, lens, ZOOM_NONE))
+            for lens in row.zoom_lenses:
+                modes.append(VideoMode(row.ratio, row.resolution, fps, lens, row.zoom))
+    return ModeCatalog(modes, DEFAULT_MODE)
