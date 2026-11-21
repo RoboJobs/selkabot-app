@@ -25,9 +25,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from open_gopro.models.constants import SettingId
-
 from sw.camera import hero10_table as table
+from sw.camera.gopro_hero10 import state_mismatches
+from sw.camera.modes import VideoMode
 
 
 @dataclass(frozen=True)
@@ -69,23 +69,8 @@ def probe_cases(rows: Iterable[table.TableRow] = table.ROWS) -> list[ProbeCase]:
 
 
 def compare_state(expected: ProbeCase, state: Mapping[Any, Any]) -> tuple[str, ...]:
-    """Return human readable mismatches between the requested case and camera state.
-
-    `state` maps SDK setting identifiers to the values the camera reports.
-    Missing entries count as mismatches.
-    """
-    checks = (
-        (SettingId.VIDEO_RESOLUTION, table.RESOLUTION_ENUM[(expected.ratio, expected.resolution)], "resolution"),
-        (SettingId.FRAMES_PER_SECOND, table.FPS_ENUM[expected.fps], "fps"),
-        (SettingId.VIDEO_LENS, table.LENS_ENUM[expected.lens], "lens"),
-    )
-    problems: list[str] = []
-    for setting, wanted, name in checks:
-        if setting not in state:
-            problems.append(f"{name}: not reported")
-        elif state[setting] != wanted:
-            problems.append(f"{name}: wanted {wanted.name}, camera reports {state[setting]}")
-    return tuple(problems)
+    """Return human readable mismatches between the requested case and camera state."""
+    return state_mismatches(VideoMode(expected.ratio, expected.resolution, expected.fps, expected.lens), state)
 
 
 def format_report(results: Iterable[ProbeResult]) -> str:
