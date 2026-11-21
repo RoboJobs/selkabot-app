@@ -515,7 +515,11 @@ class LivestreamApp:
         self.video.pack(fill="both", expand=True, padx=8, pady=8)
         self._show_message("Connecting to GoPro...")
 
-        self.picker = ModePicker(controller.catalog, load_mode(config_file, controller.catalog))
+        self.picker = ModePicker(
+            controller.catalog,
+            load_mode(config_file, controller.catalog),
+            unavailable=hero10_table.UNCONFIRMED_VALUES,
+        )
         modes_frame = ttk.Frame(root)
         modes_frame.pack(fill="x", padx=8, pady=(0, 4))
         self._build_mode_rows(modes_frame)

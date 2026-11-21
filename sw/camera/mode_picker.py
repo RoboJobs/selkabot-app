@@ -8,6 +8,7 @@ commit() only after the camera has accepted the new mode.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,11 +32,20 @@ class ModePicker:
         mode: Starting mode. Defaults to the catalog default. Must be valid.
     """
 
-    def __init__(self, catalog: ModeCatalog, mode: VideoMode | None = None) -> None:
+    def __init__(
+        self,
+        catalog: ModeCatalog,
+        mode: VideoMode | None = None,
+        unavailable: Mapping[str, frozenset] | None = None,
+    ) -> None:
         self._catalog = catalog
+        self._unavailable: dict[str, frozenset] = dict(unavailable or {})
         self._committed = mode if mode is not None else catalog.default
         if not catalog.is_valid(self._committed):
             raise ValueError(f"{self._committed.label} is not in the catalog")
+        if self._is_unavailable(self._committed):
+            # A saved mode that the window may no longer offer falls back to the default.
+            self._committed = catalog.default
 
     @property
     def mode(self) -> VideoMode:
@@ -53,7 +63,10 @@ class ModePicker:
     def options(self, axis: str) -> list[PickerOption]:
         """Every value of `axis`, enabled only where the committed mode allows it."""
         selection = {a: getattr(self._committed, a) for a in AXES}
-        return [PickerOption(str(o.value), o.value, o.enabled) for o in self._catalog.options(axis, selection)]
+        return [
+            PickerOption(str(o.value), o.value, o.enabled and o.value not in self._unavailable.get(axis, frozenset()))
+            for o in self._catalog.options(axis, selection)
+        ]
 
     def preview(self, axis: str, text: str) -> VideoMode:
         """The mode that picking `text` on `axis` would produce, without committing it.
@@ -62,6 +75,8 @@ class ModePicker:
             ValueError: `text` is not a value of `axis`, or it is not enabled.
         """
         value = self._value_for(axis, text)
+        if value in self._unavailable.get(axis, frozenset()):
+            raise ValueError(f"{text} {axis} is not available on this camera yet")
         return self._catalog.select(self._committed, axis, value)
 
     def commit(self, mode: VideoMode) -> None:
@@ -69,6 +84,9 @@ class ModePicker:
         if not self._catalog.is_valid(mode):
             raise ValueError(f"{mode.label} is not in the catalog")
         self._committed = mode
+
+    def _is_unavailable(self, mode: VideoMode) -> bool:
+        return any(getattr(mode, axis) in values for axis, values in self._unavailable.items())
 
     def _value_for(self, axis: str, text: str) -> Any:
         for value in self._catalog.values(axis):

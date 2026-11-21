@@ -35,7 +35,7 @@ def app(root, tmp_path):
     ui._busy = False
     ui._recording = False
     ui.config_file = tmp_path / "config.json"
-    ui.picker = ModePicker(table.build_catalog())
+    ui.picker = ModePicker(table.build_catalog(), unavailable=table.UNCONFIRMED_VALUES)
     ui.status = tk.StringVar(master=root)
     ui.controller = SimpleNamespace(set_mode=lambda mode: None)
     frame = ttk.Frame(root)
@@ -60,6 +60,8 @@ def test_default_mode_enables_the_compatible_options(app):
     assert enabled_texts(app, "ratio") == ["16:9", "4:3"]
     assert enabled_texts(app, "resolution") == ["5.3K", "4K", "2.7K"]
     assert enabled_texts(app, "zoom") == ["none", "1.4x"]
+    assert enabled_texts(app, "fps") == ["60", "120", "240"]
+    assert ("50", "disabled") in states(app, "fps")
 
 
 def test_choosing_4_3_disables_5_3k_after_refresh(app):

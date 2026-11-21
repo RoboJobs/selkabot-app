@@ -107,6 +107,10 @@ ZOOM_PERCENT: dict[str, int | None] = {
 }
 
 
+# Values present in the table that the camera did not accept in testing (PAL frame rates
+# on this unit). They stay in the catalog and are disabled in the window until confirmed.
+UNCONFIRMED_VALUES: dict[str, frozenset] = {"fps": frozenset({50, 100, 200})}
+
 DEFAULT_MODE = VideoMode(RATIO_16_9, "2.7K", 60, LENS_WIDE, ZOOM_NONE)
 
 
