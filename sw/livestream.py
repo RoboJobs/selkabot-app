@@ -62,7 +62,8 @@ from PIL import Image, ImageTk
 
 from sw.camera import hero10_table
 from sw.camera.gopro_hero10 import HeroBackend
-from sw.camera.modes import NO_ZOOM, ModeCatalog, VideoMode
+from sw.camera.mode_picker import ModePicker
+from sw.camera.modes import AXES, ModeCatalog, VideoMode
 from sw.sync_uploads import sync_uploads
 from sw.uploader import make_qr, public_url, upload_video
 from sw import shotcut_watermark
@@ -73,12 +74,13 @@ logger = logging.getLogger(__name__)
 # expected while joining the UDP stream mid-GOP. Read on first VideoCapture.
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
-# Label shown in the UI -> video mode. Temporary bridge until the cascading selector replaces it.
-RECORDING_MODES: dict[str, VideoMode] = {
-    "2.7K 16:9": hero10_table.DEFAULT_MODE,
-    "2.7K 4:3": VideoMode(hero10_table.RATIO_4_3, "2.7K", 120, hero10_table.LENS_WIDE, NO_ZOOM),
+MODE_AXIS_TITLES: dict[str, str] = {
+    "ratio": "Ratio",
+    "resolution": "Resolution",
+    "fps": "FPS",
+    "lens": "Lens",
+    "zoom": "Zoom",
 }
-DEFAULT_RESOLUTION = "2.7K 16:9"
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "videos"
 DEFAULT_FOLDER = "default"
@@ -509,20 +511,13 @@ class LivestreamApp:
         self.video.pack(fill="both", expand=True, padx=8, pady=8)
         self._show_message("Connecting to GoPro...")
 
+        self.picker = ModePicker(controller.catalog)
+        modes_frame = ttk.Frame(root)
+        modes_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self._build_mode_rows(modes_frame)
+
         controls = ttk.Frame(root)
         controls.pack(fill="x", padx=8, pady=(0, 8))
-
-        ttk.Label(controls, text="Mode:").pack(side="left")
-        self.resolution = tk.StringVar(value=DEFAULT_RESOLUTION)
-        self._applied_resolution = DEFAULT_RESOLUTION
-        self.resolution_buttons = [
-            ttk.Radiobutton(
-                controls, text=label, value=label, variable=self.resolution, command=self._on_resolution
-            )
-            for label in RECORDING_MODES
-        ]
-        for button in self.resolution_buttons:
-            button.pack(side="left", padx=4)
 
         self.record_button = tk.Button(controls, text="Start recording", width=16, command=self._on_record)
         self.record_button.pack(side="right")
@@ -548,7 +543,7 @@ class LivestreamApp:
 
         self._update_controls()
         self._run(
-            controller.connect(RECORDING_MODES[DEFAULT_RESOLUTION]),
+            controller.connect(self.picker.mode),
             "Connecting to GoPro over USB…",
             self._on_connected,
         )
@@ -591,27 +586,65 @@ class LivestreamApp:
         # ffmpeg needs several seconds to probe the stream before the first frame.
         self._show_message("Starting preview...")
         self.reader.start()
-        fps = RECORDING_MODES[self._applied_resolution].fps
-        self.status.set(f"Connected to GoPro {serial}. Ready to record at {self._applied_resolution}, {fps} fps.")
+        self.status.set(f"Connected to GoPro {serial}. Ready to record at {self.picker.mode.label}.")
 
-    def _on_resolution(self) -> None:
-        label = self.resolution.get()
-        if label == self._applied_resolution:
+    def _build_mode_rows(self, parent: ttk.Frame) -> None:
+        """Create one row per cascade axis. Options the committed mode rules out are disabled, not hidden."""
+        self._mode_vars: dict[str, tk.StringVar] = {}
+        self._mode_buttons: dict[str, list[ttk.Radiobutton]] = {}
+        for row, axis in enumerate(AXES):
+            ttk.Label(parent, text=MODE_AXIS_TITLES[axis], width=10, anchor="w").grid(row=row, column=0, sticky="w")
+            var = tk.StringVar(value=self.picker.selected_text(axis))
+            self._mode_vars[axis] = var
+            self._mode_buttons[axis] = [
+                ttk.Radiobutton(
+                    parent,
+                    text=opt.text,
+                    value=opt.text,
+                    variable=var,
+                    command=functools.partial(self._on_mode_pick, axis),
+                )
+                for opt in self.picker.options(axis)
+            ]
+            for column, button in enumerate(self._mode_buttons[axis], start=1):
+                button.grid(row=row, column=column, sticky="w", padx=4)
+        self._update_mode_states()
+
+    def _on_mode_pick(self, axis: str) -> None:
+        try:
+            target = self.picker.preview(axis, self._mode_vars[axis].get())
+        except ValueError:
+            self._refresh_mode_controls()
+            return
+        if target == self.picker.mode:
             return
 
         def done(_: None) -> None:
-            self._applied_resolution = label
-            self.status.set(f"Resolution set to {label}, 60 fps.")
+            self.picker.commit(target)
+            self._refresh_mode_controls()
+            self.status.set(f"Mode set to {target.label}.")
 
         def failed(_: Exception) -> None:
-            self.resolution.set(self._applied_resolution)
+            self._refresh_mode_controls()
 
         self._run(
-            self.controller.set_mode(RECORDING_MODES[label]),
-            f"Switching to {label}…",
+            self.controller.set_mode(target),
+            f"Switching to {target.label}…",
             done,
             failed,
         )
+
+    def _refresh_mode_controls(self) -> None:
+        """Show the committed mode on every axis and enable only the options it allows."""
+        for axis in AXES:
+            self._mode_vars[axis].set(self.picker.selected_text(axis))
+        self._update_mode_states()
+
+    def _update_mode_states(self) -> None:
+        locked = self._busy or self._recording
+        for axis in AXES:
+            for opt, button in zip(self.picker.options(axis), self._mode_buttons[axis]):
+                button.config(state="normal" if opt.enabled and not locked else "disabled")
 
     def _folder_name(self) -> str | None:
         """The folder typed in the box, or None (with the reason in the status line) if it is unusable."""
@@ -738,10 +771,9 @@ class LivestreamApp:
         else:
             self.record_button.config(text="Start recording", bg="#2e7d32", fg="white", activebackground="#1b5e20")
         self.record_button.config(state="disabled" if self._busy else "normal")
-        radio_state = "disabled" if self._busy or self._recording else "normal"
-        for button in self.resolution_buttons:
-            button.config(state=radio_state)
+        self._update_mode_states()
         # The folder and image are fixed for the duration of a recording and its download.
+        radio_state = "disabled" if self._busy or self._recording else "normal"
         self.folder_entry.config(state=radio_state)
         self.image_entry.config(state=radio_state)
 
@@ -754,8 +786,7 @@ class LivestreamApp:
 
         if self._recording and not self._busy:
             elapsed = int(time.monotonic() - self._record_started)
-            fps = RECORDING_MODES[self._applied_resolution].fps
-            self.status.set(f"● Recording {self._applied_resolution} {fps} fps — {elapsed // 60:02d}:{elapsed % 60:02d}")
+            self.status.set(f"● Recording {self.picker.mode.label} — {elapsed // 60:02d}:{elapsed % 60:02d}")
 
         frame = self.reader.latest_frame()
         # Ignore frames still buffered from before the preview was paused.

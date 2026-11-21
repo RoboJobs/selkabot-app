@@ -1,0 +1,77 @@
+"""What the UI shows for the cascading video mode selector.
+
+ModePicker holds the mode the camera is set to ("committed") and answers the
+questions a UI needs: which values to list, which are enabled, and which mode
+a pick would produce. It has no Tk or camera dependency. The UI calls
+commit() only after the camera has accepted the new mode.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from sw.camera.modes import AXES, ModeCatalog, VideoMode
+
+
+@dataclass(frozen=True)
+class PickerOption:
+    """One button in the selector: the text shown, the value it stands for, and whether it can be pressed."""
+
+    text: str
+    value: Any
+    enabled: bool
+
+
+class ModePicker:
+    """Tracks the committed mode and turns user picks into candidate modes.
+
+    Args:
+        catalog: The camera's mode catalog.
+        mode: Starting mode. Defaults to the catalog default. Must be valid.
+    """
+
+    def __init__(self, catalog: ModeCatalog, mode: VideoMode | None = None) -> None:
+        self._catalog = catalog
+        self._committed = mode if mode is not None else catalog.default
+        if not catalog.is_valid(self._committed):
+            raise ValueError(f"{self._committed.label} is not in the catalog")
+
+    @property
+    def mode(self) -> VideoMode:
+        """The mode the camera is known to be in."""
+        return self._committed
+
+    @property
+    def axes(self) -> tuple[str, ...]:
+        return AXES
+
+    def selected_text(self, axis: str) -> str:
+        """Text of the committed value on `axis`, as shown on its button."""
+        return str(getattr(self._committed, axis))
+
+    def options(self, axis: str) -> list[PickerOption]:
+        """Every value of `axis`, enabled only where the committed mode allows it."""
+        selection = {a: getattr(self._committed, a) for a in AXES}
+        return [PickerOption(str(o.value), o.value, o.enabled) for o in self._catalog.options(axis, selection)]
+
+    def preview(self, axis: str, text: str) -> VideoMode:
+        """The mode that picking `text` on `axis` would produce, without committing it.
+
+        Raises:
+            ValueError: `text` is not a value of `axis`, or it is not enabled.
+        """
+        value = self._value_for(axis, text)
+        return self._catalog.select(self._committed, axis, value)
+
+    def commit(self, mode: VideoMode) -> None:
+        """Record that the camera is now in `mode`."""
+        if not self._catalog.is_valid(mode):
+            raise ValueError(f"{mode.label} is not in the catalog")
+        self._committed = mode
+
+    def _value_for(self, axis: str, text: str) -> Any:
+        for value in self._catalog.values(axis):
+            if str(value) == text:
+                return value
+        raise ValueError(f"{text!r} is not a {axis} value")
