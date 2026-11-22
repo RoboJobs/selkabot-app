@@ -16,10 +16,10 @@
   "flash_min_gap": 0.08,
   "flash_max_gap": 0.3,
   "video_mode": {
-    "ratio": "4:3",
+    "ratio": "16:9",
     "resolution": "4K",
-    "fps": 60,
+    "fps": 120,
     "lens": "Wide",
-    "zoom": 57
+    "zoom": 0
   }
 }
