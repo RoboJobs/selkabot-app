@@ -81,7 +81,8 @@ class ModeCatalog:
         self._default = default
         self._zoom_max = zoom_max if zoom_max is not None else (lambda mode: NO_ZOOM)
         self._values: dict[str, tuple[Any, ...]] = {
-            axis: tuple(dict.fromkeys(getattr(m, axis) for m in self._modes)) for axis in AXES
+            axis: tuple(dict.fromkeys(getattr(m, axis) for m in self._modes))
+            for axis in AXES
         }
 
     @property
@@ -97,7 +98,7 @@ class ModeCatalog:
         return self._zoom_max(replace(mode, zoom=NO_ZOOM))
 
     def values(self, axis: str) -> tuple[Any, ...]:
-        """Every discrete value the axis takes anywhere in the catalog, in display order."""
+        """Every discrete value of the axis in the catalog, in display order."""
         return self._values[_check_axis(axis)]
 
     def is_valid(self, mode: VideoMode) -> bool:
@@ -107,7 +108,7 @@ class ModeCatalog:
         return base in self._set and NO_ZOOM <= mode.zoom <= self.zoom_max(base)
 
     def options(self, axis: str, selection: Mapping[str, Any]) -> list[Option]:
-        """List the values of a discrete axis, enabled only if compatible with `selection`.
+        """List the values of a discrete axis, enabled if compatible with `selection`.
 
         Only the axes before `axis` in the cascade order are looked at. Missing
         entries in `selection` are treated as unconstrained.
@@ -123,13 +124,15 @@ class ModeCatalog:
         Zoom: `value` is a percentage that must be within the allowed range.
 
         Raises:
-            ValueError: if `value` is not allowed given the earlier choices in `current`.
+            ValueError: if `value` is not allowed given the choices in `current`.
         """
         _check_axis(axis)
         chosen = _as_dict(current)
         if axis == "zoom":
             base = replace(current, zoom=NO_ZOOM)
-            if not isinstance(value, int) or not NO_ZOOM <= value <= self.zoom_max(base):
+            if not isinstance(value, int) or not NO_ZOOM <= value <= self.zoom_max(
+                base
+            ):
                 raise ValueError(f"zoom {value!r} is not allowed with {base.label}")
             chosen["zoom"] = value
             return VideoMode(**chosen)
@@ -154,11 +157,15 @@ class ModeCatalog:
         chosen["zoom"] = min(max(int(requested["zoom"]), NO_ZOOM), self.zoom_max(base))
         return VideoMode(**chosen)
 
-    def _enabled_values(self, axis: str, selection: Mapping[str, Any]) -> tuple[Any, ...]:
-        """Values of `axis` that appear in a mode matching every earlier axis in `selection`."""
+    def _enabled_values(
+        self, axis: str, selection: Mapping[str, Any]
+    ) -> tuple[Any, ...]:
+        """Values of `axis` in a mode matching every earlier axis in `selection`."""
         prefix = AXES[: AXES.index(_check_axis(axis))]
         matching = [
-            m for m in self._modes if all(getattr(m, a) == selection[a] for a in prefix if a in selection)
+            m
+            for m in self._modes
+            if all(getattr(m, a) == selection[a] for a in prefix if a in selection)
         ]
         present = {getattr(m, axis) for m in matching}
         return tuple(v for v in self.values(axis) if v in present)

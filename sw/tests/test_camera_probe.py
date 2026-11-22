@@ -9,7 +9,12 @@ from sw.camera import hero10_table as t
 def test_probe_cases_are_unique_and_cover_every_fps_and_lens():
     cases = probe.probe_cases()
     assert len(cases) == len(set(cases))
-    expected = {(r.ratio, r.resolution, fps, lens) for r in t.ROWS for fps in r.fps for lens in r.lenses}
+    expected = {
+        (r.ratio, r.resolution, fps, lens)
+        for r in t.ROWS
+        for fps in r.fps
+        for lens in r.lenses
+    }
     assert {(c.ratio, c.resolution, c.fps, c.lens) for c in cases} == expected
 
 
@@ -49,7 +54,9 @@ def test_compare_state_reports_missing_setting():
 
 def test_format_report_counts_and_marks_failures():
     ok = probe.ProbeResult(probe.ProbeCase("16:9", "4K", 120, "Wide"), True)
-    bad = probe.ProbeResult(probe.ProbeCase("16:9", "4K", 120, "Narrow"), False, ("lens: wanted X",))
+    bad = probe.ProbeResult(
+        probe.ProbeCase("16:9", "4K", 120, "Narrow"), False, ("lens: wanted X",)
+    )
     text = probe.format_report([ok, bad])
     lines = text.splitlines()
     assert lines[0] == "OK    16:9 4K 120fps Wide"
@@ -58,5 +65,7 @@ def test_format_report_counts_and_marks_failures():
 
 
 def test_format_report_shows_error_when_no_mismatch_list():
-    bad = probe.ProbeResult(probe.ProbeCase("16:9", "4K", 120, "Wide"), False, error="timeout")
+    bad = probe.ProbeResult(
+        probe.ProbeCase("16:9", "4K", 120, "Wide"), False, error="timeout"
+    )
     assert "(timeout)" in probe.format_report([bad])

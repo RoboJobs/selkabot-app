@@ -1,4 +1,4 @@
-"""Tests for GoProController's mode handling, against a fake WiredGoPro (no hardware)."""
+"""Tests for GoProController's mode handling, against a fake WiredGoPro."""
 
 from types import SimpleNamespace
 
@@ -52,7 +52,11 @@ class _Setting:
             return Resp(False)
         self._gopro.state[self._key] = value
         if self._name == "lens":
-            available = value in (table.LENS_ENUM["Wide"], table.LENS_ENUM["Linear"], table.LENS_ENUM["Linear+HL"])
+            available = value in (
+                table.LENS_ENUM["Wide"],
+                table.LENS_ENUM["Linear"],
+                table.LENS_ENUM["Linear+HL"],
+            )
             self._gopro.state[StatusId.ZOOM_AVAILABLE] = available
             if not available:
                 self._gopro.state[StatusId.ZOOM_LEVEL] = 0
@@ -68,7 +72,9 @@ class _Command:
         return Resp(True)
 
     async def set_preview_stream(self, mode, port=None):
-        self._gopro.log.append("preview_on" if mode == constants.Toggle.ENABLE else "preview_off")
+        self._gopro.log.append(
+            "preview_on" if mode == constants.Toggle.ENABLE else "preview_off"
+        )
         return Resp(True)
 
     async def set_keep_alive(self):
@@ -122,8 +128,17 @@ def test_set_mode_restarts_preview_around_the_change(controller):
     controller.submit(controller.connect(table.DEFAULT_MODE)).result(timeout=5)
     gopro = FakeWired.instances[-1]
     gopro.log.clear()
-    controller.submit(controller.set_mode(VideoMode("16:9", "2.7K", 120, "Wide", 42))).result(timeout=5)
-    assert _commands(gopro) == ["preview_off", "resolution", "fps", "lens", "zoom", "preview_on"]
+    controller.submit(
+        controller.set_mode(VideoMode("16:9", "2.7K", 120, "Wide", 42))
+    ).result(timeout=5)
+    assert _commands(gopro) == [
+        "preview_off",
+        "resolution",
+        "fps",
+        "lens",
+        "zoom",
+        "preview_on",
+    ]
 
 
 def test_set_mode_restarts_preview_even_when_the_camera_refuses(controller):
@@ -132,7 +147,9 @@ def test_set_mode_restarts_preview_even_when_the_camera_refuses(controller):
     gopro.log.clear()
     FakeWired.reject = "resolution"
     with pytest.raises(RuntimeError):
-        controller.submit(controller.set_mode(VideoMode("16:9", "4K", 120, "Wide", NO_ZOOM))).result(timeout=5)
+        controller.submit(
+            controller.set_mode(VideoMode("16:9", "4K", 120, "Wide", NO_ZOOM))
+        ).result(timeout=5)
     assert _commands(gopro) == ["preview_off", "resolution", "preview_on"]
 
 

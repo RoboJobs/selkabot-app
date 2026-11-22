@@ -1,4 +1,4 @@
-"""Tests for the cascading video mode model (sw/camera/modes.py) and the HERO10 catalog."""
+"""Tests for the cascading video mode model and the HERO10 catalog."""
 
 import dataclasses
 
@@ -40,7 +40,9 @@ def test_video_mode_is_immutable_and_hashable():
 
 def test_label_includes_zoom_only_when_set():
     assert D.label == "16:9 2.7K 60fps Wide"
-    assert VideoMode("16:9", "4K", 120, "Wide", 42).label == "16:9 4K 120fps Wide zoom 42%"
+    assert (
+        VideoMode("16:9", "4K", 120, "Wide", 42).label == "16:9 4K 120fps Wide zoom 42%"
+    )
 
 
 # --- ModeCatalog construction ----------------------------------------------
@@ -52,7 +54,10 @@ def test_duplicates_are_dropped_and_order_kept():
 
 def test_catalog_modes_must_have_zero_zoom():
     with pytest.raises(ValueError):
-        ModeCatalog([VideoMode("16:9", "4K", 120, "Wide", 10)], default=VideoMode("16:9", "4K", 120, "Wide", 10))
+        ModeCatalog(
+            [VideoMode("16:9", "4K", 120, "Wide", 10)],
+            default=VideoMode("16:9", "4K", 120, "Wide", 10),
+        )
 
 
 def test_default_must_be_in_catalog():
@@ -87,7 +92,9 @@ def test_is_valid_accepts_zoom_within_the_range(small):
 
 def test_is_valid_refuses_zoom_outside_the_range_or_not_a_percentage(small):
     narrow = VideoMode("16:9", "2.7K", 60, "Narrow")
-    assert not small.is_valid(dataclasses.replace(narrow, zoom=5))  # no zoom with Narrow
+    assert not small.is_valid(
+        dataclasses.replace(narrow, zoom=5)
+    )  # no zoom with Narrow
     assert not small.is_valid(dataclasses.replace(D, zoom=101))
     assert not small.is_valid(dataclasses.replace(D, zoom=-1))
     assert not small.is_valid(dataclasses.replace(D, zoom="1.4x"))  # type: ignore[arg-type]
@@ -124,12 +131,16 @@ def test_disabled_values_are_still_listed(small):
 
 
 def test_fps_depends_on_ratio_and_resolution(small):
-    assert enabled(small.options("fps", {"ratio": "16:9", "resolution": "2.7K"})) == {60}
+    assert enabled(small.options("fps", {"ratio": "16:9", "resolution": "2.7K"})) == {
+        60
+    }
     assert enabled(small.options("fps", {"ratio": "16:9", "resolution": "4K"})) == {120}
 
 
 def test_lens_depends_on_earlier_axes(small):
-    assert enabled(small.options("lens", {"ratio": "16:9", "resolution": "4K", "fps": 120})) == {"Wide", "Narrow"}
+    assert enabled(
+        small.options("lens", {"ratio": "16:9", "resolution": "4K", "fps": 120})
+    ) == {"Wide", "Narrow"}
 
 
 def test_later_axes_do_not_affect_earlier_options(small):
@@ -142,12 +153,12 @@ def test_later_axes_do_not_affect_earlier_options(small):
 
 
 def test_select_ratio_keeps_downstream_values_that_are_still_valid(small):
-    # 2.7K and 60fps carry over; Wide does not exist in 4:3, so the lens falls back to Narrow.
+    # 2.7K and 60fps carry over; Wide is not in 4:3, so the lens falls back to Narrow.
     assert small.select(D, "ratio", "4:3") == F
 
 
 def test_select_ratio_falls_back_for_axes_the_new_ratio_does_not_offer(small):
-    # 4:3 has no 4K, no 120fps and no Wide lens here, so resolution, fps and lens fall back.
+    # 4:3 has no 4K, no 120fps and no Wide lens here, so those axes fall back.
     assert small.select(B, "ratio", "4:3") == F
 
 
@@ -187,7 +198,9 @@ def test_select_discrete_value_rejects_a_disabled_choice(small):
 
 def test_resolve_keeps_a_valid_mode(small):
     assert small.resolve(D) == D
-    assert small.resolve(dataclasses.replace(D, zoom=45)) == dataclasses.replace(D, zoom=45)
+    assert small.resolve(dataclasses.replace(D, zoom=45)) == dataclasses.replace(
+        D, zoom=45
+    )
 
 
 def test_resolve_clamps_zoom_to_the_range(small):
@@ -227,7 +240,11 @@ def test_hero_catalog_lists_each_mode_once_with_zero_zoom(hero):
 
 
 def test_hero_resolution_after_ratio_16_9_includes_5_3k(hero):
-    assert enabled(hero.options("resolution", {"ratio": "16:9"})) == {"5.3K", "4K", "2.7K"}
+    assert enabled(hero.options("resolution", {"ratio": "16:9"})) == {
+        "5.3K",
+        "4K",
+        "2.7K",
+    }
 
 
 def test_hero_resolution_after_ratio_4_3_excludes_5_3k(hero):
@@ -235,7 +252,9 @@ def test_hero_resolution_after_ratio_4_3_excludes_5_3k(hero):
 
 
 def test_hero_superview_is_disabled_in_4_3(hero):
-    assert "SuperView" not in enabled(hero.options("lens", {"ratio": "4:3", "resolution": "4K", "fps": 60}))
+    assert "SuperView" not in enabled(
+        hero.options("lens", {"ratio": "4:3", "resolution": "4K", "fps": 60})
+    )
 
 
 def test_hero_zoom_range_depends_on_the_lens(hero):
@@ -244,7 +263,9 @@ def test_hero_zoom_range_depends_on_the_lens(hero):
     narrow = VideoMode("16:9", "4K", 120, "Narrow")
     superview = VideoMode("16:9", "2.7K", 60, "SuperView")
     assert hero.zoom_max(wide) == 100
-    assert hero.zoom_max(linear) == 0  # 4K 120fps allows zoom on Wide and Linear+HL only
+    assert (
+        hero.zoom_max(linear) == 0
+    )  # 4K 120fps allows zoom on Wide and Linear+HL only
     assert hero.zoom_max(narrow) == 0
     assert hero.zoom_max(superview) == 0
 

@@ -66,7 +66,10 @@ def probe_cases(rows: Iterable[table.TableRow] = table.ROWS) -> list[ProbeCase]:
 
 def compare_state(expected: ProbeCase, state: Mapping[Any, Any]) -> tuple[str, ...]:
     """Return human readable mismatches between the requested case and camera state."""
-    return state_mismatches(VideoMode(expected.ratio, expected.resolution, expected.fps, expected.lens), state)
+    return state_mismatches(
+        VideoMode(expected.ratio, expected.resolution, expected.fps, expected.lens),
+        state,
+    )
 
 
 def format_report(results: Iterable[ProbeResult]) -> str:
@@ -89,12 +92,16 @@ async def _apply_case(gopro: Any, case: ProbeCase) -> ProbeResult:
     """Send one case to the camera and read the state back."""
     try:
         for response in (
-            await gopro.http_setting.video_resolution.set(table.RESOLUTION_ENUM[(case.ratio, case.resolution)]),
+            await gopro.http_setting.video_resolution.set(
+                table.RESOLUTION_ENUM[(case.ratio, case.resolution)]
+            ),
             await gopro.http_setting.frames_per_second.set(table.FPS_ENUM[case.fps]),
             await gopro.http_setting.video_lens.set(table.LENS_ENUM[case.lens]),
         ):
             if not response.ok:
-                return ProbeResult(case, False, error=f"camera returned {response.status}")
+                return ProbeResult(
+                    case, False, error=f"camera returned {response.status}"
+                )
         state = (await gopro.http_command.get_camera_state()).data
     except Exception as exc:  # the probe must keep going through the whole table
         return ProbeResult(case, False, error=str(exc))
@@ -116,8 +123,14 @@ async def _run(serial: str | None) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--serial", default=None, help="Camera serial number (auto-discovered if omitted)")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--serial",
+        default=None,
+        help="Camera serial number (auto-discovered if omitted)",
+    )
     args = parser.parse_args()
     raise SystemExit(asyncio.run(_run(args.serial)))
 

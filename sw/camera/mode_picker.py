@@ -16,7 +16,7 @@ from sw.camera.modes import AXES, NO_ZOOM, ModeCatalog, VideoMode
 
 @dataclass(frozen=True)
 class PickerOption:
-    """One button in the selector: the text shown, the value it stands for, and whether it can be pressed."""
+    """One selector button: its text, its value, and whether it is enabled."""
 
     text: str
     value: Any
@@ -51,16 +51,21 @@ class ModePicker:
         return str(getattr(self._committed, axis))
 
     def options(self, axis: str) -> list[PickerOption]:
-        """Every discrete value of `axis`, enabled only where the committed mode allows it."""
+        """Every discrete value of `axis`, enabled where the mode allows it."""
         selection = {a: getattr(self._committed, a) for a in AXES}
-        return [PickerOption(str(o.value), o.value, o.enabled) for o in self._catalog.options(axis, selection)]
+        return [
+            PickerOption(str(o.value), o.value, o.enabled)
+            for o in self._catalog.options(axis, selection)
+        ]
 
     def zoom_range(self) -> tuple[int, int]:
         """Lowest and highest zoom percentage the committed mode allows."""
         return NO_ZOOM, self._catalog.zoom_max(self._committed)
 
     def preview(self, axis: str, text: str) -> VideoMode:
-        """The mode that picking `text` on a discrete axis would produce, without committing it.
+        """The mode that picking `text` on a discrete axis would produce.
+
+        Nothing is committed.
 
         Raises:
             ValueError: `text` is not a value of `axis`, or it is not enabled.

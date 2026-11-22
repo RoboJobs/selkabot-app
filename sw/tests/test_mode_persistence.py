@@ -7,7 +7,13 @@ import pytest
 
 from sw import livestream as l
 from sw.camera import hero10_table as table
-from sw.camera.mode_persistence import MODE_KEY, load_mode, mode_from_dict, mode_to_dict, save_mode
+from sw.camera.mode_persistence import (
+    MODE_KEY,
+    load_mode,
+    mode_from_dict,
+    mode_to_dict,
+    save_mode,
+)
 from sw.camera.modes import VideoMode
 
 CATALOG = table.build_catalog()
@@ -39,8 +45,20 @@ def test_unparseable_file_gives_the_default(tmp_path):
 @pytest.mark.parametrize(
     "saved",
     [
-        {"ratio": "16:9", "resolution": "5.3K", "fps": 240, "lens": "Wide", "zoom": "none"},  # not in table
-        {"ratio": "16:9", "resolution": "4K", "fps": "120", "lens": "Wide", "zoom": "none"},  # wrong type
+        {
+            "ratio": "16:9",
+            "resolution": "5.3K",
+            "fps": 240,
+            "lens": "Wide",
+            "zoom": "none",
+        },  # not in table
+        {
+            "ratio": "16:9",
+            "resolution": "4K",
+            "fps": "120",
+            "lens": "Wide",
+            "zoom": "none",
+        },  # wrong type
         {"ratio": "16:9", "resolution": "4K"},  # missing axes
         "16:9 4K",  # not an object
     ],
@@ -66,7 +84,9 @@ def test_save_keeps_other_keys_used_by_the_watermark_tool(tmp_path):
 def test_save_creates_the_file_when_missing(tmp_path):
     path = tmp_path / "config.json"
     assert save_mode(path, WIDE_4K)
-    assert json.loads(path.read_text(encoding="utf-8")) == {MODE_KEY: mode_to_dict(WIDE_4K)}
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        MODE_KEY: mode_to_dict(WIDE_4K)
+    }
 
 
 def test_save_does_not_overwrite_an_unparseable_file(tmp_path):

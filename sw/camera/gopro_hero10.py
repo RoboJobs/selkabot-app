@@ -12,7 +12,7 @@ from sw.camera.modes import ModeCatalog, VideoMode
 
 
 def camera_values(mode: VideoMode) -> tuple[Any, Any, Any]:
-    """SDK enums (resolution, fps, lens) for a mode. Zoom is a percentage, not an enum."""
+    """SDK enums (resolution, fps, lens) for a mode. Zoom is a percentage."""
     return (
         table.RESOLUTION_ENUM[(mode.ratio, mode.resolution)],
         table.FPS_ENUM[mode.fps],
@@ -23,7 +23,8 @@ def camera_values(mode: VideoMode) -> tuple[Any, Any, Any]:
 def state_mismatches(mode: VideoMode, state: Mapping[Any, Any]) -> tuple[str, ...]:
     """Describe how the camera's reported state differs from `mode`.
 
-    Only resolution, fps and lens can be read back here. A missing setting counts as a mismatch.
+    Only resolution, fps and lens can be read back here.
+    A missing setting counts as a mismatch.
     """
     resolution, fps, lens = camera_values(mode)
     checks = (
@@ -36,7 +37,9 @@ def state_mismatches(mode: VideoMode, state: Mapping[Any, Any]) -> tuple[str, ..
         if setting not in state:
             problems.append(f"{name}: not reported")
         elif state[setting] != wanted:
-            problems.append(f"{name}: wanted {wanted.name}, camera reports {state[setting]}")
+            problems.append(
+                f"{name}: wanted {wanted.name}, camera reports {state[setting]}"
+            )
     return tuple(problems)
 
 
@@ -51,11 +54,17 @@ def zoom_mismatches(mode: VideoMode, state: Mapping[Any, Any]) -> tuple[str, ...
     if StatusId.ZOOM_AVAILABLE not in state:
         problems.append("zoom available: not reported")
     elif state[StatusId.ZOOM_AVAILABLE] != expected_available:
-        problems.append(f"zoom available: wanted {expected_available}, camera reports {state[StatusId.ZOOM_AVAILABLE]}")
+        problems.append(
+            f"zoom available: wanted {expected_available}, "
+            f"camera reports {state[StatusId.ZOOM_AVAILABLE]}"
+        )
     if StatusId.ZOOM_LEVEL not in state:
         problems.append("zoom level: not reported")
     elif state[StatusId.ZOOM_LEVEL] != mode.zoom:
-        problems.append(f"zoom level: wanted {mode.zoom}, camera reports {state[StatusId.ZOOM_LEVEL]}")
+        problems.append(
+            f"zoom level: wanted {mode.zoom}, "
+            f"camera reports {state[StatusId.ZOOM_LEVEL]}"
+        )
     return tuple(problems)
 
 
@@ -97,9 +106,14 @@ class HeroBackend:
         await _send(http.frames_per_second.set(fps), "frames per second")
         await _send(http.video_lens.set(lens), "video lens")
         if table.zoom_supported(mode):
-            await _send(self._gopro.http_command.set_digital_zoom(percent=mode.zoom), "digital zoom")
+            await _send(
+                self._gopro.http_command.set_digital_zoom(percent=mode.zoom),
+                "digital zoom",
+            )
 
         state = (await self._gopro.http_command.get_camera_state()).data
         problems = state_mismatches(mode, state) + zoom_mismatches(mode, state)
         if problems:
-            raise RuntimeError(f"camera did not keep {mode.label}: " + "; ".join(problems))
+            raise RuntimeError(
+                f"camera did not keep {mode.label}: " + "; ".join(problems)
+            )

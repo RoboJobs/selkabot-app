@@ -3,7 +3,6 @@
 import pytest
 
 from sw.camera import hero10_table as t
-from sw.camera.modes import VideoMode
 
 
 def test_table_has_only_ntsc_frame_rates():
@@ -29,17 +28,23 @@ def test_no_duplicate_rows():
     assert len(keys) == len(set(keys))
 
 
-@pytest.mark.parametrize("row", t.ROWS, ids=lambda r: f"{r.ratio}-{r.resolution}-{r.fps}")
+@pytest.mark.parametrize(
+    "row", t.ROWS, ids=lambda r: f"{r.ratio}-{r.resolution}-{r.fps}"
+)
 def test_zoom_lenses_are_a_subset_of_lenses(row):
     assert set(row.zoom_lenses) <= set(row.lenses)
 
 
-@pytest.mark.parametrize("row", t.ROWS, ids=lambda r: f"{r.ratio}-{r.resolution}-{r.fps}")
+@pytest.mark.parametrize(
+    "row", t.ROWS, ids=lambda r: f"{r.ratio}-{r.resolution}-{r.fps}"
+)
 def test_narrow_never_allows_zoom(row):
     assert t.LENS_NARROW not in row.zoom_lenses
 
 
-@pytest.mark.parametrize("row", t.ROWS, ids=lambda r: f"{r.ratio}-{r.resolution}-{r.fps}")
+@pytest.mark.parametrize(
+    "row", t.ROWS, ids=lambda r: f"{r.ratio}-{r.resolution}-{r.fps}"
+)
 def test_superview_only_on_16_9(row):
     if t.LENS_SUPERVIEW in row.lenses:
         assert row.ratio == "16:9"

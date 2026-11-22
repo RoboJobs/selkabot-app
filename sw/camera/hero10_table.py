@@ -58,14 +58,26 @@ _ALL_SV = (LENS_SUPERVIEW,) + _ALL_NO_SV
 
 ROWS: tuple[TableRow, ...] = (
     # 16:9
-    TableRow(RATIO_16_9, "5.3K", (60,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(
+        RATIO_16_9, "5.3K", (60,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)
+    ),
     TableRow(RATIO_16_9, "4K", (120,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR_HL)),
-    TableRow(RATIO_16_9, "2.7K", (240,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
-    TableRow(RATIO_16_9, "2.7K", (120,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
-    TableRow(RATIO_16_9, "2.7K", (60,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(
+        RATIO_16_9, "2.7K", (240,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)
+    ),
+    TableRow(
+        RATIO_16_9, "2.7K", (120,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)
+    ),
+    TableRow(
+        RATIO_16_9, "2.7K", (60,), _ALL_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)
+    ),
     # 4:3 (no SuperView)
-    TableRow(RATIO_4_3, "4K", (60,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
-    TableRow(RATIO_4_3, "2.7K", (120,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)),
+    TableRow(
+        RATIO_4_3, "4K", (60,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)
+    ),
+    TableRow(
+        RATIO_4_3, "2.7K", (120,), _ALL_NO_SV, (LENS_WIDE, LENS_LINEAR, LENS_LINEAR_HL)
+    ),
 )
 
 # Camera enum for each (ratio, resolution). The aspect ratio is encoded in
@@ -96,7 +108,7 @@ DEFAULT_MODE = VideoMode(RATIO_16_9, "2.7K", 60, LENS_WIDE, NO_ZOOM)
 
 
 def zoom_supported(mode: VideoMode) -> bool:
-    """True if the table allows digital zoom with this mode's lens, frame rate and resolution."""
+    """True if the table allows digital zoom for this lens, fps and resolution."""
     return any(
         row.ratio == mode.ratio
         and row.resolution == mode.resolution
@@ -112,7 +124,7 @@ def zoom_max(mode: VideoMode) -> int:
 
 
 def build_catalog() -> ModeCatalog:
-    """Expand ROWS into every valid HERO10 video mode (zoom 0); zoom is continuous on top."""
+    """Expand ROWS into every valid HERO10 video mode (zoom 0)."""
     modes: list[VideoMode] = []
     for row in ROWS:
         for fps in row.fps:

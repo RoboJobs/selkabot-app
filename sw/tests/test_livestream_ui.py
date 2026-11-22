@@ -43,7 +43,9 @@ def app(root, tmp_path):
     frame.pack()
     ui._build_mode_rows(frame)
     ui._run_calls = []
-    ui._run = lambda coro, status, done, failed: ui._run_calls.append((status, done, failed))
+    ui._run = lambda coro, status, done, failed: ui._run_calls.append(
+        (status, done, failed)
+    )
     return ui
 
 
@@ -79,11 +81,19 @@ def test_choosing_4_3_disables_5_3k_after_refresh(app):
 def test_busy_or_recording_disables_every_button(app):
     app._busy = True
     app._update_mode_states()
-    assert all(state == "disabled" for axis in app._mode_buttons for _, state in states(app, axis))
+    assert all(
+        state == "disabled"
+        for axis in app._mode_buttons
+        for _, state in states(app, axis)
+    )
     app._busy = False
     app._recording = True
     app._update_mode_states()
-    assert all(state == "disabled" for axis in app._mode_buttons for _, state in states(app, axis))
+    assert all(
+        state == "disabled"
+        for axis in app._mode_buttons
+        for _, state in states(app, axis)
+    )
 
 
 def test_zoom_on_a_lens_without_zoom_reverts_the_slider(app):
@@ -150,12 +160,16 @@ def test_repeating_the_current_value_sends_nothing(app):
     assert app._run_calls == []
 
 
-def test_full_window_locks_the_selector_until_connected_then_enables_it(root, monkeypatch, tmp_path):
+def test_full_window_locks_the_selector_until_connected_then_enables_it(
+    root, monkeypatch, tmp_path
+):
     """Build the real LivestreamApp (not just the rows) against a fake controller."""
     monkeypatch.setattr(
         l,
         "PreviewReader",
-        lambda *a, **k: SimpleNamespace(start=lambda: None, stop=lambda: None, latest_frame=lambda: None),
+        lambda *a, **k: SimpleNamespace(
+            start=lambda: None, stop=lambda: None, latest_frame=lambda: None
+        ),
     )
 
     class FakeController:
@@ -187,13 +201,20 @@ def test_full_window_locks_the_selector_until_connected_then_enables_it(root, mo
     )
     assert ui.picker.mode.label == "16:9 2.7K 60fps Wide"
     # Connecting: every option is locked until the camera answers.
-    assert all(state == "disabled" for axis in ui._mode_buttons for _, state in states(ui, axis))
+    assert all(
+        state == "disabled"
+        for axis in ui._mode_buttons
+        for _, state in states(ui, axis)
+    )
 
     try:
         controller.future.set_result("GP-TEST")
         ui._poll()
         assert zoom_state(ui) == "normal"
-        assert ui.status.get() == "Connected to GoPro GP-TEST. Ready to record at 16:9 2.7K 60fps Wide."
+        assert (
+            ui.status.get()
+            == "Connected to GoPro GP-TEST. Ready to record at 16:9 2.7K 60fps Wide."
+        )
     finally:
         ui.postprocessor.stop()  # its thread would otherwise keep pytest alive
 
@@ -205,7 +226,9 @@ def test_window_starts_on_the_saved_mode(root, monkeypatch, tmp_path):
     monkeypatch.setattr(
         l,
         "PreviewReader",
-        lambda *a, **k: SimpleNamespace(start=lambda: None, stop=lambda: None, latest_frame=lambda: None),
+        lambda *a, **k: SimpleNamespace(
+            start=lambda: None, stop=lambda: None, latest_frame=lambda: None
+        ),
     )
 
     class FakeController:

@@ -25,7 +25,7 @@ def mode_to_dict(mode: VideoMode) -> dict[str, Any]:
 
 
 def mode_from_dict(data: Any, catalog: ModeCatalog) -> VideoMode | None:
-    """Return the mode described by `data`, or None if it is malformed or not in the catalog."""
+    """Return the mode in `data`, or None if it is malformed or not in the catalog."""
     if not isinstance(data, dict):
         return None
     try:
@@ -36,7 +36,7 @@ def mode_from_dict(data: Any, catalog: ModeCatalog) -> VideoMode | None:
 
 
 def load_mode(config_file: Path, catalog: ModeCatalog) -> VideoMode:
-    """Return the saved mode, or the catalog default if none is saved or it is unusable."""
+    """Return the saved mode, or the catalog default if it is missing or unusable."""
     try:
         data = json.loads(config_file.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -48,19 +48,26 @@ def load_mode(config_file: Path, catalog: ModeCatalog) -> VideoMode:
         return catalog.default
     mode = mode_from_dict(data[MODE_KEY], catalog)
     if mode is None:
-        logger.warning("Ignoring saved video mode %r in %s", data[MODE_KEY], config_file)
+        logger.warning(
+            "Ignoring saved video mode %r in %s", data[MODE_KEY], config_file
+        )
         return catalog.default
     return mode
 
 
 def save_mode(config_file: Path, mode: VideoMode) -> bool:
-    """Store `mode` in the config file, keeping its other keys. Returns False if nothing was written."""
+    """Store `mode` in the config file, keeping other keys.
+
+    Returns False if nothing was written.
+    """
     try:
         config = json.loads(config_file.read_text(encoding="utf-8"))
     except FileNotFoundError:
         config = {}
     except (OSError, ValueError):
-        logger.warning("Not saving video mode: %s is unreadable", config_file, exc_info=True)
+        logger.warning(
+            "Not saving video mode: %s is unreadable", config_file, exc_info=True
+        )
         return False
     if not isinstance(config, dict):
         logger.warning("Not saving video mode: %s is not a JSON object", config_file)

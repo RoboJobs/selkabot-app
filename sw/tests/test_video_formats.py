@@ -53,8 +53,10 @@ def test_flash_events_are_deterministic_and_inside_the_video(name, probe):
 
 
 def test_chunk_count_depends_on_duration_not_frame_rate():
-    # The chunking splits by seconds, so 10 s of footage gets the same chunks at any frame rate.
-    counts = {fps: p._effective_chunks(fps * 10, fps, 4) for fps in (30, 60, 100, 120, 240)}
+    # Chunking splits by seconds, so 10 s of footage gets the same chunks at any fps.
+    counts = {
+        fps: p._effective_chunks(fps * 10, fps, 4) for fps in (30, 60, 100, 120, 240)
+    }
     assert len(set(counts.values())) == 1, counts
 
 
@@ -67,11 +69,15 @@ def test_project_profile_matches_the_source_format(name, probe, tmp_path, monkey
     )
     assert f'width="{probe.width}" height="{probe.height}"' in xml
     assert f'frame_rate_num="{probe.fps_num}" frame_rate_den="{probe.fps_den}"' in xml
-    assert f'display_aspect_num="{probe.width}" display_aspect_den="{probe.height}"' in xml
+    assert (
+        f'display_aspect_num="{probe.width}" display_aspect_den="{probe.height}"' in xml
+    )
 
 
 @pytest.mark.parametrize("name, probe", FORMATS, ids=IDS)
-def test_watermark_box_follows_the_frame_and_logo_shape(name, probe, tmp_path, monkeypatch):
+def test_watermark_box_follows_the_frame_and_logo_shape(
+    name, probe, tmp_path, monkeypatch
+):
     logo = tmp_path / "logo.png"
     Image.new("RGBA", (200, 100)).save(logo)  # 2:1 logo
     monkeypatch.setattr(p, "_image_size", lambda path: (200, 100))
@@ -80,7 +86,7 @@ def test_watermark_box_follows_the_frame_and_logo_shape(name, probe, tmp_path, m
 
 
 def test_slowdown_interpolation_rate_scales_with_the_source(tmp_path, monkeypatch):
-    """The minterpolate target rate is fps/speed, so a 240 fps source is interpolated much faster."""
+    """The minterpolate rate is fps/speed, so a 240 fps source interpolates faster."""
 
     class Stop(Exception):
         pass
