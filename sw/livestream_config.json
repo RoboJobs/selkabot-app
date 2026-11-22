@@ -1,5 +1,5 @@
 {
-  "folder": "/home/juan/Documents/photobot/videos/likegym20261108",
+  "folder": "lr_up_test",
   "image": "likegym_watermark.png",
   "fadein_image": "likegym.png",
   "fadeout_image": "selkabot.png",
@@ -14,5 +14,12 @@
   "exposure": 0.6,
   "flash_windows": "3.8-4.7, 5.5-6, 7.3-8, 9.5-10, 11-12.5, 14.3-14.7, 16.2-16.8",
   "flash_min_gap": 0.08,
-  "flash_max_gap": 0.3
+  "flash_max_gap": 0.3,
+  "video_mode": {
+    "ratio": "4:3",
+    "resolution": "4K",
+    "fps": 60,
+    "lens": "Wide",
+    "zoom": 57
+  }
 }

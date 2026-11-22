@@ -15,14 +15,20 @@ downloaded, so the camera is free to record meanwhile. - Frame thread: reads the
 preview stream with OpenCV, keeps latest frame. Results from the asyncio thread reach
 the UI through a queue polled by Tk.
 
-Notes: - The preview stream is a low resolution live view; the recorded file is in   the
-selected resolution (2.7K 16:9 by default) at 60 fps. - Resolution can only be changed
-while not recording or downloading. The   preview stream is restarted around the change.
-- The preview is paused while recording. On HERO10 firmware H21.01.01.62.00,   starting
-a recording while the USB preview is running kills the preview   until the camera is
-power cycled. Stopping the preview first, and starting   it again once the clip is
-written, avoids this. - The SDK's StreamFeature uses BLE to start the preview stream,
-which is not   available on WiredGoPro, so the HTTP preview command is used directly.
+Notes:
+- The preview stream is a low resolution live view; the recorded file is in
+  the selected video mode (2.7K 16:9 at 60 fps, no zoom, Wide lens by default).
+  Modes come from sw/camera/hero10_table.py and are chosen with the cascading
+  ratio / resolution / fps / lens / zoom rows.
+- The mode can only be changed while not recording or downloading. The
+  preview stream is restarted around the change. The last accepted mode is
+  saved in livestream_config.json.
+- The preview is paused while recording. On HERO10 firmware H21.01.01.62.00,
+  starting a recording while the USB preview is running kills the preview
+  until the camera is power cycled. Stopping the preview first, and starting
+  it again once the clip is written, avoids this.
+- The SDK's StreamFeature uses BLE to start the preview stream, which is not
+  available on WiredGoPro, so the HTTP preview command is used directly.
 
 Usage:     uv run python -m sw.livestream [--output-dir videos] [--port 8554] [--no-
 upload]
@@ -52,10 +58,14 @@ import cv2
 import numpy as np
 from open_gopro import WiredGoPro
 from open_gopro.models import constants, proto
-from open_gopro.models.constants import settings
 from PIL import Image, ImageTk
 
 from sw import shotcut_watermark
+from sw.camera import hero10_table
+from sw.camera.gopro_hero10 import HeroBackend
+from sw.camera.mode_persistence import load_mode, save_mode
+from sw.camera.mode_picker import ModePicker
+from sw.camera.modes import AXES, ModeCatalog, VideoMode
 from sw.sync_uploads import sync_uploads
 from sw.uploader import make_qr, public_url, upload_video
 
@@ -65,14 +75,16 @@ logger = logging.getLogger(__name__)
 # expected while joining the UDP stream mid-GOP. Read on first VideoCapture.
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
-# Label shown in the UI -> GoPro resolution setting
-RESOLUTIONS: dict[str, settings.VideoResolution] = {
-    "2.7K 16:9": settings.VideoResolution.NUM_2_7K,
-    "2.7K 4:3": settings.VideoResolution.NUM_2_7K_4_3,
-    "1080p": settings.VideoResolution.NUM_1080,
+DISCRETE_AXES: tuple[str, ...] = AXES[:-1]  # zoom is a slider, not buttons
+ZOOM_MAX_PERCENT = 100
+
+MODE_AXIS_TITLES: dict[str, str] = {
+    "ratio": "Ratio",
+    "resolution": "Resolution",
+    "fps": "FPS",
+    "lens": "Lens",
+    "zoom": "Zoom",
 }
-DEFAULT_RESOLUTION = "2.7K 16:9"
-FPS = settings.FramesPerSecond.NUM_60_0
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "videos"
 DEFAULT_FOLDER = "default"
@@ -238,6 +250,8 @@ class GoProController:
         self._media_before: set[str] = set()
         self._recording = False
         self._keep_alive_task: asyncio.Task | None = None
+        self._backend: HeroBackend | None = None
+        self.catalog: ModeCatalog = hero10_table.build_catalog()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._loop.run_forever, name="gopro-loop", daemon=True
@@ -253,7 +267,7 @@ class GoProController:
         assert self._gopro is not None, "GoPro is not connected"
         return self._gopro
 
-    async def connect(self, resolution: settings.VideoResolution) -> str:
+    async def connect(self, mode: VideoMode) -> str:
         """Connect over USB, configure video mode and start the preview stream.
 
         Returns:     The camera serial number.
@@ -268,17 +282,19 @@ class GoProController:
                 group=proto.EnumPresetGroup.PRESET_GROUP_ID_VIDEO
             )
         )
-        await self._apply_video_settings(resolution)
+        self._backend = HeroBackend(self.gopro, self.catalog)
+        await self._backend.apply_mode(mode)
         await self._start_preview()
         self._keep_alive_task = self._loop.create_task(self._keep_alive())
         # get_camera_name is not supported by HERO10 firmware (404)
         return self.gopro.identifier
 
-    async def set_resolution(self, resolution: settings.VideoResolution) -> None:
-        """Change the recording resolution, restarting the preview around it."""
+    async def set_mode(self, mode: VideoMode) -> None:
+        """Change the recording mode, restarting the preview around it."""
         await self._stop_preview()
         try:
-            await self._apply_video_settings(resolution)
+            assert self._backend is not None, "connect() must run before set_mode()"
+            await self._backend.apply_mode(mode)
         finally:
             await self._start_preview()
 
@@ -382,11 +398,6 @@ class GoProController:
             except Exception:  # pylint: disable=broad-except
                 logger.exception("Error while closing the GoPro connection")
         self._loop.call_soon(self._loop.stop)
-
-    async def _apply_video_settings(self, resolution: settings.VideoResolution) -> None:
-        # Resolution first: the valid fps values depend on it.
-        _check(await self.gopro.http_setting.video_resolution.set(resolution))
-        _check(await self.gopro.http_setting.frames_per_second.set(FPS))
 
     async def _stop_preview(self) -> None:
         # Not checked: the camera returns an error if no stream is running.
@@ -561,24 +572,16 @@ class LivestreamApp:
         self.video.pack(fill="both", expand=True, padx=8, pady=8)
         self._show_message("Connecting to GoPro...")
 
+        self.picker = ModePicker(
+            controller.catalog,
+            load_mode(config_file, controller.catalog),
+        )
+        modes_frame = ttk.Frame(root)
+        modes_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self._build_mode_rows(modes_frame)
+
         controls = ttk.Frame(root)
         controls.pack(fill="x", padx=8, pady=(0, 8))
-
-        ttk.Label(controls, text="Resolution (60 fps):").pack(side="left")
-        self.resolution = tk.StringVar(value=DEFAULT_RESOLUTION)
-        self._applied_resolution = DEFAULT_RESOLUTION
-        self.resolution_buttons = [
-            ttk.Radiobutton(
-                controls,
-                text=label,
-                value=label,
-                variable=self.resolution,
-                command=self._on_resolution,
-            )
-            for label in RESOLUTIONS
-        ]
-        for button in self.resolution_buttons:
-            button.pack(side="left", padx=4)
 
         self.record_button = tk.Button(
             controls, text="Start recording", width=16, command=self._on_record
@@ -609,7 +612,7 @@ class LivestreamApp:
 
         self._update_controls()
         self._run(
-            controller.connect(RESOLUTIONS[DEFAULT_RESOLUTION]),
+            controller.connect(self.picker.mode),
             "Connecting to GoPro over USB…",
             self._on_connected,
         )
@@ -653,28 +656,119 @@ class LivestreamApp:
         self._show_message("Starting preview...")
         self.reader.start()
         self.status.set(
-            f"Connected to GoPro {serial}. Ready to record at {
-                self._applied_resolution
-            }, 60 fps."
+            f"Connected to GoPro {serial}. Ready to record at {self.picker.mode.label}."
         )
 
-    def _on_resolution(self) -> None:
-        label = self.resolution.get()
-        if label == self._applied_resolution:
+    def _build_mode_rows(self, parent: ttk.Frame) -> None:
+        """Create one row per discrete cascade axis, then a zoom slider.
+
+        Options that the committed mode rules out are disabled, not hidden.
+        Zoom is continuous: the slider moves freely, and the camera is only
+        changed when the user lets go of it.
+        """
+        self._mode_vars: dict[str, tk.StringVar] = {}
+        self._mode_buttons: dict[str, list[ttk.Radiobutton]] = {}
+        for row, axis in enumerate(DISCRETE_AXES):
+            ttk.Label(parent, text=MODE_AXIS_TITLES[axis], width=10, anchor="w").grid(
+                row=row, column=0, sticky="w"
+            )
+            var = tk.StringVar(value=self.picker.selected_text(axis))
+            self._mode_vars[axis] = var
+            self._mode_buttons[axis] = [
+                ttk.Radiobutton(
+                    parent,
+                    text=opt.text,
+                    value=opt.text,
+                    variable=var,
+                    command=functools.partial(self._on_mode_pick, axis),
+                )
+                for opt in self.picker.options(axis)
+            ]
+            for column, button in enumerate(self._mode_buttons[axis], start=1):
+                button.grid(row=row, column=column, sticky="w", padx=4)
+
+        zoom_row = len(DISCRETE_AXES)
+        ttk.Label(parent, text=MODE_AXIS_TITLES["zoom"], width=10, anchor="w").grid(
+            row=zoom_row, column=0, sticky="w"
+        )
+        self._zoom_var = tk.DoubleVar(value=self.picker.mode.zoom)
+        self._zoom_scale = ttk.Scale(
+            parent,
+            from_=0,
+            to=ZOOM_MAX_PERCENT,
+            variable=self._zoom_var,
+            command=self._on_zoom_drag,
+        )
+        self._zoom_scale.grid(row=zoom_row, column=1, columnspan=6, sticky="we", padx=4)
+        self._zoom_scale.bind("<ButtonRelease-1>", self._on_zoom_release)
+        self._zoom_scale.bind("<KeyRelease>", self._on_zoom_release)
+        self._zoom_label = ttk.Label(parent, text=f"{self.picker.mode.zoom}%", width=6)
+        self._zoom_label.grid(row=zoom_row, column=7, sticky="w")
+        self._update_mode_states()
+
+    def _on_mode_pick(self, axis: str) -> None:
+        try:
+            target = self.picker.preview(axis, self._mode_vars[axis].get())
+        except ValueError:
+            self._refresh_mode_controls()
+            return
+        self._apply_pick(target)
+
+    def _on_zoom_drag(self, _value: str = "") -> None:
+        """While the slider moves, show the value only.
+        The camera is not changed yet."""
+        self._zoom_label.config(text=f"{round(self._zoom_var.get())}%")
+
+    def _on_zoom_release(self, _event: Any = None) -> None:
+        """The slider was let go: apply the zoom the user chose."""
+        try:
+            target = self.picker.preview_zoom(round(self._zoom_var.get()))
+        except ValueError:
+            self._refresh_mode_controls()
+            return
+        self._apply_pick(target)
+
+    def _apply_pick(self, target: VideoMode) -> None:
+        """Send a picked mode to the camera; commit it only if the camera accepts it."""
+        if target == self.picker.mode:
+            self._refresh_mode_controls()
             return
 
         def done(_: None) -> None:
-            self._applied_resolution = label
-            self.status.set(f"Resolution set to {label}, 60 fps.")
+            self.picker.commit(target)
+            save_mode(self.config_file, target)
+            self._refresh_mode_controls()
+            self.status.set(f"Mode set to {target.label}.")
 
         def failed(_: Exception) -> None:
-            self.resolution.set(self._applied_resolution)
+            self._refresh_mode_controls()
 
         self._run(
-            self.controller.set_resolution(RESOLUTIONS[label]),
-            f"Switching to {label}…",
+            self.controller.set_mode(target),
+            f"Switching to {target.label}…",
             done,
             failed,
+        )
+
+    def _refresh_mode_controls(self) -> None:
+        """Show the committed mode on every axis and enable
+        only the options it allows."""
+        for axis in DISCRETE_AXES:
+            self._mode_vars[axis].set(self.picker.selected_text(axis))
+        self._zoom_var.set(self.picker.mode.zoom)
+        self._zoom_label.config(text=f"{self.picker.mode.zoom}%")
+        self._update_mode_states()
+
+    def _update_mode_states(self) -> None:
+        locked = self._busy or self._recording
+        for axis in DISCRETE_AXES:
+            for opt, button in zip(self.picker.options(axis), self._mode_buttons[axis]):
+                button.config(
+                    state="normal" if opt.enabled and not locked else "disabled"
+                )
+        _, zoom_max = self.picker.zoom_range()
+        self._zoom_scale.config(
+            state="normal" if zoom_max > 0 and not locked else "disabled"
         )
 
     def _folder_name(self) -> str | None:
@@ -843,11 +937,10 @@ class LivestreamApp:
                 activebackground="#1b5e20",
             )
         self.record_button.config(state="disabled" if self._busy else "normal")
+        self._update_mode_states()
+        # The folder and image are fixed for the duration of a recording
+        # and its download.
         radio_state = "disabled" if self._busy or self._recording else "normal"
-        for button in self.resolution_buttons:
-            button.config(state=radio_state)
-        # The folder and image are fixed for the duration of a recording and its
-        # download.
         self.folder_entry.config(state=radio_state)
         self.image_entry.config(state=radio_state)
 
@@ -861,8 +954,8 @@ class LivestreamApp:
         if self._recording and not self._busy:
             elapsed = int(time.monotonic() - self._record_started)
             self.status.set(
-                f"● Recording {self._applied_resolution} 60 fps — {elapsed // 60:02d}:{
-                    elapsed % 60:02d}"
+                f"● Recording {self.picker.mode.label} — \
+                {elapsed // 60:02d}:{elapsed % 60:02d}"
             )
 
         frame = self.reader.latest_frame()
