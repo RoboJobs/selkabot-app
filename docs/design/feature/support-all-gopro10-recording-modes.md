@@ -155,3 +155,33 @@ New package `sw/camera/` (camera-agnostic core + per-model data and adapters):
 ## Verification
 - `uv run pytest --cov=sw.camera --cov=sw.livestream --cov=sw.shotcut_watermark --cov=sw.shotcut_pipeline sw/tests/`
 - With the camera connected: `uv run python sw/camera_probe.py`, then `uv run python -m sw.livestream`. Step through the cascades (e.g. 16:9, 4K, 120, Narrow, check zoom disabled), record a clip per representative mode, and confirm the ffprobe width, height and fps match the selection and the watermark/edit pipeline completes.
+
+## Deviations from the plan (as implemented)
+
+This section records where the implementation departed from the plan above, and why.
+
+### Zoom
+- **Continuous zoom instead of 1.4x / 2x levels.** The plan modelled zoom as discrete levels (`none`, `1.4x`, `2x`) with calibrated percentages. The camera accepts any integer percentage from 0 to 100 on lenses that support zoom, so zoom is now an integer percentage with a per-mode maximum (100 on zoom lenses, 0 elsewhere). The catalog lists only zoom-0 modes; the window shows a 0-100% slider. Confirmed on the camera: 0, 25, 37, 80, 100 accepted, and the level read back matched.
+- **No calibration step.** Phase 0 planned a `--calibrate-zoom` run to find the percentages for 1.4x and 2x. Calibration was added, then removed once zoom became continuous.
+- **Zoom is not sent on lenses without zoom.** The plan sent zoom last in every mode, including 0. The camera rejects any digital zoom command (even 0) while SuperView or Narrow is selected, and it resets the level to 0 itself when those lenses are selected. The adapter now sends zoom only where the table allows it.
+- **Zoom status is checked after each change.** Not in the plan. The camera reports zoom availability (status 77) and zoom level (status 75); the adapter checks both against the table after every mode change.
+- **Slider applies on release.** The plan had discrete buttons applied on selection. For the slider, dragging only updates the label; the camera is changed when the user releases it, so the camera is not flooded with commands.
+- **The 2x zoom in the requested 4:3 rows** is the only 2x in the table; no requested 16:9 mode can use 2x. The plan's "2x zoom never applies to the requested 16:9 modes" note still holds.
+
+### Frame rates
+- **PAL rates removed.** The requested 50, 100 and 200 fps rows are not used with this camera. The probe found the camera rejected them (50 fps returned an error; 100 and 200 fps timed out with malformed responses). They were first kept in the catalog and disabled in the window, then removed entirely from the table, the camera enums and the window.
+- **Frame rate pairs split.** The plan listed "120/100" as one entry. Each value is a separate option in the table (the PAL one is now removed), so the window shows each rate on its own.
+
+### Window and selector
+- **Zoom is not one of the radio rows.** The plan described five labelled groups for the five axes. The four discrete axes use radio buttons; zoom is a slider.
+- **Temporary bridge removed.** Phase 3 kept the old radio buttons working through a temporary `RECORDING_MODES` map, including a 4:3 mode at 120 fps. Phase 4 replaced the bridge with the cascade rows and removed it.
+- **Startup restores the saved mode.** Not in the plan's phases. A saved mode that is no longer valid falls back to the default with a logged warning.
+
+### Scope and data
+- **1080p removed**, as decided during planning. The table in code does not include it.
+- **Mode file is not overwritten when unreadable.** The plan said to merge into `livestream_config.json`. If the file cannot be parsed, the mode is not saved, so the user's other settings are not lost. The existing `save_config` still replaces an unreadable file, as before.
+
+### Process
+- **Probe ran on the camera during Phase 0**, not as a later checkpoint. Its results drove the PAL removal and the zoom redesign.
+- **Phase gates were run per phase, and later fixes were separate commits.** The plan asked for one commit per phase. Fixes found on the camera (SuperView zoom, zoom status checks, PAL removal, zoom slider) were committed separately after the phases.
+- **Window tests needed a display.** The Tk tests run only where a display exists and are skipped otherwise. The full-window test stops the post-processing thread so pytest can exit.
