@@ -1,20 +1,21 @@
-"""Shotcut (MLT/melt) edit engine: clip a recording, add watermarks, fades and slow motion.
+"""Shotcut (MLT/melt) edit engine: clip a recording, add watermarks, fades and slow
+motion.
 
 The project is built as MLT XML (the same format Shotcut saves), so it can be opened in
 Shotcut afterwards, and rendered with `melt` (Shotcut's own engine) — no Shotcut GUI and
 no MCP server are needed at runtime.
 
-Edits, all in source-frame terms:
-- Clip: a window of the recording (start, length), default the whole recording.
-- Slow motion: each slowdown window is played at `speed`. Smoothing is one of:
-    "high": pre-rendered with ffmpeg minterpolate (motion-compensated 200 fps interpolation,
-            then slowed down), cached under SMOOTH_CACHE_DIR. Slow to render, best quality.
-    "shotcut": MLT's native `timewarp` producer. Instant, lower quality.
-- Fades: an optional still image fades in at the start and out at the end (crossfades).
-- Watermarks: images in fixed corners, faded in and out with the stills.
+Edits, all in source-frame terms: - Clip: a window of the recording (start, length),
+default the whole recording. - Slow motion: each slowdown window is played at `speed`.
+Smoothing is one of:     "high": pre-rendered with ffmpeg minterpolate (motion-
+compensated 200 fps interpolation,             then slowed down), cached under
+SMOOTH_CACHE_DIR. Slow to render, best quality.     "shotcut": MLT's native `timewarp`
+producer. Instant, lower quality. - Fades: an optional still image fades in at the start
+and out at the end (crossfades). - Watermarks: images in fixed corners, faded in and out
+with the stills.
 
-`watermarks_for` and `edit_clip` are the entry points; see sw/shotcut_watermark.py for the
-standalone script and settings UI.
+`watermarks_for` and `edit_clip` are the entry points; see sw/shotcut_watermark.py for
+the standalone script and settings UI.
 """
 
 from __future__ import annotations
@@ -23,8 +24,8 @@ import hashlib
 import json
 import logging
 import os
-import re
 import random
+import re
 import shutil
 import subprocess
 import time
@@ -36,12 +37,14 @@ from xml.sax.saxutils import quoteattr
 
 logger = logging.getLogger(__name__)
 
-# Receives short progress messages, such as "slowdown 1/2: 40%". Used by the window's status line.
+# Receives short progress messages, such as "slowdown 1/2: 40%". Used by
+# the window's status line.
 ProgressFn = Callable[[str], None]
 
 
 def _report(progress: ProgressFn | None, message: str) -> None:
-    """Send a progress message to the caller, or to the log when there is no caller to send it to."""
+    """Send a progress message to the caller, or to the log when there is no caller to
+    send it to."""
     if progress is not None:
         progress(message)
     else:
@@ -49,16 +52,21 @@ def _report(progress: ProgressFn | None, message: str) -> None:
 
 
 def _emit(progress: ProgressFn | None, message: str) -> None:
-    """Log a message and also send it to the caller (the terminal and the window both see it)."""
+    """Log a message and also send it to the caller (the terminal and the window both
+    see it)."""
     logger.info(message)
     if progress is not None:
         progress(message)
 
 
-def _run_ffmpeg(cmd: list[str], expected_seconds: float, progress: ProgressFn | None) -> None:
+def _run_ffmpeg(
+    cmd: list[str], expected_seconds: float, progress: ProgressFn | None
+) -> None:
     """Run ffmpeg, reporting its progress every 5% of `expected_seconds` of output."""
     full = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
-    proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     assert proc.stdout is not None and proc.stderr is not None
     shown = -5
     for line in proc.stdout:
@@ -75,7 +83,10 @@ def _run_ffmpeg(cmd: list[str], expected_seconds: float, progress: ProgressFn | 
 
 
 def _run_melt(cmd: list[str], progress: ProgressFn | None) -> None:
-    """Run melt, reporting the percentage it prints every 5%. Raises CalledProcessError on failure."""
+    """Run melt, reporting the percentage it prints every 5%.
+
+    Raises CalledProcessError on failure.
+    """
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert proc.stdout is not None
     fd = proc.stdout.fileno()
@@ -96,6 +107,7 @@ def _run_melt(cmd: list[str], progress: ProgressFn | None) -> None:
     if rc:
         raise subprocess.CalledProcessError(rc, cmd, output="".join(output)[-4000:])
 
+
 ROOT = Path(__file__).resolve().parents[1]
 # Always-used watermark, plus its two corners.
 ALWAYS_WATERMARK = ROOT / "selkabot.png"
@@ -104,27 +116,36 @@ ALWAYS_CORNERS = ("bottom-left", "top-right")
 IMAGE_CORNERS = ("top-left", "bottom-right")
 WATERMARK_SIZE_PCT = 10  # Each watermark's bounding box, as a percentage of the frame
 
-# Smoothed slow-motion segments are cached here, outside the recording folders (the upload
+# Smoothed slow-motion segments are cached here, outside the recording folders (the
+# upload
 # sync uploads every .mp4 it finds in a recording folder).
 SMOOTH_CACHE_DIR = ROOT / "videos" / "shotcut" / "smoothed"
 SMOOTHING_MODES = ("high", "shotcut")
-# ffmpeg minterpolate is single-threaded, so each slowdown is split into this many chunks that
-# are rendered in parallel. Chunks overlap by CHUNK_CONTEXT_FRAMES source frames on each side.
+# ffmpeg minterpolate is single-threaded, so each slowdown is split into this many
+# chunks that
+# are rendered in parallel. Chunks overlap by CHUNK_CONTEXT_FRAMES source
+# frames on each side.
 DEFAULT_CHUNKS = 4
 CHUNK_CONTEXT_FRAMES = 2
 MIN_CHUNK_SECONDS = 0.5  # Shorter windows get fewer chunks
 
-FADE_STILL_SECONDS = 2.0  # Full length of each fade still, before the crossfade eats into it
-FADE_TRANSITION_SECONDS = 1.0  # Crossfade length, split evenly between the still and the clip
+FADE_STILL_SECONDS = (
+    2.0  # Full length of each fade still, before the crossfade eats into it
+)
+FADE_TRANSITION_SECONDS = (
+    1.0  # Crossfade length, split evenly between the still and the clip
+)
 
-# The flatpak build of melt (SHOTCUT_MELT_PATH=shotcut-melt) cannot read files under /tmp, so
+# The flatpak build of melt (SHOTCUT_MELT_PATH=shotcut-melt) cannot read files under
+# /tmp, so
 # keep projects and renders inside the repository or the home folder.
 MELT = os.environ.get("SHOTCUT_MELT_PATH", "melt")
 FFMPEG = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
 
 def _corner_xy(corner: str, box_h: float) -> tuple[float, float]:
-    """x%, y% of the top-left corner of a watermark box WATERMARK_SIZE_PCT wide and `box_h` tall."""
+    """X%, y% of the top-left corner of a watermark box WATERMARK_SIZE_PCT wide and
+    `box_h` tall."""
     x = 0 if corner.endswith("left") else 100 - WATERMARK_SIZE_PCT
     y = 0 if corner.startswith("top") else 100 - box_h
     return x, y
@@ -132,7 +153,18 @@ def _corner_xy(corner: str, box_h: float) -> tuple[float, float]:
 
 def _image_size(path: Path) -> tuple[int, int]:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -142,10 +174,11 @@ def _image_size(path: Path) -> tuple[int, int]:
 
 
 def _watermark_box_height(image: Path, probe: "Probe") -> float:
-    """Height of a watermark's box, in % of the frame height, for the image's own aspect ratio.
+    """Height of a watermark's box, in % of the frame height, for the image's own aspect
+    ratio.
 
-    The width is WATERMARK_SIZE_PCT of the frame width, so the
-    height follows from the image's shape, and the image fills the box without distortion.
+    The width is WATERMARK_SIZE_PCT of the frame width, so the height follows from the
+    image's shape, and the image fills the box without distortion.
     """
     image_w, image_h = _image_size(image)
     return WATERMARK_SIZE_PCT * (probe.width / probe.height) * (image_h / image_w)
@@ -155,7 +188,8 @@ def _watermark_box_height(image: Path, probe: "Probe") -> float:
 class EditSettings:
     """Everything that changes from one video to the next. Times are in seconds.
 
-    slowdowns: (start, end) pairs, relative to the start of the clip (not of the recording).
+    slowdowns: (start, end) pairs, relative to the start of the clip (not of the
+        recording).
     clip_start: where the clip starts in the recording.
     clip_length: clip duration, or None for the rest of the recording.
     speed: playback speed inside a slowdown window (0.3 = 30%).
@@ -168,23 +202,32 @@ class EditSettings:
     clip_start: float = 0.0
     clip_length: float | None = None
     smoothing: str = "high"
-    exposure: float = 0.0  # Stops: negative is darker, positive brighter. Applied to the recording only.
+    exposure: float = (
+        # Stops: negative is darker, positive brighter. Applied to the recording only.
+        0.0
+    )
     chunks: int = DEFAULT_CHUNKS  # Parallel pieces per slowdown in "high" smoothing
     fadein_image: Path | None = None
     fadeout_image: Path | None = None
     soundtrack: Path | None = None  # Replaces the recording's own sound when set
-    soundtrack_start: float = 0.0  # Where in the soundtrack file the output starts, in seconds
+    soundtrack_start: float = (
+        0.0  # Where in the soundtrack file the output starts, in seconds
+    )
     flash_windows: tuple[tuple[float, float], ...] = ()
     flash_min_gap: float = 0.045
     flash_max_gap: float = 0.18
 
     def __post_init__(self) -> None:
         if not -3 <= self.exposure <= 3:
-            raise ValueError(f"exposure must be between -3 and 3 stops, not {self.exposure}")
+            raise ValueError(
+                f"exposure must be between -3 and 3 stops, not {self.exposure}"
+            )
         if self.soundtrack_start < 0:
             raise ValueError("soundtrack_start cannot be negative")
         if self.smoothing not in SMOOTHING_MODES:
-            raise ValueError(f"smoothing must be one of {SMOOTHING_MODES}, not {self.smoothing!r}")
+            raise ValueError(
+                f"smoothing must be one of {SMOOTHING_MODES}, not {self.smoothing!r}"
+            )
         if not 0 < self.speed <= 1:
             raise ValueError(f"speed must be in (0, 1], not {self.speed}")
         if self.chunks < 1:
@@ -192,15 +235,23 @@ class EditSettings:
         if self.clip_start < 0:
             raise ValueError("clip_start cannot be negative")
         if self.clip_length is not None and self.clip_length <= 0:
-            raise ValueError("clip_length must be positive, or None for the rest of the recording")
+            raise ValueError(
+                "clip_length must be positive, or None for the rest of the recording"
+            )
         for start, end in self.slowdowns:
             if not 0 <= start < end:
-                raise ValueError(f"slowdown ({start}, {end}) must have 0 <= start < end")
+                raise ValueError(
+                    f"slowdown ({start}, {end}) must have 0 <= start < end"
+                )
         for start, end in self.flash_windows:
             if not 0 <= start < end:
-                raise ValueError(f"flash window ({start}, {end}) must have 0 <= start < end")
+                raise ValueError(
+                    f"flash window ({start}, {end}) must have 0 <= start < end"
+                )
         if not 0 <= self.flash_min_gap <= self.flash_max_gap:
-            raise ValueError("flash_min_gap must be non-negative and no greater than flash_max_gap")
+            raise ValueError(
+                "flash_min_gap must be non-negative and no greater than flash_max_gap"
+            )
 
 
 @dataclass
@@ -239,7 +290,13 @@ def probe_video(path: Path) -> Probe:
     fps_num, fps_den = (int(x) for x in stream["r_frame_rate"].split("/"))
     duration = float(data["format"]["duration"])
     total_frames = round(duration * fps_num / fps_den)
-    return Probe(width=width, height=height, fps_num=fps_num, fps_den=fps_den, total_frames=total_frames)
+    return Probe(
+        width=width,
+        height=height,
+        fps_num=fps_num,
+        fps_den=fps_den,
+        total_frames=total_frames,
+    )
 
 
 def _prop(name: str, value: object) -> str:
@@ -247,7 +304,8 @@ def _prop(name: str, value: object) -> str:
 
 
 def _fit_filter(filter_id: str, out: int) -> str:
-    """A full-frame `affine` filter that letterboxes/pillarboxes an image, preserving aspect."""
+    """A full-frame `affine` filter that letterboxes/pillarboxes an image, preserving
+    aspect."""
     return (
         f'    <filter id={quoteattr(filter_id)} in="0" out="{out}">\n'
         f"{_prop('mlt_service', 'affine')}\n"
@@ -260,7 +318,12 @@ def _fit_filter(filter_id: str, out: int) -> str:
 
 
 def _watermark_filters(
-    transform_id: str, opacity_id: str, out: int, corner: str, alpha_keyframes: str, box_h: float
+    transform_id: str,
+    opacity_id: str,
+    out: int,
+    corner: str,
+    alpha_keyframes: str,
+    box_h: float,
 ) -> str:
     x, y = _corner_xy(corner, box_h)
     rect = f"0={x}%/{y}%:{WATERMARK_SIZE_PCT}%x{box_h:.4f}%"
@@ -281,7 +344,8 @@ def _watermark_filters(
 
 
 def _atempo_chain(speed: float) -> str:
-    """ffmpeg atempo filters (each limited to 0.5..2) whose product is `speed`; pitch is kept."""
+    """Ffmpeg atempo filters (each limited to 0.5..2) whose product is `speed`; pitch is
+    kept."""
     filters = []
     remaining = speed
     while remaining < 0.5:
@@ -293,7 +357,18 @@ def _atempo_chain(speed: float) -> str:
 
 def _has_audio(path: Path) -> bool:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -302,7 +377,8 @@ def _has_audio(path: Path) -> bool:
 
 
 def _effective_chunks(frames: int, fps: float, chunks: int) -> int:
-    """At most `chunks`, and never so many that a chunk is shorter than MIN_CHUNK_SECONDS."""
+    """At most `chunks`, and never so many that a chunk is shorter than
+    MIN_CHUNK_SECONDS."""
     return max(1, min(chunks, int(frames / fps / MIN_CHUNK_SECONDS)))
 
 
@@ -316,26 +392,36 @@ def smooth_segment(
     progress: ProgressFn | None = None,
     chunks: int = DEFAULT_CHUNKS,
 ) -> Path:
-    """Return a file holding source frames [start_frame, end_frame) slowed to `speed`, smoothed.
+    """Return a file holding source frames [start_frame, end_frame) slowed to `speed`,
+    smoothed.
 
     Motion-compensated interpolation (minterpolate, mci/aobmc, bidirectional, OBMC-based
-    variable-size block matching) to an intermediate rate of fps/speed, then slowed to `speed`
-    and resampled back to the source frame rate.
+    variable-size block matching) to an intermediate rate of fps/speed, then slowed to
+    `speed` and resampled back to the source frame rate.
 
-    The window is cut into `chunks` pieces that are interpolated in parallel, each with a little
-    extra source footage on either side so the seams are interpolated with real neighbours; the
-    extra output frames are trimmed off and the pieces are joined. Audio is slowed in one pass
-    with atempo (pitch kept). Results are cached by their inputs.
+    The window is cut into `chunks` pieces that are interpolated in parallel, each with
+    a little extra source footage on either side so the seams are interpolated with real
+    neighbours; the extra output frames are trimmed off and the pieces are joined. Audio
+    is slowed in one pass with atempo (pitch kept). Results are cached by their inputs.
     """
     fps = probe.fps_num / probe.fps_den
     stat = source.stat()
     video_filter = (
-        f"minterpolate=fps={round(fps / speed)}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+        "minterpolate="
+        f"fps={round(fps / speed)}:mi_mode=mci:mc_mode=aobmc:"
+        "me_mode=bidir:vsbmc=1,"
         f"setpts=PTS/{speed},fps={probe.fps_num}/{probe.fps_den}"
     )
     chunks = _effective_chunks(end_frame - start_frame, fps, chunks)
     # "v3": chunked rendering. The key covers everything that changes the output.
-    key_parts = ["v3", str(source.resolve()), str(stat.st_size), str(stat.st_mtime_ns), str(start_frame), str(end_frame)]
+    key_parts = [
+        "v3",
+        str(source.resolve()),
+        str(stat.st_size),
+        str(stat.st_mtime_ns),
+        str(start_frame),
+        str(end_frame),
+    ]
     key_parts += [str(speed), video_filter, _atempo_chain(speed), f"chunks={chunks}"]
     key = hashlib.sha1("|".join(key_parts).encode()).hexdigest()[:16]
     output = cache_dir / f"smooth_{source.stem}_{start_frame}-{end_frame}_{key}.mp4"
@@ -347,11 +433,25 @@ def smooth_segment(
     work = cache_dir / f"{output.stem}.parts"
     temp = output.with_name(output.stem + ".tmp.mp4")
     expected_out = (end_frame - start_frame) / fps / speed
-    _report(progress, f"ffmpeg started: {end_frame - start_frame} source frames -> {expected_out:.1f}s at {speed}x, {chunks} chunk(s)")
+    _report(
+        progress,
+        f"ffmpeg started: {end_frame - start_frame} source frames -> {
+            expected_out:.1f}s at {speed}x, {chunks} chunk(s)",
+    )
     started = time.monotonic()
     try:
         work.mkdir(parents=True, exist_ok=True)
-        parts = _render_chunks(source, probe, start_frame, end_frame, speed, video_filter, chunks, work, progress)
+        parts = _render_chunks(
+            source,
+            probe,
+            start_frame,
+            end_frame,
+            speed,
+            video_filter,
+            chunks,
+            work,
+            progress,
+        )
         joined = work / "video.mp4"
         _concat_parts(parts, joined, work)
         if _has_audio(source):
@@ -369,7 +469,9 @@ def smooth_segment(
     actual = _video_frames(temp)
     if abs(actual - expected) > 2:
         temp.unlink(missing_ok=True)
-        raise RuntimeError(f"smoothed segment has {actual} frames, expected about {expected}")
+        raise RuntimeError(
+            f"smoothed segment has {actual} frames, expected about {expected}"
+        )
     os.replace(temp, output)
     _report(progress, f"ffmpeg finished in {time.monotonic() - started:.0f}s")
     return output
@@ -386,12 +488,13 @@ def _render_chunks(
     work: Path,
     progress: ProgressFn | None,
 ) -> list[Path]:
-    """Interpolate the window in `chunks` parallel pieces; returns them in order, trimmed exactly.
+    """Interpolate the window in `chunks` parallel pieces; returns them in order,
+    trimmed exactly.
 
-    Piece i covers source frames [lo, hi) of the window, read with CHUNK_CONTEXT_FRAMES extra on
-    each side. Its output is trimmed to the output frames that belong to [lo, hi). The trim counts
-    are taken from the window's own frame grid (round(offset / speed)), so the pieces add up to
-    exactly the length of the whole window.
+    Piece i covers source frames [lo, hi) of the window, read with CHUNK_CONTEXT_FRAMES
+    extra on each side. Its output is trimmed to the output frames that belong to [lo,
+    hi). The trim counts are taken from the window's own frame grid (round(offset /
+    speed)), so the pieces add up to exactly the length of the whole window.
     """
     fps = probe.fps_num / probe.fps_den
     length = end_frame - start_frame
@@ -400,14 +503,19 @@ def _render_chunks(
     for i, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
         a = max(start_frame, lo - CHUNK_CONTEXT_FRAMES)
         b = min(end_frame, hi + CHUNK_CONTEXT_FRAMES)
-        trim_start = round((lo - start_frame) / speed) - round((a - start_frame) / speed)
+        trim_start = round((lo - start_frame) / speed) - round(
+            (a - start_frame) / speed
+        )
         trim_end = round((hi - start_frame) / speed) - round((a - start_frame) / speed)
         jobs.append((i, a, b, trim_start, trim_end))
 
     def render(job: tuple[int, int, int, int, int]) -> Path:
         i, a, b, trim_start, trim_end = job
         out = work / f"part_{i:02d}.mp4"
-        vf = f"{video_filter},trim=start_frame={trim_start}:end_frame={trim_end},setpts=PTS-STARTPTS"
+        vf = (
+            f"{video_filter},trim=start_frame={trim_start}:"
+            f"end_frame={trim_end},setpts=PTS-STARTPTS"
+        )
         chunk_seconds = (trim_end - trim_start) / fps
         _run_ffmpeg(
             [
@@ -435,7 +543,11 @@ def _render_chunks(
                 str(out),
             ],
             chunk_seconds,
-            None if progress is None else (lambda m, i=i: progress(f"chunk {i + 1}/{chunks} {m}")),
+            (
+                None
+                if progress is None
+                else (lambda m, i=i: progress(f"chunk {i + 1}/{chunks} {m}"))
+            ),
         )
         return out
 
@@ -445,16 +557,39 @@ def _render_chunks(
 
 def _concat_parts(parts: list[Path], output: Path, work: Path) -> None:
     listing = work / "parts.txt"
-    listing.write_text("".join(f"file '{part.resolve()}'\n" for part in parts), encoding="utf-8")
+    listing.write_text(
+        "".join(f"file '{part.resolve()}'\n" for part in parts), encoding="utf-8"
+    )
     subprocess.run(
-        [FFMPEG, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(output)],
+        [
+            FFMPEG,
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(listing),
+            "-c",
+            "copy",
+            str(output),
+        ],
         check=True,
         capture_output=True,
         text=True,
     )
 
 
-def _render_audio(source: Path, probe: Probe, start_frame: int, end_frame: int, speed: float, output: Path) -> None:
+def _render_audio(
+    source: Path,
+    probe: Probe,
+    start_frame: int,
+    end_frame: int,
+    speed: float,
+    output: Path,
+) -> None:
     fps = probe.fps_num / probe.fps_den
     subprocess.run(
         [
@@ -469,7 +604,8 @@ def _render_audio(source: Path, probe: Probe, start_frame: int, end_frame: int, 
             "-i",
             str(source),
             "-vn",
-            # Pad to the video's length: the slowed audio can be a few frames short, and the mux
+            # Pad to the video's length: the slowed audio can be a few frames
+            # short, and the mux
             # must not cut the video down to it.
             "-af",
             f"{_atempo_chain(speed)},apad",
@@ -512,15 +648,19 @@ def _mux(video: Path, audio: Path, output: Path) -> None:
     )
 
 
-def _clip_window(lo_frame: int, hi_frame: int, fps: float, start_s: float, end_s: float) -> tuple[int, int] | None:
-    """[start, end) source frames for a window given in clip-relative seconds, clamped to [lo, hi)."""
+def _clip_window(
+    lo_frame: int, hi_frame: int, fps: float, start_s: float, end_s: float
+) -> tuple[int, int] | None:
+    """[start, end) source frames for a window given in clip-relative seconds, clamped
+    to [lo, hi)."""
     start = max(lo_frame, lo_frame + round(start_s * fps))
     end = min(hi_frame, lo_frame + round(end_s * fps))
     return (start, end) if end > start else None
 
 
 def _exposure_filter(filter_id: str, exposure: float) -> str:
-    """An avfilter exposure adjustment (in stops) for use inside a producer; "" when there is none."""
+    """An avfilter exposure adjustment (in stops) for use inside a producer; "" when
+    there is none."""
     if not exposure:
         return ""
     return (
@@ -539,20 +679,29 @@ FLASH_LEVELS = (1.8, 4.5)
 
 
 def flash_scale_for_exposure(exposure: float) -> float:
-    """Reduce flash peaks as the base footage exposure rises, while preserving a visible burst."""
+    """Reduce flash peaks as the base footage exposure rises, while preserving a visible
+    burst."""
     if exposure <= 0:
         return 1.0
     return max(0.35, 2 ** (-1.35 * exposure))
 
 
 def flash_events(
-    windows: tuple[tuple[float, float], ...], fps: float, duration_frames: int,
-    seed: int = FLASH_SEED, visible_start: int = 0, visible_end: int | None = None,
-    min_gap: float = FLASH_MIN_GAP_SECONDS, max_gap: float = FLASH_MAX_GAP_SECONDS,
+    windows: tuple[tuple[float, float], ...],
+    fps: float,
+    duration_frames: int,
+    seed: int = FLASH_SEED,
+    visible_start: int = 0,
+    visible_end: int | None = None,
+    min_gap: float = FLASH_MIN_GAP_SECONDS,
+    max_gap: float = FLASH_MAX_GAP_SECONDS,
 ) -> list[tuple[int, int, float]]:
-    """Return irregular (start, end, brightness level) pulses in output-timeline frames."""
+    """Return irregular (start, end, brightness level) pulses in output-timeline
+    frames."""
     rng = random.Random(seed)
-    visible_end = duration_frames if visible_end is None else min(duration_frames, visible_end)
+    visible_end = (
+        duration_frames if visible_end is None else min(duration_frames, visible_end)
+    )
     events: list[tuple[int, int, float]] = []
     for start_s, end_s in windows:
         start_s = max(0.0, start_s)
@@ -573,7 +722,7 @@ def flash_events(
 def _flash_filter(events: list[tuple[int, int, float]], scale: float = 1.0) -> str:
     if not events:
         return ""
-    keyframes = [f"0=1"]
+    keyframes = ["0=1"]
     for start, end, level in events:
         peak = 1 + (level - 1) * scale
         keyframes.extend((f"{start}=1", f"{start + 1}={peak:.3f}", f"{end}=1"))
@@ -588,7 +737,16 @@ def _flash_filter(events: list[tuple[int, int, float]], scale: float = 1.0) -> s
 
 def _duration_seconds(path: Path) -> float:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -611,16 +769,18 @@ def build_project_xml(
     flash_min_gap: float = FLASH_MIN_GAP_SECONDS,
     flash_max_gap: float = FLASH_MAX_GAP_SECONDS,
 ) -> tuple[str, int]:
-    """Build the MLT project XML for one edited, watermarked clip; also returns its length in frames.
+    """Build the MLT project XML for one edited, watermarked clip; also returns its
+    length in frames.
 
-    clip: (first source frame, number of frames) of the clip.
-    exposure: stops to add to the recording's footage (the main clip and the slowdowns). The fade
-        stills and the watermarks are not adjusted. It is applied here, at render time, not in the
-        cached smoothed segments, so changing it does not re-render them.
-    music: (soundtrack file, first frame of the soundtrack to use, length of the soundtrack in
-        frames), or None to keep the recording's own sound. Frames are at the project's frame rate.
-    windows: slow-motion windows as (start, end) source frames within the clip, each with the
-        pre-rendered smoothed file for it, or None to use MLT's timewarp instead.
+    clip: (first source frame, number of frames) of the clip. exposure: stops to add to
+    the recording's footage (the main clip and the slowdowns). The fade     stills and
+    the watermarks are not adjusted. It is applied here, at render time, not in the
+    cached smoothed segments, so changing it does not re-render them. music: (soundtrack
+    file, first frame of the soundtrack to use, length of the soundtrack in     frames),
+    or None to keep the recording's own sound. Frames are at the project's frame rate.
+    windows: slow-motion windows as (start, end) source frames within the clip, each
+    with the     pre-rendered smoothed file for it, or None to use MLT's timewarp
+    instead.
     """
     fps_num, fps_den = probe.fps_num, probe.fps_den
     fps = fps_num / fps_den
@@ -650,7 +810,8 @@ def build_project_xml(
         f"  </producer>"
     )
 
-    # Lead fade-in: a still, trimmed to its solo portion, then a crossfade into the clip's start.
+    # Lead fade-in: a still, trimmed to its solo portion, then a crossfade
+    # into the clip's start.
     lead_transition_id = "lead_transition"
     if has_fadein:
         fadein_id = "fadein_still"
@@ -664,11 +825,16 @@ def build_project_xml(
         )
         solo_len = still_frames - trans_frames
         if solo_len > 0:
-            add_entry(f'    <entry producer="{fadein_id}" in="0" out="{solo_len - 1}" />', solo_len)
+            add_entry(
+                f'    <entry producer="{fadein_id}" in="0" out="{solo_len - 1}" />',
+                solo_len,
+            )
         producers.append(
             f'  <tractor id="{lead_transition_id}" in="0" out="{trans_frames - 1}">\n'
-            f'    <track producer="{fadein_id}" in="{solo_len}" out="{still_frames - 1}" />\n'
-            f'    <track producer="{main_id}" in="{clip_lo}" out="{clip_lo + trans_frames - 1}" />\n'
+            f'    <track producer="{fadein_id}" in="{solo_len}" '
+            f'out="{still_frames - 1}" />\n'
+            f'    <track producer="{main_id}" in="{clip_lo}" '
+            f'out="{clip_lo + trans_frames - 1}" />\n'
             f'    <transition id="lead_luma" out="{trans_frames - 1}">\n'
             f"{_prop('a_track', '0')}\n"
             f"{_prop('b_track', '1')}\n"
@@ -684,10 +850,19 @@ def build_project_xml(
             f"  </tractor>"
         )
         fade_in_start = cursor  # Frame where the watermarks start ramping up
-        add_entry(f'    <entry producer="{lead_transition_id}" in="0" out="{trans_frames - 1}" />', trans_frames)
-        fade_in_end = cursor - 1  # Frame where the main video takes over at full opacity
+        add_entry(
+            f'    <entry producer="{lead_transition_id}" in="0" out="{
+                trans_frames - 1
+            }" />',
+            trans_frames,
+        )
+        fade_in_end = (
+            cursor - 1
+        )  # Frame where the main video takes over at full opacity
     else:
-        fade_in_start = fade_in_end = 0  # Watermarks are at full opacity from the first frame
+        fade_in_start = fade_in_end = (
+            0  # Watermarks are at full opacity from the first frame
+        )
 
     # Body: the clip's middle, split into normal and slow-motion pieces.
     body_lo = clip_lo + (trans_frames if has_fadein else 0)
@@ -709,12 +884,18 @@ def build_project_xml(
         )
     for k, (start, end, smoothed) in enumerate(windows):
         if start > body_cur:
-            add_entry(f'    <entry producer="{main_id}" in="{body_cur}" out="{start - 1}" />', start - body_cur)
+            add_entry(
+                f'    <entry producer="{main_id}" in="{body_cur}" out="{start - 1}" />',
+                start - body_cur,
+            )
         if smoothed is None:
             warped_len = round((end - start) / speed)
             warped_in = int(start / speed)
             add_entry(
-                f'    <entry producer="timewarp" in="{warped_in}" out="{warped_in + warped_len - 1}" />', warped_len
+                f'    <entry producer="timewarp" in="{warped_in}" out="{
+                    warped_in + warped_len - 1
+                }" />',
+                warped_len,
             )
         else:
             slow_id = f"slow_{k}"
@@ -727,10 +908,15 @@ def build_project_xml(
                 f"{_exposure_filter(f'exposure_{slow_id}', exposure)}"
                 f"  </producer>"
             )
-            add_entry(f'    <entry producer="{slow_id}" in="0" out="{length - 1}" />', length)
+            add_entry(
+                f'    <entry producer="{slow_id}" in="0" out="{length - 1}" />', length
+            )
         body_cur = end
     if body_hi > body_cur:
-        add_entry(f'    <entry producer="{main_id}" in="{body_cur}" out="{body_hi - 1}" />', body_hi - body_cur)
+        add_entry(
+            f'    <entry producer="{main_id}" in="{body_cur}" out="{body_hi - 1}" />',
+            body_hi - body_cur,
+        )
 
     # Trailing fade-out: a crossfade from the clip's end, then the still's solo portion.
     trail_transition_id = "trail_transition"
@@ -747,7 +933,8 @@ def build_project_xml(
         fade_out_start = cursor  # Frame where the watermarks start ramping down
         producers.append(
             f'  <tractor id="{trail_transition_id}" in="0" out="{trans_frames - 1}">\n'
-            f'    <track producer="{main_id}" in="{clip_hi - trans_frames}" out="{clip_hi - 1}" />\n'
+            f'    <track producer="{main_id}" in="{clip_hi - trans_frames}" '
+            f'out="{clip_hi - 1}" />\n'
             f'    <track producer="{fadeout_id}" in="0" out="{trans_frames - 1}" />\n'
             f'    <transition id="trail_luma" out="{trans_frames - 1}">\n'
             f"{_prop('a_track', '0')}\n"
@@ -763,23 +950,44 @@ def build_project_xml(
             f"    </transition>\n"
             f"  </tractor>"
         )
-        add_entry(f'    <entry producer="{trail_transition_id}" in="0" out="{trans_frames - 1}" />', trans_frames)
+        add_entry(
+            f'    <entry producer="{trail_transition_id}" in="0" out="{
+                trans_frames - 1
+            }" />',
+            trans_frames,
+        )
         fade_out_end = cursor - 1  # Frame where the still takes over alone
         solo_len = still_frames - trans_frames
         if solo_len > 0:
-            add_entry(f'    <entry producer="{fadeout_id}" in="{trans_frames}" out="{still_frames - 1}" />', solo_len)
+            add_entry(
+                f'    <entry producer="{fadeout_id}" in="{trans_frames}" out="{
+                    still_frames - 1
+                }" />',
+                solo_len,
+            )
     else:
-        fade_out_start = fade_out_end = cursor - 1  # Watermarks stay at full opacity to the end
+        fade_out_start = fade_out_end = (
+            cursor - 1
+        )  # Watermarks stay at full opacity to the end
 
     total_final = cursor
-    flash_xml = _flash_filter(flash_events(
-        flash_windows, fps, total_final,
-        visible_start=fade_in_end, visible_end=fade_out_start + 1,
-        min_gap=flash_min_gap, max_gap=flash_max_gap,
-    ), flash_scale_for_exposure(exposure))
+    flash_xml = _flash_filter(
+        flash_events(
+            flash_windows,
+            fps,
+            total_final,
+            visible_start=fade_in_end,
+            visible_end=fade_out_start + 1,
+            min_gap=flash_min_gap,
+            max_gap=flash_max_gap,
+        ),
+        flash_scale_for_exposure(exposure),
+    )
 
-    # One producer per watermark corner, each with its own position and an opacity ramp that
-    # matches the fades: invisible under a still, ramping during its crossfade, opaque otherwise.
+    # One producer per watermark corner, each with its own position and an
+    # opacity ramp that
+    # matches the fades: invisible under a still, ramping during its
+    # crossfade, opaque otherwise.
     alpha_keyframes = f"0={0 if has_fadein else 1};"
     if has_fadein:
         alpha_keyframes += f"{fade_in_start}=0;{fade_in_end}=1;"
@@ -798,7 +1006,16 @@ def build_project_xml(
                 f"{_prop('length', total_final)}\n"
                 f"{_prop('resource', image)}\n"
                 f"{_prop('mlt_service', 'qimage')}\n"
-                f"{_watermark_filters(f'{wm_id}_t', f'{wm_id}_o', total_final - 1, corner, alpha_keyframes, box_h)}\n"
+                f"{
+                    _watermark_filters(
+                        f'{wm_id}_t',
+                        f'{wm_id}_o',
+                        total_final - 1,
+                        corner,
+                        alpha_keyframes,
+                        box_h,
+                    )
+                }\n"
                 f"  </producer>"
             )
             watermark_tracks.append(
@@ -807,9 +1024,14 @@ def build_project_xml(
                 f"  </playlist>"
             )
 
-    corner_pairs = [(i, j) for i, (_, c) in enumerate(watermarks) for j in range(len(c))]
-    tracks_xml = "\n".join(f'    <track producer="pl_wm_{i}_{j}" />' for i, j in corner_pairs)
-    # With a soundtrack, the recording's own audio is hidden and the soundtrack is an extra
+    corner_pairs = [
+        (i, j) for i, (_, c) in enumerate(watermarks) for j in range(len(c))
+    ]
+    tracks_xml = "\n".join(
+        f'    <track producer="pl_wm_{i}_{j}" />' for i, j in corner_pairs
+    )
+    # With a soundtrack, the recording's own audio is hidden and the soundtrack
+    # is an extra
     # audio-only track whose playlist entry is exactly the output's length.
     v1_track = '    <track producer="playlist_v1" />\n'
     music_xml = ""
@@ -824,7 +1046,8 @@ def build_project_xml(
             f"{_prop('mlt_service', 'avformat-novalidate')}\n"
             f"  </producer>\n"
             f'  <playlist id="pl_music">\n'
-            f'    <entry producer="music" in="{music_in}" out="{music_in + total_final - 1}" />\n'
+            f'    <entry producer="music" in="{music_in}" '
+            f'out="{music_in + total_final - 1}" />\n'
             f"  </playlist>\n"
         )
         music_track = '    <track producer="pl_music" />\n'
@@ -838,7 +1061,8 @@ def build_project_xml(
     )
 
     profile = (
-        f'<profile description="{probe.width}x{probe.height}" width="{probe.width}" height="{probe.height}" '
+        f'<profile description="{probe.width}x{probe.height}" '
+        f'width="{probe.width}" height="{probe.height}" '
         f'progressive="1" sample_aspect_num="1" sample_aspect_den="1" '
         f'display_aspect_num="{probe.width}" display_aspect_den="{probe.height}" '
         f'frame_rate_num="{fps_num}" frame_rate_den="{fps_den}" colorspace="709" />'
@@ -876,7 +1100,8 @@ def _video_frames(path: Path) -> int:
 def plan_windows(
     probe: Probe, settings: EditSettings, clip: tuple[int, int]
 ) -> list[tuple[int, int]]:
-    """Slow-motion windows as absolute source frames, clamped to the body of the clip."""
+    """Slow-motion windows as absolute source frames, clamped to the body of the
+    clip."""
     fps = probe.fps_num / probe.fps_den
     clip_lo, clip_n = clip
     trans = round(FADE_TRANSITION_SECONDS * fps)
@@ -912,29 +1137,29 @@ def edit_clip(
     settings: EditSettings | None = None,
     progress: ProgressFn | None = None,
 ) -> Path:
-    """Edit `original` (clip, watermarks, fades, slow motion) and render it to `output` with melt.
+    """Edit `original` (clip, watermarks, fades, slow motion) and render it to `output`
+    with melt.
 
     The editable Shotcut project is saved next to `output` as `<output stem>.mlt`.
 
-    Args:
-        original: Input video file.
-        output: Output video file. Must differ from `original`.
-        watermarks: Pairs of (image, corners); defaults to the always-used watermark alone.
-        fadein_image: Still image to fade in from, or None for no opening fade.
-        fadeout_image: Still image to fade out to, or None for no closing fade.
-        settings: Clip, slow-motion and smoothing settings. Its fade images are overridden by
-            the explicit fadein_image/fadeout_image arguments when those are given.
-        progress: Called with each progress message (also logged). None logs only.
+    Args:     original: Input video file.     output: Output video file. Must differ
+    from `original`.     watermarks: Pairs of (image, corners); defaults to the always-
+    used watermark alone.     fadein_image: Still image to fade in from, or None for no
+    opening fade.     fadeout_image: Still image to fade out to, or None for no closing
+    fade.     settings: Clip, slow-motion and smoothing settings. Its fade images are
+    overridden by         the explicit fadein_image/fadeout_image arguments when those
+    are given.     progress: Called with each progress message (also logged). None logs
+    only.
 
-    Returns:
-        The output path.
+    Returns:     The output path.
     """
     settings = settings or EditSettings()
     if watermarks is None:
         watermarks = [(ALWAYS_WATERMARK, ALWAYS_CORNERS)]
     fadein_image = fadein_image or settings.fadein_image
     fadeout_image = fadeout_image or settings.fadeout_image
-    # melt resolves relative resource paths against the project file's own directory, not the
+    # melt resolves relative resource paths against the project file's own
+    # directory, not the
     # caller's cwd, so every path written into the XML must be absolute.
     original = original.resolve()
     watermarks = [(image.resolve(), corners) for image, corners in watermarks]
@@ -957,12 +1182,16 @@ def edit_clip(
     windows = plan_windows(probe, settings, clip)
     clip_first, clip_frames = clip
     say(
-        f"recording is {probe.total_frames / fps:.2f}s; clip is {clip_frames / fps:.2f}s "
-        f"long, starting at {clip_first / fps:.2f}s ({probe.width}x{probe.height}, {fps:.3f} fps)"
+        f"recording is {probe.total_frames / fps:.2f}s; clip is {
+            clip_frames / fps:.2f}s "
+        f"long, starting at {clip_first / fps:.2f}s ({probe.width}x{probe.height}, {
+            fps:.3f} fps)"
     )
     for k, (start, end) in enumerate(windows, start=1):
         say(
-            f"slowdown {k}/{len(windows)}: clip {(start - clip_first) / fps:.2f}-{(end - clip_first) / fps:.2f}s "
+            f"slowdown {k}/{len(windows)}: clip "
+            f"{(start - clip_first) / fps:.2f}-"
+            f"{(end - clip_first) / fps:.2f}s "
             f"at {settings.speed}x"
         )
     if settings.slowdowns and not windows:
@@ -975,7 +1204,10 @@ def edit_clip(
 
     smoothed: list[Path | None] = [None] * len(windows)
     if settings.smoothing == "high" and windows:
-        say(f"smoothing {len(windows)} slowdown(s) with ffmpeg in parallel (high quality, slow)")
+        say(
+            f"smoothing {len(windows)} slowdown(s) with ffmpeg in parallel "
+            "(high quality, slow)"
+        )
 
         def smooth_one(item: tuple[int, tuple[int, int]]) -> Path:
             k, (start, end) = item
@@ -1028,21 +1260,28 @@ def edit_clip(
         if music_in + total_frames > music_len:
             say(
                 f"warning: soundtrack {soundtrack.name} ends after "
-                f"{(music_len - music_in) / fps:.1f}s from the start point; the rest of the video is silent"
+                f"{(music_len - music_in) / fps:.1f}s from the start point; "
+                "the rest of the video is silent"
             )
         say(f"soundtrack {soundtrack.name} from {settings.soundtrack_start:g}s")
 
-    # The project is kept next to the rendered video (<name>_watermarked.mlt) so it can be
+    # The project is kept next to the rendered video (<name>_watermarked.mlt) so
+    # it can be
     # opened in Shotcut and edited afterwards. It is never deleted.
     project_path = output.with_suffix(".mlt")
     project_path.write_text(xml, encoding="utf-8")
-    # The expected length, so the upload sync can tell a finished render from a truncated one
+    # The expected length, so the upload sync can tell a finished render from a
+    # truncated one
     # even when the clip was trimmed (and so is shorter than its original).
     output.with_suffix(".edit.json").write_text(
-        json.dumps({"expected_seconds": total_frames * probe.fps_den / probe.fps_num}) + "\n", encoding="utf-8"
+        json.dumps({"expected_seconds": total_frames * probe.fps_den / probe.fps_num})
+        + "\n",
+        encoding="utf-8",
     )
-    # Render to a temporary name and rename only when melt succeeds, so an interrupted render
-    # never leaves a truncated file under the final name (the upload sync would pick it up).
+    # Render to a temporary name and rename only when melt succeeds, so an
+    # interrupted render
+    # never leaves a truncated file under the final name (the upload sync
+    # would pick it up).
     temp_output = output.with_name(output.stem + ".rendering.mp4")
     cmd = [
         MELT,
@@ -1065,7 +1304,8 @@ def edit_clip(
         temp_output.unlink(missing_ok=True)
         raise
     except BaseException:
-        temp_output.unlink(missing_ok=True)  # e.g. the app was stopped mid-render
+        # e.g. the app was stopped mid-render
+        temp_output.unlink(missing_ok=True)
         raise
     os.replace(temp_output, output)
     say(f"wrote {output.name} in {time.monotonic() - started:.0f}s")
@@ -1073,7 +1313,8 @@ def edit_clip(
 
 
 def watermarks_for(image: str | None) -> list[tuple[Path, tuple[str, ...]]]:
-    """Return the always-used watermark, plus `image` (a file name) in IMAGE_CORNERS if given."""
+    """Return the always-used watermark, plus `image` (a file name) in IMAGE_CORNERS if
+    given."""
     watermarks = [(ALWAYS_WATERMARK, ALWAYS_CORNERS)]
     if image:
         watermarks.append((Path(image), IMAGE_CORNERS))
