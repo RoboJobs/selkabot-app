@@ -24,6 +24,8 @@ dependencies = [
     "boto3>=1.43.123",
     "python-dotenv>=1.2.4",
     "qrcode[pil]>=8.2",
+    "cython>=3.3.1",
+    "fairino",
 ]
 
 [dependency-groups]
@@ -42,6 +44,7 @@ exclude = [
 select = ["E", "F", "I"]
 
 [tool.uv.sources]
+fairino = { path = "third_party/fairino_sdk/linux" }
 torch = [
     { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]

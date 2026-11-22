@@ -14,3 +14,5 @@ codev/.update-hashes.json
 *.guard
 shotcut-mcp/*
 videos/*
+third_party/fairino_sdk/
+.codegraph/
