@@ -9,6 +9,7 @@ codev/.update-hashes.json
 *.FCBak
 .env
 *.pyc
+.coverage
 *.mlt
 *.guard
 shotcut-mcp/*

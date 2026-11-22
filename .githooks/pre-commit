@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+run_check() {
+    local description="$1"
+    shift
+
+    echo "==> $description"
+    if ! "$@"; then
+        echo "Pre-commit check failed: $description" >&2
+        exit 1
+    fi
+}
+
+python_files=()
+while IFS= read -r -d '' file; do
+    case "$file" in
+        *.py) python_files+=("$file") ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if ((${#python_files[@]} > 0)); then
+    run_check "Checking Python formatting" uv run ruff format --check "${python_files[@]}"
+    run_check "Running Ruff linter" uv run ruff check "${python_files[@]}"
+else
+    echo "==> No staged Python files; skipping Ruff checks"
+fi
+
+run_check "Running unit tests" \
+    uv run pytest \
+    --cov=sw.livestream \
+    --cov=sw.shotcut_watermark \
+    --cov=sw.shotcut_pipeline \
+    --cov-report=term-missing \
+    sw/tests/
