@@ -370,7 +370,7 @@ Signatures are binding for the implementer. Private helpers are free.
   - `level_rotation(pan_deg, tilt_deg) -> np.ndarray(3,3)`
   - `look_at_angles(pos, target) -> tuple[pan, tilt]` (raises `DegenerateTarget` for a zero vector; the validator reports the geometry limits)
   - `rotation_to_sdk_euler(R) -> (rx, ry, rz)` and `sdk_euler_to_rotation(rx, ry, rz) -> R`. The convention is the module constant `SDK_EULER = "xyz"`, set by Q1.
-  - `roll_error_deg(R) -> float`: the angle of x_cam out of the horizontal plane.
+  - `roll_error_deg(R) -> float`: roll about the optical axis relative to the level reference u = normalise(z_cam × z_base), which equals x_cam when the camera is level, measured about z_cam. Not "x_cam out of the horizontal plane": that metric scales a true roll by cos(tilt), which underestimates it for a tilted camera (found while implementing Phase 1).
   - `pointing_error_deg(R, pos, target) -> float`
   - `unwrap_deg(seq) -> list` (continuous unwrap used in target mode)
 - **`path.py`**
@@ -619,3 +619,23 @@ Signatures are binding for the implementer. Private helpers are free.
    - Delete the controller file and restart: "file missing on controller".
    - Unplug the robot's network during a motion: the watchdog stops it (or the app reports UNKNOWN) and the app still exits cleanly.
    - Interrupt a `publish` between steps 3 and 5: the app disables the motion, and re-running `publish` fixes it.
+
+## Phase 0 results (simulator, 192.168.58.2)
+
+Run on the Fairino simulator with the probes in `sw/robot/spike/`. The simulator behaves like the robot for the SDK calls below, but it does **not** reproduce trajectory playback or file storage, so several questions stay open and must be re-run on the real robot.
+
+| # | Result | Status |
+|---|---|---|
+| Q1 | Rotating J1 by +10° changed TCP rz by +9.98° and rotated the TCP xy by +9.98° about base z. The manual defines rx/ry/rz as rotations about **fixed** axes. Convention confirmed: scipy `"xyz"` (lowercase, extrinsic). Probe: `euler_probe.py`. | **Confirmed** |
+| Q2 | `TrajectoryJUpLoad` returned 0 for some files and -1 or a connection reset for others (flaky). `LoadTrajectoryJ` returned **8 for every file tried**, including a file that does not exist, for the Cartesian, joint, comma, tab, timed and headed formats. `GetTrajectoryStartPose` also returned 8. TPD recording (`tpd_record_probe.py`) needs manual mode plus drag-teach; with no hand motion it stored **zero points** and `LoadTPD` returned 0 with start pose zeros. Format undetermined. | **Blocked on simulator** |
+| Q3 | Depends on Q2 (no trajectory could be loaded). | **Blocked** |
+| Q4 | Depends on Q2. | **Blocked** |
+| Q5 | A `MoveJ` was running on connection A. A second connection B called `StopMotion`. The move ran to its target (J1 = 60.0°) and B's stop did not interrupt it. Two possibilities: the simulator serialises requests, so B's call waited behind A's move, or B's call was ignored. Either way, the independent stop channel is **not** demonstrated. Probe: `stop_channel_probe.py`. | **Failed in simulator; needs hardware test** |
+| Q6 | Needs trajectory playback or dense streaming. | **Blocked** |
+| Q7 | `ComputeFileMD5` returned error 4 with no hash for **every** path, including `test.lua`, which the controller lists. The controller-side hash is unusable on the simulator. | **Blocked on simulator** |
+| Q8 | Soft limits (deg): J1 ±175, J2 −265…85, J3 ±160, J4 −265…85, J5 ±175, J6 ±175. Install angle (0, 0). Tool 0 offset all zeros. State period 8 ms. Singularity thresholds not measured. | **Partial** |
+
+Other observations:
+- **Simulator speed is not real time.** At `SetSpeed(5)` a 60° joint move took more than two minutes. Speed limits from the manual cannot be checked on the simulator.
+- **Robot state at the end of Phase 0:** home pose, `robot_state` 1 (stopped), `motion_done` 1, error codes 0, auto mode.
+- **Consequence for the design:** the backend decision (A, B or C in § Backend and timing contract) cannot be made on the simulator. The stop-channel assumption (Threading / Stop and shutdown) is unverified and must be treated as failing until a hardware test shows otherwise. The design's fail-closed rule for the stop channel stays in force.

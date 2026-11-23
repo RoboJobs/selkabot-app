@@ -15,4 +15,11 @@ codev/.update-hashes.json
 shotcut-mcp/*
 videos/*
 third_party/fairino_sdk/
-.codegraph/
+.codegraph/# Robot motions: generated or machine-local files (see docs/design/feature)
+sw/robot/build/
+sw/robot/spike/out/
+sw/robot/logs/
+sw/robot/motions/*/validated.json
+sw/robot/motions/*/rehearsal*.csv
+sw/robot/motions/*/*.prev
+sw/robot/motions/*/*.tmp
