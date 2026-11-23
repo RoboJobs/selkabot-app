@@ -26,6 +26,8 @@ dependencies = [
     "qrcode[pil]>=8.2",
     "cython>=3.3.1",
     "fairino",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
