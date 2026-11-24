@@ -190,3 +190,6 @@ Fixtures:
 1. Gate green after every phase.
 2. Phase 0: H1 recorded; H2 shows the discontinuity is present in the recording and plays continuously; H3 (generated files, blend 1) plays continuously with no unexpected turns. H3 passing is a precondition for Phase 4.
 3. Phase 4: the portrait motion validates (roll within `max_roll_deg` of +90° at every sample), plays without "TPD command point error", and the GoPro preview shows portrait, right way up, level horizon. Landscape motions validate and play unchanged.
+
+## History (facts, not instructions)
+- **Phase 1 done (2026-11-25).** `pose` (roll in `level_rotation`, `roll_deviation_deg`, `rotation_angle_deg`, `pose_rotation_diff_deg`; the scipy gimbal-lock warning silenced), `level` (`roll` in `solve_wrist`/`level_keyframe`), `schema` (`format`, `CAMERA_ROLL_DEG`, `MotionConfig.format` + serializer), `path.to_sdk_pose(sample, roll_deg)`, `validate` (roll target in IK/keyframes/wrist solve/`check_roll`; `check_fk_roundtrip` on every sample by rotation and returning FK poses; cartesian pose columns = FK; `format` in `validated.json`). Test fixture `sw/tests/fakes/wrist_kinematics.py` (`WristFK`: spherical wrist, mount offset, a mount that makes portrait singular, alternate Euler triples). Phase 0 (operator) still pending.

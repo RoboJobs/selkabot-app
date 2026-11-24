@@ -7,11 +7,18 @@ of the optical axis). Because the image-right axis stays horizontal for every
 
 Frames: base B has z up. The camera tool frame has z = optical axis,
 x = image right, y = image down.
+
+"Level" means a constant roll about the optical axis: 0 for landscape, +90 for
+portrait (image-x points down the image plane, image-y is horizontal, to the
+left). Portrait poses sit near the SDK Euler singularity (ry = +/-90), where
+rx and rz are individually ill-defined, so orientations are compared as
+rotations (rotation_angle_deg), never Euler angle by angle.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Sequence
 
 import numpy as np
@@ -46,9 +53,13 @@ def _rx(deg: float) -> np.ndarray:
     return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
 
 
-def level_rotation(pan_deg: float, tilt_deg: float) -> np.ndarray:
-    """Camera-to-base rotation for a pan and tilt, with zero roll."""
-    return _rz(pan_deg) @ _R_LEVEL0 @ _rx(tilt_deg)
+def level_rotation(
+    pan_deg: float, tilt_deg: float, roll_deg: float = 0.0
+) -> np.ndarray:
+    """Camera-to-base rotation for a pan and tilt and a constant roll about
+    the optical axis (0 = landscape, 90 = portrait). The roll factor turns the
+    camera about its own z, so the optical axis (pan, tilt) is unchanged."""
+    return _rz(pan_deg) @ _R_LEVEL0 @ _rx(tilt_deg) @ _rz(roll_deg)
 
 
 def look_at_angles(
@@ -89,6 +100,30 @@ def roll_error_deg(rotation: np.ndarray) -> float:
     return math.degrees(math.atan2(sin_roll, cos_roll))
 
 
+def wrap_deg(angle: float) -> float:
+    """Wrap an angle to (-180, 180]."""
+    wrapped = (angle + 180.0) % 360.0 - 180.0
+    return 180.0 if wrapped == -180.0 else wrapped
+
+
+def roll_deviation_deg(rotation: np.ndarray, target_roll_deg: float) -> float:
+    """Signed roll error relative to the wanted roll, wrapped to (-180, 180]."""
+    return wrap_deg(roll_error_deg(rotation) - target_roll_deg)
+
+
+def rotation_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    """Angle (deg) of the rotation taking `a` to `b`. Independent of how the
+    rotations were written as Euler angles."""
+    return math.degrees(Rotation.from_matrix(a.T @ b).magnitude())
+
+
+def pose_rotation_diff_deg(pose_a: Sequence[float], pose_b: Sequence[float]) -> float:
+    """rotation_angle_deg between the orientations of two SDK poses."""
+    return rotation_angle_deg(
+        sdk_euler_to_rotation(*pose_a[3:6]), sdk_euler_to_rotation(*pose_b[3:6])
+    )
+
+
 def pointing_error_deg(
     rotation: np.ndarray, pos: Sequence[float], target: Sequence[float]
 ) -> float:
@@ -104,8 +139,14 @@ def pointing_error_deg(
 
 
 def rotation_to_sdk_euler(rotation: np.ndarray) -> tuple[float, float, float]:
-    """SDK (rx, ry, rz) in degrees for a rotation matrix."""
-    rx, ry, rz = Rotation.from_matrix(rotation).as_euler(SDK_EULER, degrees=True)
+    """SDK (rx, ry, rz) in degrees for a rotation matrix.
+
+    At ry = +/-90 (portrait camera looking horizontally) only rx - rz (or
+    rx + rz) is defined; scipy then sets rz = 0 and warns. That is a valid
+    representation of the same rotation, so the warning is silenced."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Gimbal lock detected")
+        rx, ry, rz = Rotation.from_matrix(rotation).as_euler(SDK_EULER, degrees=True)
     return float(rx), float(ry), float(rz)
 
 

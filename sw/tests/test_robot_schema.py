@@ -188,7 +188,8 @@ def test_motion_config_round_trips_through_json(tmp_path):
     path = tmp_path / "motion.json"
     path.write_text(json.dumps(raw))
     config = schema.load_motion_config(path)
-    assert schema.motion_config_to_dict(config) == raw
+    # A file without 'format' loads as landscape and is written back with it.
+    assert schema.motion_config_to_dict(config) == {**raw, "format": "landscape"}
 
 
 @pytest.mark.parametrize(
@@ -339,3 +340,61 @@ def test_joints_and_seed_are_rejected_in_cartesian_mode(key):
     with pytest.raises(schema.SchemaError) as exc:
         schema.design_from_dict(raw, "demo")
     assert exc.value.field == f"keyframes[1].{key}"
+
+
+# -- format (D11: landscape / portrait) ---------------------------------------
+
+
+def test_format_defaults_to_landscape():
+    d = schema.design_from_dict(ANGLES, "demo")
+    assert d.format == "landscape"
+    assert d.camera_roll_deg == 0.0
+
+
+@pytest.mark.parametrize("base", [ANGLES, TARGET, JOINT])
+def test_portrait_format_in_every_mode(base):
+    raw = _mutate(base, lambda r: r.update(format="portrait"))
+    d = schema.design_from_dict(raw, "demo")
+    assert d.format == "portrait"
+    assert d.camera_roll_deg == 90.0
+
+
+def test_unknown_format_is_rejected():
+    raw = _mutate(ANGLES, lambda r: r.update(format="square"))
+    with pytest.raises(schema.SchemaError) as exc:
+        schema.design_from_dict(raw, "demo")
+    assert exc.value.field == "format"
+
+
+def test_motion_config_without_format_loads_as_landscape(tmp_path):
+    path = tmp_path / "motion.json"
+    path.write_text(json.dumps(_motion_dict()))
+    assert schema.load_motion_config(path).format == "landscape"
+
+
+def test_portrait_motion_config_round_trips(tmp_path):
+    raw = _motion_dict(format="portrait")
+    path = tmp_path / "motion.json"
+    path.write_text(json.dumps(raw))
+    config = schema.load_motion_config(path)
+    assert config.format == "portrait"
+    assert schema.motion_config_to_dict(config) == raw
+
+
+def test_motion_config_with_unknown_format_is_rejected(tmp_path):
+    path = tmp_path / "motion.json"
+    path.write_text(json.dumps(_motion_dict(format="square")))
+    with pytest.raises(schema.SchemaError) as exc:
+        schema.load_motion_config(path)
+    assert exc.value.field == "format"
+
+
+def test_committed_motion_json_still_loads():
+    from pathlib import Path
+
+    meta = (
+        Path(__file__).resolve().parents[1]
+        / "robot/motions/up_down_horizontal/motion.json"
+    )
+    config = schema.load_motion_config(meta)
+    assert config.format == "landscape"

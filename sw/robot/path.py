@@ -185,8 +185,9 @@ def sample_path(design: Design) -> list[Sample]:
     return samples
 
 
-def to_sdk_pose(sample: Sample) -> list[float]:
-    """SDK pose [x, y, z, rx, ry, rz] of the camera tool in the base frame."""
-    rotation = level_rotation(sample.pan, sample.tilt)
+def to_sdk_pose(sample: Sample, roll_deg: float = 0.0) -> list[float]:
+    """SDK pose [x, y, z, rx, ry, rz] of the camera tool in the base frame,
+    with a constant roll about the optical axis (0 landscape, 90 portrait)."""
+    rotation = level_rotation(sample.pan, sample.tilt, roll_deg)
     rx, ry, rz = rotation_to_sdk_euler(rotation)
     return [*sample.pos, rx, ry, rz]

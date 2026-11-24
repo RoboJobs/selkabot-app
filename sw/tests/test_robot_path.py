@@ -233,3 +233,12 @@ def test_sdk_pose_has_six_values_and_the_position_of_the_sample():
     pose6 = path.to_sdk_pose(s)
     assert len(pose6) == 6
     assert pose6[:3] == pytest.approx(list(s.pos))
+
+
+def test_to_sdk_pose_with_portrait_roll():
+    s = path.Sample(0.0, (500.0, 100.0, 300.0), 25.0, -10.0, None)
+    landscape, portrait = path.to_sdk_pose(s), path.to_sdk_pose(s, 90.0)
+    assert landscape == path.to_sdk_pose(s, 0.0)  # default unchanged
+    assert portrait[:3] == landscape[:3]
+    pan, tilt, roll = pose.camera_angles(*portrait[3:])
+    assert (pan, tilt, roll) == pytest.approx((25.0, -10.0, 90.0), abs=1e-6)

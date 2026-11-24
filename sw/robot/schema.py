@@ -20,6 +20,10 @@ ALLOWED_PERIODS_MS = (2, 4, 8)
 MAX_ABS_TILT_DEG = 85.0
 BACKENDS = ("tpd",)
 INTERPOLATIONS = ("cartesian", "joint")
+# Constant camera roll about the optical axis per format (D11). Portrait is
+# reached with the wrist; the camera stays the same tool.
+CAMERA_ROLL_DEG = {"landscape": 0.0, "portrait": 90.0}
+DEFAULT_FORMAT = "landscape"
 ANGLE_VEL_CHANNELS = ("x", "y", "z", "pan", "tilt")
 TARGET_VEL_CHANNELS = ("x", "y", "z", "tx", "ty", "tz")
 
@@ -102,7 +106,8 @@ class Limits:
     min_wrist_margin_deg: float = 15.0  # cartesian mode: |J5| away from 0/180
     min_elbow_margin_deg: float = 5.0  # cartesian mode: |J3| away from 0 (straight)
     overshoot_pct: float = 2.0
-    max_roll_deg: float = 0.5  # joint mode only; cartesian mode is level exactly
+    # Max deviation from the format's roll (0 landscape, 90 portrait).
+    max_roll_deg: float = 0.5
     max_pointing_error_deg: float = 0.1
     min_segment_s: float = 0.05
 
@@ -125,6 +130,17 @@ class Design:
     limits: Limits = Limits()
     interpolation: str = "cartesian"  # "cartesian" or "joint"
     ramp_fraction: float | None = None  # joint mode: cruise profile, see joint_path
+    format: str = DEFAULT_FORMAT  # "landscape" or "portrait" (D11)
+
+    @property
+    def camera_roll_deg(self) -> float:
+        return CAMERA_ROLL_DEG[self.format]
+
+
+def _format(raw: Any, path: object) -> str:
+    if raw not in CAMERA_ROLL_DEG:
+        raise SchemaError(path, "format", f"must be one of {tuple(CAMERA_ROLL_DEG)}")
+    return raw
 
 
 def _keyframe(
@@ -287,6 +303,7 @@ def design_from_dict(
         raise SchemaError(path, "<root>", "must be a mapping")
     allowed = {
         "name",
+        "format",
         "tool_id",
         "user_id",
         "interpolation",
@@ -382,6 +399,7 @@ def design_from_dict(
         limits,
         interpolation,
         ramp,
+        _format(raw.get("format", DEFAULT_FORMAT), path),
     )
 
 
@@ -481,6 +499,7 @@ class MotionConfig:
     approved_ovl: int
     design_sha256: str
     published_at: str
+    format: str = DEFAULT_FORMAT  # optional in motion.json; missing = landscape
 
     def check_consistent(self, path: object = "motion.json") -> None:
         """Reject cross-field inconsistencies. Raises SchemaError."""
@@ -509,6 +528,10 @@ class MotionConfig:
             raise SchemaError(path, "start_joints", "expected 6 values")
         if len(self.start_pose) != 6:
             raise SchemaError(path, "start_pose", "expected 6 values")
+        if self.format not in CAMERA_ROLL_DEG:
+            raise SchemaError(
+                path, "format", f"must be one of {tuple(CAMERA_ROLL_DEG)}"
+            )
 
 
 def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
@@ -533,6 +556,7 @@ def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
         approved_ovl=int(raw["approved_ovl"]),
         design_sha256=str(raw["design_sha256"]),
         published_at=str(raw["published_at"]),
+        format=str(raw.get("format", DEFAULT_FORMAT)),
     )
     config.check_consistent(path)
     return config
@@ -542,6 +566,7 @@ def motion_config_to_dict(config: MotionConfig) -> dict[str, Any]:
     out = {k: getattr(config, k) for k in MOTION_FILE_KEYS}
     for key in ("start_joints", "start_pose"):
         out[key] = list(out[key])
+    out["format"] = config.format  # optional key, not in MOTION_FILE_KEYS
     return out
 
 

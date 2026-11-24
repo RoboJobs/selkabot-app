@@ -59,9 +59,13 @@ def solve_wrist(
     pan: float,
     tilt: float,
     wrist_guess: list[float] | None = None,
+    roll: float = 0.0,
 ) -> list[float]:
-    """J4-J6 that make the camera level with the given pan and tilt, keeping
-    J1-J3 of `joints`. Returns the full joint vector; raises LevelError."""
+    """J4-J6 that put the camera at the given pan and tilt with a constant
+    roll about its optical axis (0 = landscape, 90 = portrait), keeping J1-J3
+    of `joints`. Returns the full joint vector; raises LevelError when the
+    orientation cannot be reached. A singular wrist (J5 near 0/180) may still
+    succeed here: rejecting it is validate.check_wrist_singularity's job."""
     if abs(tilt) > MAX_ABS_TILT_DEG:
         raise LevelError(
             f"tilt {tilt:.1f}deg is too close to vertical for a level horizon"
@@ -70,7 +74,7 @@ def solve_wrist(
 
     def residual(wrist):
         p, t, r = camera_angles(*fk([*arm, *wrist])[3:])
-        return [r, _wrap(p - pan), t - tilt]
+        return [_wrap(r - roll), _wrap(p - pan), t - tilt]
 
     start = list(wrist_guess) if wrist_guess is not None else list(joints[3:])
     sol = least_squares(residual, start, diff_step=DIFF_STEP, xtol=1e-10, ftol=1e-10)
@@ -84,15 +88,21 @@ def solve_wrist(
 
 
 def level_keyframe(
-    fk: FK, joints: list[float], pan: float | None = None, tilt: float | None = None
+    fk: FK,
+    joints: list[float],
+    pan: float | None = None,
+    tilt: float | None = None,
+    roll: float = 0.0,
+    wrist_guess: list[float] | None = None,
 ) -> LevelResult:
-    """Level a captured keyframe. pan/tilt default to where the camera already
-    points, so the framing is kept and only the roll is removed."""
+    """Level a captured keyframe to `roll` (0 landscape, 90 portrait). pan/tilt
+    default to where the camera already points, so the viewing direction is
+    kept; the camera itself may move (moved_mm), since it sits off the flange."""
     before = list(fk(joints))
     pan0, tilt0, roll0 = camera_angles(*before[3:])
     pan = pan0 if pan is None else pan
     tilt = tilt0 if tilt is None else tilt
-    leveled = solve_wrist(fk, joints, pan, tilt)
+    leveled = solve_wrist(fk, joints, pan, tilt, wrist_guess, roll)
     after = list(fk(leveled))
     p, t, _r = camera_angles(*after[3:])
     return LevelResult(

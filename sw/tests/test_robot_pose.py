@@ -4,6 +4,7 @@ import math
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from sw.robot import pose
 
@@ -130,3 +131,68 @@ def test_camera_angles_reads_pan_tilt_and_roll():
     )
     pan, tilt, roll = pose.camera_angles(*pose.rotation_to_sdk_euler(rolled))
     assert (pan, tilt, roll) == pytest.approx((30.0, -12.0, 5.0), abs=1e-9)
+
+
+# -- portrait (constant roll 90) ----------------------------------------------
+
+
+def test_portrait_axes_at_pan_0_tilt_0():
+    r = pose.level_rotation(0.0, 0.0, 90.0)
+    np.testing.assert_allclose(r[:, 0], [0, 0, -1], atol=1e-12)  # image-x down
+    np.testing.assert_allclose(r[:, 1], [0, 1, 0], atol=1e-12)  # image-y left
+    np.testing.assert_allclose(r[:, 2], [1, 0, 0], atol=1e-12)  # optical axis
+
+
+def test_portrait_roll_is_90_for_every_pan_and_tilt():
+    rng = np.random.default_rng(7)
+    for _ in range(1000):
+        pan, tilt = rng.uniform(-180, 180), rng.uniform(-80, 80)
+        r = pose.level_rotation(pan, tilt, 90.0)
+        assert pose.roll_error_deg(r) == pytest.approx(90.0, abs=1e-9)
+        assert abs(r[:, 1] @ [0, 0, 1]) < 1e-12  # image-y horizontal
+        assert r[:, 0] @ [0, 0, 1] < 0  # image-x points (projected) down
+        np.testing.assert_allclose(r[:, 2], pose.level_rotation(pan, tilt)[:, 2])
+        np.testing.assert_allclose(r.T @ r, np.eye(3), atol=1e-12)
+        assert np.linalg.det(r) == pytest.approx(1.0)
+
+
+def test_roll_zero_matches_the_two_argument_form():
+    for pan, tilt in [(0, 0), (30, -12), (-170, 45)]:
+        np.testing.assert_array_equal(
+            pose.level_rotation(pan, tilt, 0.0), pose.level_rotation(pan, tilt)
+        )
+
+
+def test_roll_deviation_is_signed_and_wrapped():
+    def rolled(roll):
+        return pose.level_rotation(20, 10, roll)
+
+    assert pose.roll_deviation_deg(rolled(90), 90) == pytest.approx(0, abs=1e-9)
+    assert pose.roll_deviation_deg(rolled(179), -179) == pytest.approx(-2, abs=1e-9)
+    assert pose.roll_deviation_deg(rolled(-179), 179) == pytest.approx(2, abs=1e-9)
+    assert pose.roll_deviation_deg(rolled(-90), 90) == pytest.approx(180, abs=1e-9)
+
+
+def test_rotation_angle_deg():
+    rz37 = Rotation.from_euler("z", 37, degrees=True).as_matrix()
+    a = pose.level_rotation(15, 5, 90)
+    assert pose.rotation_angle_deg(a, a) == pytest.approx(0, abs=1e-9)
+    assert pose.rotation_angle_deg(np.eye(3), rz37) == pytest.approx(37)
+    assert pose.rotation_angle_deg(rz37, np.eye(3)) == pytest.approx(37)
+
+
+def test_portrait_euler_round_trip_is_the_same_rotation_at_the_singularity():
+    r = pose.level_rotation(40.0, 0.0, 90.0)  # ry = 90: Euler singularity
+    rx, ry, rz = pose.rotation_to_sdk_euler(r)  # no warning escapes
+    assert abs(ry) == pytest.approx(90, abs=1e-6)
+    back = pose.sdk_euler_to_rotation(rx, ry, rz)
+    assert pose.rotation_angle_deg(r, back) < 1e-6
+
+
+@pytest.mark.parametrize("tilt", [0.0, 5.0, -5.0, 30.0, -30.0])
+def test_camera_angles_of_portrait_poses_near_the_singularity(tilt):
+    euler = pose.rotation_to_sdk_euler(pose.level_rotation(-25.0, tilt, 90.0))
+    pan, t, roll = pose.camera_angles(*euler)
+    assert pan == pytest.approx(-25.0, abs=1e-6)
+    assert t == pytest.approx(tilt, abs=1e-6)
+    assert roll == pytest.approx(90.0, abs=1e-6)
