@@ -70,6 +70,9 @@ class FakeRobotClient:
         self.move_j_calls: list[tuple[list[float], int, int, float]] = []
         self.speeds: list[int] = []
         self.modes: list[int] = []
+        self.servo_j_calls: list[tuple[list[float], list[float], float]] = []
+        self.servo_move_started = False
+        self.servo_move_ended = False
 
         self.install_angle: list[float] = [0.0, 0.0]
         self.soft_limits: list[float] = [
@@ -222,3 +225,32 @@ class FakeRobotClient:
 
     def CloseRPC(self) -> None:
         self.closed = True
+
+    # -- servo streaming (D9, simulator preview only) -----------------------
+
+    def ServoMoveStart(self) -> int:
+        self._record("ServoMoveStart", (), {})
+        code = self._err("ServoMoveStart")
+        if code:
+            return code
+        self.servo_move_started = True
+        return 0
+
+    def ServoMoveEnd(self) -> int:
+        self._record("ServoMoveEnd", (), {})
+        code = self._err("ServoMoveEnd")
+        if code:
+            return code
+        self.servo_move_ended = True
+        return 0
+
+    def ServoJ(
+        self, joint_pos: list[float], axisPos: list[float], cmdT: float = 0.008
+    ) -> int:
+        self._record("ServoJ", (joint_pos, axisPos), {"cmdT": cmdT})
+        code = self._err("ServoJ")
+        if code:
+            return code
+        self.servo_j_calls.append((list(joint_pos), list(axisPos), cmdT))
+        self.robot_state_pkg.jt_cur_pos = list(joint_pos)
+        return 0

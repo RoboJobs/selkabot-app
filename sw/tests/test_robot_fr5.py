@@ -173,6 +173,65 @@ def test_move_tpd_calls_with_blend_and_ovl(robot, client):
     assert client.move_tpd_calls == [("traj/motion_demo", 0, 50)]
 
 
+# -- stream_joints (D9, simulator preview only) -----------------------------
+
+
+def test_stream_joints_calls_servo_move_start_and_end(robot, client, monkeypatch):
+    monkeypatch.setattr(fr5.time, "sleep", lambda s: None)
+    rows = [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]]
+    robot.stream_joints(rows, period_s=0.008)
+    assert client.servo_move_started
+    assert client.servo_move_ended
+
+
+def test_stream_joints_sends_one_servo_j_per_row_with_zero_axis_pos(
+    robot, client, monkeypatch
+):
+    monkeypatch.setattr(fr5.time, "sleep", lambda s: None)
+    rows = [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]]
+    robot.stream_joints(rows, period_s=0.008)
+    assert client.servo_j_calls == [
+        ([1, 2, 3, 4, 5, 6], [0.0, 0.0, 0.0, 0.0], 0.008),
+        ([7, 8, 9, 10, 11, 12], [0.0, 0.0, 0.0, 0.0], 0.008),
+    ]
+
+
+def test_stream_joints_passes_the_rows_own_period_as_cmdt(robot, client, monkeypatch):
+    monkeypatch.setattr(fr5.time, "sleep", lambda s: None)
+    robot.stream_joints([[0.0] * 6], period_s=0.002)
+    assert client.servo_j_calls[0][2] == 0.002
+
+
+def test_stream_joints_sleeps_period_scaled_by_ovl(robot, client, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(fr5.time, "sleep", lambda s: sleeps.append(s))
+    robot.stream_joints([[0.0] * 6, [0.0] * 6], period_s=0.008, ovl=50)
+    # At ovl=50 the sleep between rows is twice the file's own period, minus
+    # the (tiny, real) time the ServoJ call itself took.
+    assert sleeps and sleeps[0] == pytest.approx(0.016, abs=2e-3)
+
+
+def test_stream_joints_servo_move_end_runs_even_if_a_servo_j_fails(
+    robot, client, monkeypatch
+):
+    monkeypatch.setattr(fr5.time, "sleep", lambda s: None)
+    client.errors["ServoJ"] = -1
+    with pytest.raises(fr5.FairinoError):
+        robot.stream_joints([[0.0] * 6], period_s=0.008)
+    assert client.servo_move_started
+    assert client.servo_move_ended
+
+
+def test_stream_joints_never_calls_servo_jt(robot, client, monkeypatch):
+    """ServoJT (torque control) must never be used for preview; FakeRobotClient
+    does not even implement it, so a mistaken call raises AttributeError."""
+    monkeypatch.setattr(fr5.time, "sleep", lambda s: None)
+    robot.stream_joints([[0.0] * 6], period_s=0.008)
+    assert not hasattr(client, "ServoJT") or "ServoJT" not in [
+        c[0] for c in client.calls
+    ]
+
+
 # -- TPD loading --------------------------------------------------------
 
 

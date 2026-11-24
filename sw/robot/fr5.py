@@ -68,6 +68,11 @@ class RobotClient(Protocol):
     ) -> int: ...
     def StopMotion(self) -> int: ...
     def CloseRPC(self) -> None: ...
+    def ServoMoveStart(self) -> int: ...
+    def ServoMoveEnd(self) -> int: ...
+    def ServoJ(
+        self, joint_pos: list[float], axisPos: list[float], cmdT: float = 0.008
+    ) -> int: ...
 
 
 def _call(client: RobotClient, name: str, *args: Any, **kwargs: Any) -> Any:
@@ -202,6 +207,31 @@ class FR5:
 
     def stop(self) -> None:
         _call(self.client, "StopMotion")
+
+    def stream_joints(
+        self, rows: list[list[float]], period_s: float, ovl: int = 100
+    ) -> None:
+        """Simulator preview only (D9): replay `rows` (6 joint angles each)
+        with ServoJ, one row per call, paced by `period_s * 100 / ovl`.
+
+        This is a preview, not the production path: it does not use
+        LoadTPD/MoveTPD or exercise the controller's own TPD interpolation.
+        Never ServoJT (torque control) -- see the design doc, "Simulator
+        playback via ServoJ".
+        """
+        sleep_s = period_s * 100.0 / ovl
+        axis_pos = [0.0, 0.0, 0.0, 0.0]
+        _call(self.client, "ServoMoveStart")
+        try:
+            for row in rows:
+                start = time.monotonic()
+                _call(self.client, "ServoJ", row, axis_pos, cmdT=period_s)
+                elapsed = time.monotonic() - start
+                remaining = sleep_s - elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
+        finally:
+            _call(self.client, "ServoMoveEnd")
 
     # -- TPD loading --------------------------------------------------------
 

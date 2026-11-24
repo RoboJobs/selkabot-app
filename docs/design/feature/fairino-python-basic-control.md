@@ -31,6 +31,7 @@ Terminology: a **motion** is one named trajectory, e.g. `sweep_left_fast`. Avoid
 | `MoveJ` and other motion commands | Accepted, but a second connection's `StopMotion` did not reliably interrupt a running `MoveJ` (§ History) — treat stop as unverified on the sim | Works; needs operator YES |
 | `FR5.upload_file` (`FileUpload` + port 20010) | **Fails.** The sim does not open the data port the same way; every attempt returned -1 even with the retrying protocol (§ History) | Works (verified end to end) |
 | `LoadTPD`, `GetTPDStartPose`, `MoveTPD` | **Does not play trajectories.** `LoadTPD` may return 0 but the controller does not store or run files the same way | Works (verified end to end) |
+| `ServoJ` (joint-space servo streaming) | Expected to work like any other motion command (same row as `MoveJ`) — this is how a generated TPD file is previewed on the sim, since upload/`MoveTPD` are unavailable there (§ Simulator playback via ServoJ) | Not used; `MoveTPD` is the production path |
 
 Consequences for implementation and testing:
 - Every `motionctl` command defaults to `--ip 192.168.50.2`. Only `upload`, `play` and `publish` (and the Phase 4/5 robot acceptance steps) require `--ip 192.168.58.2`, and those three commands are run **only by the operator**, never unattended.
@@ -48,6 +49,7 @@ Consequences for implementation and testing:
 | D6 | Joint values in the file come from the controller's IK (`GetInverseKinRef`, seeded with the previous sample). The pose columns are the planned pose. | File joints and poses must agree. We don't know which of the two `MoveTPD` uses, so both must be right. |
 | D7 | Keep motions **≤ 20 s** for now. | The verified recording is 23 s (11520 points at 2 ms, 1.3 MB). |
 | D8 | Safety minimum: operator YES prompt before any motion; move to start at 10% speed; `StopMotion` on Ctrl-C, Stop, close or error; controller collision detection stays on. **The physical e-stop is the primary safety device.** | — |
+| D9 | The sim preview (`motionctl simplay`) streams a compiled TPD file's joints with `ServoJ`, one row per call, timed by the file's own period. **Never `ServoJT` (torque control).** | `ServoJ` is a direct joint-position stream, the closest thing to "replay this file" the sim can do, since `upload`/`MoveTPD` don't work there (§ Simulator vs real robot). `ServoJT` has no position reference; using it to track a trajectory needs a PD controller we have not built and do not need for visualization. |
 
 ## TPD file format (binding)
 Verified by playing `sw/tracktestpc.txt` (a copy of a pendant recording) from Python. Generated files must match it exactly, field for field.
@@ -67,6 +69,15 @@ Verified by playing `sw/tracktestpc.txt` (a copy of a pendant recording) from Py
   11520,1,2,0,0,0
   91.2883,-121.5264,129.4355,-98.2465,-89.9802,0.0237,135.9624,-268.4651,361.4536,-179.6626,0.0199,-178.7353,2,0,17
   ```
+
+## Simulator playback via ServoJ (D9)
+Previewing a compiled TPD file end to end (upload, `LoadTPD`, `MoveTPD`) only works on the real robot (§ Simulator vs real robot). To see a generated motion move on the sim before ever touching the real robot, `motionctl simplay` reads the compiled file's joint columns and streams them with `ServoJ`, one row per call, which is a real SDK motion primitive (not a visualization hack) and works on the sim the same as `MoveJ` does.
+
+- `ServoJ(joint_pos, axis_pos, cmdT=period_s)` in `fairino/Robot.py:1581`. `axis_pos` is the external-axis position, always `[0,0,0,0]` for us (no external axes). `cmdT` defaults to 0.008s; the manual's "recommended range [0.001~0.0016]" is for the controller-side command cycle and is not what paces playback — **the SDK's own example (`example/servo.py`) paces calls from the client with `time.sleep(cmdT)` between `ServoJ` calls**, which is what `simplay` does: `cmdT` is passed through unchanged so the controller's internal interpolation matches the inter-call spacing.
+- Sequence: `ServoMoveStart()`; for each row, `ServoJ(row_joints, [0,0,0,0], cmdT=period_s)`, then sleep `period_s` (minus the call's own elapsed time, clamped to ≥ 0, so drift doesn't accumulate); `ServoMoveEnd()` in a `finally`, even on an error or Ctrl-C.
+- **Never `ServoJT`** (joint torque control, D9). It has no position reference of its own; replaying a position trajectory with it needs a PD controller we have not built, which is a different and riskier project, not a visualization tool.
+- This is a **preview only**. It does not exercise `LoadTPD`/`MoveTPD`, the controller's own TPD interpolation, or the upload path, so it cannot stand in for the Phase 4 real-robot acceptance test. Its purpose is to let the implementer and the operator see a generated motion move, and sanity-check the level horizon and timing, before spending real-robot time on it.
+- `FR5.stream_joints(rows, period_s, ovl=100)` (new in `fr5.py`) wraps the sequence above. `motionctl simplay NAME [--ovl N] [--ip IP]` (default sim) reads `sw/robot/build/motion_<name>.txt` (or compiles it first if missing) and calls it; `--ovl` scales the inter-row sleep (not `cmdT`, which stays at the file's period) the same way `ovl` scales `MoveTPD`, so a sim preview at `--ovl 50` takes twice as long as the planned duration.
 
 ## Robot call reference
 All are methods of `fairino.Robot.RPC`. Only `sw/robot/fr5.py` may call them (§ Package map).
@@ -88,6 +99,7 @@ All are methods of `fairino.Robot.RPC`. Only `sw/robot/fr5.py` may call them (§
 | Speed | `SetSpeed(pct)` | Global and persistent; there is no getter. |
 | Move to start | `MoveJ(start_joints, tool_id, 0, vel=pct)` | Blocking by default (`blendT=-1`). |
 | Play | `MoveTPD("traj/motion_<name>", 0, ovl)` | blend 0 = no smoothing; `ovl` = speed scale 0–100. |
+| Sim preview (D9) | `ServoMoveStart()`; repeated `ServoJ(joints6, [0,0,0,0], cmdT=period_s)`; `ServoMoveEnd()` | Client paces calls with `time.sleep(period_s)`, as the SDK's own example does. Not used on the real robot. |
 | Stop | `StopMotion()` | |
 | State (cache, never blocks) | `robot_state_pkg`: `jt_cur_pos`, `tl_cur_pos`, `motion_done`, `mc_queue_len`, `robot_mode`, `main_code`, `sub_code`, `tool` | Refreshed by the SDK's state thread (port 20004). |
 
@@ -314,6 +326,7 @@ Signatures are binding. Private helpers are free.
     - `move_j(joints, tool_id, vel_pct)` (blocking)
     - `upload_file(local_path, file_type=20) -> str`, `file_md5(remote_path) -> str | None` (None = not found), `delete_traj(filename)`
     - `load_tpd(name)`, `tpd_start_pose(name) -> list[float]`, `move_tpd(name, blend, ovl)`, `stop()`
+    - `stream_joints(rows: list[list[float]], period_s: float, ovl: int = 100)` (D9, sim preview): `ServoMoveStart()`; for each row, `ServoJ(row, [0,0,0,0], cmdT=period_s)` then sleep `period_s * 100/ovl` (clamped to ≥ 0 after subtracting the call's own elapsed time); `ServoMoveEnd()` in `finally`. Never `ServoJT`.
 - **`motionctl.py`** (Phase 4, `publish`/`list` in Phase 5): `uv run python -m sw.robot.motionctl <cmd> …`:
   - `new NAME --template sweep|crane|orbit|push_in|first_test`
   - All commands take `--ip IP`, default `192.168.50.2` (the simulator; § Simulator vs real robot). `upload`, `play` and `publish` need `--ip 192.168.58.2` and operator confirmation; they refuse to run against the default sim IP since they need the real file/motion services.
@@ -321,6 +334,7 @@ Signatures are binding. Private helpers are free.
   - `plan NAME`: sample count, duration, peak TCP speed (no robot).
   - `validate NAME [--ip IP]` (default sim): IK on the controller (no motion), writes `validated.json`.
   - `compile NAME`: writes `sw/robot/build/motion_<name>.txt`; refuses if `validated.json` is missing or its `design_sha256` is stale.
+  - `simplay NAME [--ovl N] [--ip IP]` (default sim; § Simulator playback via ServoJ, D9): reads the compiled file (compiles first if missing), moves to the start pose with `move_j` at `move_to_start_speed_pct`, then `stream_joints`. Preview only; never the production path. Not restricted to the sim IP (harmless on the real robot too, but there is no reason to run it there instead of `play`).
   - `upload NAME --ip 192.168.58.2`: `upload_file`, `LoadTPD`, `GetTPDStartPose` equals the first row's pose (tolerance 0.01). No motion. **Real robot only; refuses the sim IP.** On `FileTransferError`, print the local build path and stop — do not retry; ask the operator to upload manually.
   - `play NAME --ovl N --ip 192.168.58.2`: the robot test (see Phase 4). **Real robot only; refuses the sim IP** (it does not play TPD trajectories). Requires operator YES.
   - `publish NAME --ovl N --ip 192.168.58.2`: **real robot only**, operator-run. `list` (no `--ip`, reads only local `motion.json` files).
@@ -362,7 +376,8 @@ Small, mechanical. Tasks:
 - Done when: the gate passes.
 
 ### Phase 4: TPD writer, `motionctl`, first robot test ← **milestone**
-- Work: `tpd_file.py`; `motionctl` commands `new`, `pose`, `plan`, `validate`, `compile`, `upload`, `play`.
+- Work: `tpd_file.py`; `motionctl` commands `new`, `pose`, `plan`, `validate`, `compile`, `simplay`, `upload`, `play`; `FR5.stream_joints` (D9).
+- Use `simplay` on the simulator to see a generated motion move and sanity-check timing and the level horizon **before** spending real-robot time (recommended, not required): `motionctl new`, `validate`, `compile`, then `simplay NAME --ovl 25`.
 - `play NAME --ovl N` sequence (copy `sw/fairino_basic_query.py`):
   1. Check the local build file's MD5 equals the controller's (`file_md5`); if not, tell the operator to run `upload`.
   2. `load_tpd(tpd_name)`; `tpd_start_pose` equals the first row's pose (0.01).
@@ -371,7 +386,7 @@ Small, mechanical. Tasks:
   5. `Press Enter to play:`. Then `load_tpd` again (cheap insurance), `move_tpd(tpd_name, 0, N)`. Print how long `move_tpd` took to return.
   6. Wait for completion as in § Motion runner, with the watchdog; print the elapsed time vs `duration_s · 100 / N`.
   7. Ctrl-C at any point → `stop()`. Always reset speed and `close()` in `finally`.
-- Tests: `sw/tests/test_robot_tpd_file.py`: write → read round trip; header `N,1,8,0,0,0` and rows ending `8,0,17` for period 8 and tool 0; header `N,1,2,0,0,0` and `2,0,17` for period 2; 4 decimals; **golden test: writing the verified recording's first data row (§ TPD file format example; embed the line in the test, do not read `sw/tracktestpc.txt`) with N = 1 reproduces `1,1,2,0,0,0` and that row byte for byte**; length mismatch raises. `sw/tests/test_robot_motionctl.py` with `FakeRobotClient` and `tmp_path`: `new` writes a loadable design; `validate` writes `validated.json` only on pass; `compile` refuses a stale `design_sha256`; `upload` calls `upload_file` then `LoadTPD("traj/motion_<name>")`; `play` aborts without YES and never calls `MoveJ`/`MoveTPD` then; `play` with YES calls `Mode(0)`, `MoveJ(start_joints, …)`, `MoveTPD("traj/motion_<name>", 0, N)` in that order; Ctrl-C (raise `KeyboardInterrupt` from the fake) calls `StopMotion`.
+- Tests: `sw/tests/test_robot_tpd_file.py`: write → read round trip; header `N,1,8,0,0,0` and rows ending `8,0,17` for period 8 and tool 0; header `N,1,2,0,0,0` and `2,0,17` for period 2; 4 decimals; **golden test: writing the verified recording's first data row (§ TPD file format example; embed the line in the test, do not read `sw/tracktestpc.txt`) with N = 1 reproduces `1,1,2,0,0,0` and that row byte for byte**; length mismatch raises. `sw/tests/test_robot_motionctl.py` with `FakeRobotClient` and `tmp_path`: `new` writes a loadable design; `validate` writes `validated.json` only on pass; `compile` refuses a stale `design_sha256`; `upload` calls `upload_file` then `LoadTPD("traj/motion_<name>")`; `play` aborts without YES and never calls `MoveJ`/`MoveTPD` then; `play` with YES calls `Mode(0)`, `MoveJ(start_joints, …)`, `MoveTPD("traj/motion_<name>", 0, N)` in that order; Ctrl-C (raise `KeyboardInterrupt` from the fake) calls `StopMotion`; `simplay` calls `move_j` to the start pose then `ServoMoveStart`, one `ServoJ` per compiled row (joints matching the file, `axis_pos == [0,0,0,0]`), `ServoMoveEnd`, and never calls `upload_file`, `LoadTPD` or `MoveTPD`; a `ServoJ` error mid-stream still calls `ServoMoveEnd` (via `finally`); `simplay` compiles the file itself when the build is missing. `sw/tests/test_robot_fr5.py` adds: `stream_joints` calls `ServoMoveStart` once, one `ServoJ` per row with `axisPos=[0,0,0,0]` and the row's own `cmdT`, then `ServoMoveEnd`; `ServoMoveEnd` still runs when a row's `ServoJ` raises `FairinoError`; the real-time pacing is not asserted (it uses `time.sleep`, monkeypatched in the test to avoid a slow suite).
 - **Operator acceptance on the real robot** (cell clear, e-stop in hand):
   1. Jog the robot with the pendant to a pose where the flange points forward and level. `motionctl pose` → copy the position, pan, tilt into `first_test`'s first keyframe and the joints into `seed_joints`; second keyframe = 100 mm higher.
   2. `motionctl validate first_test`, `compile first_test`, `upload first_test`.
