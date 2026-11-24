@@ -7,7 +7,7 @@
   "speed": "0.3",
   "clip_start": "0",
   "clip_length": "16",
-  "smoothing": "high",
+  "smoothing": "native",
   "chunks": "4",
   "soundtrack": "/home/juan/Downloads/Telegram Desktop/1108.MP3",
   "soundtrack_start": "1",

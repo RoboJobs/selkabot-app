@@ -199,6 +199,9 @@ def test_full_window_locks_the_selector_until_connected_then_enables_it(
         fadeout_image="",
         config_file=tmp_path / "config.json",
     )
+    assert (
+        ui.postprocessor._jobs.qsize() == 0
+    )  # --no-upload must not require R2 credentials
     assert ui.picker.mode.label == "16:9 2.7K 60fps Wide"
     # Connecting: every option is locked until the camera answers.
     assert all(

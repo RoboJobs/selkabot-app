@@ -553,11 +553,12 @@ class LivestreamApp:
         self.postprocessor = PostProcessor(
             upload, self._events, self._on_processed, self._on_process_error
         )
-        # Check the bucket on startup; uploads it finds missing go through the
-        # same queue.
-        self.postprocessor.submit_job(
-            functools.partial(sync_uploads, controller.output_dir, folder, upload)
-        )
+        # Check the bucket on startup only when uploads are enabled. In no-upload
+        # mode, avoid requiring any R2 credentials at all.
+        if upload:
+            self.postprocessor.submit_job(
+                functools.partial(sync_uploads, controller.output_dir, folder, upload)
+            )
         self._recording = False
         self._busy = True  # Connecting
         self._record_started = 0.0
