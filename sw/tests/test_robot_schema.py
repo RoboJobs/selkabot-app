@@ -245,7 +245,7 @@ def test_camera_tool_requires_approval():
 
 def test_robot_settings_defaults_and_validation():
     defaults = schema.robot_settings_from_dict(None)
-    assert defaults.move_to_start_speed_pct == 10
+    assert defaults.move_to_start_speed_pct == 25
     assert defaults.backend == "tpd"
     with pytest.raises(schema.SchemaError):
         schema.robot_settings_from_dict({"move_to_start_speed_pct": 200})

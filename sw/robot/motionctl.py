@@ -19,7 +19,13 @@ import yaml
 
 from sw.robot import path as path_module
 from sw.robot import schema, templates, tpd_file, validate
-from sw.robot.fr5 import FR5, FairinoError, FileTransferError
+from sw.robot.fr5 import (
+    FR5,
+    TPD_BLEND_NONE,
+    TPD_BLEND_SMOOTH,
+    FairinoError,
+    FileTransferError,
+)
 from sw.robot.frames import base_to_authoring
 from sw.robot.level import LevelError, level_keyframe
 from sw.robot.pose import camera_angles
@@ -29,7 +35,7 @@ ROBOT_IP = "192.168.58.2"
 MOTIONS_DIR = Path(__file__).resolve().parent / "motions"
 BUILD_DIR = Path(__file__).resolve().parent / "build"
 POSE_TOLERANCE = 0.01
-MOVE_TO_START_SPEED_PCT = 10
+MOVE_TO_START_SPEED_PCT = 25
 # The controller's actual speed is max x global speed (SetSpeed) x the
 # command's own speed (MoveJ vel, MoveTPD ovl) -- manual 1.3.9.5. We use the
 # global speed as the one speed control and give commands 100%.
@@ -643,7 +649,8 @@ def cmd_play(args: argparse.Namespace) -> None:
         expected_duration = validated["duration_s"] * 100.0 / args.ovl
         with robot.speed(args.ovl):  # global speed = playback speed (see COMMAND_PCT)
             start = time.monotonic()
-            robot.move_tpd(tpd_name, 0, COMMAND_PCT)
+            blend = TPD_BLEND_NONE if args.no_smooth else TPD_BLEND_SMOOTH
+            robot.move_tpd(tpd_name, blend, COMMAND_PCT)
             print(f"move_tpd returned after {time.monotonic() - start:.3f}s")
             outcome = _wait_for_motion(robot, expected_duration * 1.5 + 3.0)
             elapsed = time.monotonic() - start
@@ -779,6 +786,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("play")
     p.add_argument("name")
     p.add_argument("--ovl", type=int, default=50)
+    p.add_argument(
+        "--no-smooth",
+        action="store_true",
+        help="MoveTPD blend=0 (no controller smoothing; for comparison only)",
+    )
     _add_ip(p, default=ROBOT_IP)
     p.set_defaults(func=cmd_play)
 

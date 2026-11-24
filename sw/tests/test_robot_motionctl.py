@@ -275,7 +275,7 @@ def test_play_with_yes_calls_mode_movej_movetpd_in_order(
     assert "MoveTPD" in names
     assert names.index("Mode") < names.index("MoveJ") < names.index("MoveTPD")
     # global speed = the playback speed, MoveTPD at 100% (speeds multiply)
-    assert connect.move_tpd_calls == [("traj/motion_demo", 0, 100)]
+    assert connect.move_tpd_calls == [("traj/motion_demo", 1, 100)]  # smoothed
     assert 50 in connect.speeds
     assert connect.speeds[-1] == 10  # safe default restored afterwards
 
@@ -606,3 +606,13 @@ def test_play_reports_and_stops_on_a_robot_error(
     out = capsys.readouterr().out
     assert "main 1, sub 10" in out
     assert "StopMotion" in [c[0] for c in connect.calls]
+
+
+def test_play_no_smooth_passes_blend_0_to_move_tpd(
+    connect, _redirect_dirs, monkeypatch
+):
+    motions, build = _redirect_dirs
+    _ready_to_play(connect, motions, build, monkeypatch)
+    args = ["play", "crane", "--ip", motionctl.ROBOT_IP, "--ovl", "100", "--no-smooth"]
+    assert _run(args) == 0
+    assert connect.move_tpd_calls == [("traj/motion_crane", 0, 100)]

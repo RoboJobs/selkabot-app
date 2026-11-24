@@ -136,7 +136,7 @@ def test_load_with_a_wrong_start_pose_fails_and_disables_the_motion(runner, clie
     assert "demo" in runner.disabled
 
 
-def test_move_to_start_at_10_percent_then_restores_the_speed(
+def test_move_to_start_at_25_percent_then_restores_the_speed(
     runner, client, monkeypatch
 ):
     monkeypatch.setattr("sw.robot.fr5.time.sleep", lambda s: None)  # ensure_auto
@@ -144,9 +144,9 @@ def test_move_to_start_at_10_percent_then_restores_the_speed(
     runner.move_to_start("demo").result(timeout=5)
     (move,) = _calls(client, "MoveJ")
     assert move[1] == (START_JOINTS, 1, 0)
-    # global speed carries the 10%, MoveJ itself runs at 100% (speeds multiply)
+    # global speed carries the 25%, MoveJ itself runs at 100% (speeds multiply)
     assert move[2] == {"vel": 100, "blendT": 0.0}  # non-blocking
-    assert client.speeds[-2:] == [10, 10]  # set for the move, then restored
+    assert client.speeds[-2:] == [25, 10]  # set for the move, then safe default
     assert runner.at_start("demo") == (True, 0.0)
 
 
@@ -176,7 +176,7 @@ def auto(client, monkeypatch):
 
 def test_run_resolves_when_motion_done_goes_0_then_1(runner, client, auto):
     runner.run("demo").result(timeout=5)
-    assert client.move_tpd_calls == [("traj/motion_demo", 0, 100)]
+    assert client.move_tpd_calls == [("traj/motion_demo", 1, 100)]  # smoothed
     assert client.speeds[-2:] == [100, 10]  # approved ovl as global speed, restored
     assert runner.state is mr.RunnerState.IDLE
 

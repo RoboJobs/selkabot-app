@@ -1,6 +1,7 @@
 name: up_down_horizontal
 tool_id: 1
 interpolation: joint
+ramp_fraction: 0.2
 sample_period_ms: 8
 seed_joints:
 - 89.718
@@ -35,7 +36,7 @@ keyframes:
   - 29.6695
   - -89.5659
   - 45.7689
-- t: 5.07
+- t: 2.03
   pos:
   - 129.857
   - -758.337
@@ -49,3 +50,6 @@ keyframes:
   - -181.0
   - -90.0
   - 45.0
+limits:
+  max_tcp_speed_mm_s: 1500.0
+  max_joint_speed_deg_s: 170.0

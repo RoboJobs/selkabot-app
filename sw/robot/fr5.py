@@ -20,6 +20,10 @@ from typing import Any, Protocol
 DATA_PORT = 20010
 ALLOWED_UPLOAD_TYPES = (0, 20)  # 0 = Lua, 20 = Trajectory J (TPD files use this)
 TRAJ_DIR = "/fruser/traj"
+# MoveTPD blend: 1 = controller smoothing. Default for every motion: without
+# it the joints were audibly rough at low playback speeds (2026-11-25).
+TPD_BLEND_SMOOTH = 1
+TPD_BLEND_NONE = 0
 
 
 class FairinoError(RuntimeError):

@@ -124,6 +124,7 @@ class Design:
     user_id: int = 0
     limits: Limits = Limits()
     interpolation: str = "cartesian"  # "cartesian" or "joint"
+    ramp_fraction: float | None = None  # joint mode: cruise profile, see joint_path
 
 
 def _keyframe(
@@ -289,6 +290,7 @@ def design_from_dict(
         "tool_id",
         "user_id",
         "interpolation",
+        "ramp_fraction",
         "sample_period_ms",
         "anchor",
         "seed_joints",
@@ -341,6 +343,13 @@ def design_from_dict(
             "joint interpolation needs orientation mode 'angles' (target mode must "
             "re-aim the camera at every sample, which only cartesian mode does)",
         )
+    ramp = raw.get("ramp_fraction")
+    if ramp is not None:
+        ramp = _number(ramp, path, "ramp_fraction")
+        if interpolation != "joint":
+            raise SchemaError(path, "ramp_fraction", "only with interpolation: joint")
+        if not 0.0 < ramp <= 0.5:
+            raise SchemaError(path, "ramp_fraction", "must be in (0, 0.5]")
     limits = _limits(raw.get("limits"), path)
     workspace = raw.get("workspace")
     if not isinstance(workspace, dict):
@@ -372,6 +381,7 @@ def design_from_dict(
         user_id,
         limits,
         interpolation,
+        ramp,
     )
 
 
@@ -564,7 +574,7 @@ class RobotSettings:
     ip: str = "192.168.58.2"
     backend: str = "tpd"
     start_tolerance_deg: float = 0.5
-    move_to_start_speed_pct: int = 10
+    move_to_start_speed_pct: int = 25
     safe_default_speed_pct: int = 10
     pre_roll_s: float = 0.5
     post_roll_s: float = 1.0

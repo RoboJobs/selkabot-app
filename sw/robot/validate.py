@@ -29,9 +29,9 @@ from typing import Any, Protocol
 import numpy as np
 
 from sw.robot.frames import design_to_base, within_workspace
-from sw.robot.joint_path import sample_joint_path
+from sw.robot.joint_path import make_channel, sample_joint_path
 from sw.robot.level import LevelError, solve_wrist
-from sw.robot.path import Channel, Sample, keyframe_velocities, to_sdk_pose
+from sw.robot.path import Sample, to_sdk_pose
 from sw.robot.pose import (
     camera_angles,
     roll_error_deg,
@@ -590,12 +590,8 @@ def level_joint_path(
     kf_times = [kf.t for kf in design.keyframes]
     stop = [i for i, kf in enumerate(design.keyframes) if kf.stop]
     kf_pans, kf_tilts = _keyframe_view(design, kin, kf_joints)
-    pan_ch = Channel(
-        kf_times, kf_pans, keyframe_velocities(kf_times, kf_pans, {}, stop)
-    )
-    tilt_ch = Channel(
-        kf_times, kf_tilts, keyframe_velocities(kf_times, kf_tilts, {}, stop)
-    )
+    pan_ch = make_channel(kf_times, kf_pans, stop, design.ramp_fraction)
+    tilt_ch = make_channel(kf_times, kf_tilts, stop, design.ramp_fraction)
     joints: list[list[float]] = []
     guess = blend[0][3:]
     for i, (t, q) in enumerate(zip(times, blend, strict=True)):

@@ -29,7 +29,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
-from sw.robot.fr5 import FR5, FairinoError
+from sw.robot.fr5 import FR5, TPD_BLEND_SMOOTH, FairinoError
 from sw.robot.schema import MotionConfig, RobotSettings, SchemaError
 
 POSE_TOLERANCE = 0.01  # GetTPDStartPose vs motion.json (float32 precision)
@@ -276,7 +276,9 @@ class MotionRunner:
             timer.start()
             try:
                 self._call(lambda r: r.set_speed(ovl))  # global = playback speed
-                self._call(lambda r: r.move_tpd(config.tpd_name, 0, COMMAND_PCT))
+                self._call(
+                    lambda r: r.move_tpd(config.tpd_name, TPD_BLEND_SMOOTH, COMMAND_PCT)
+                )
                 self._wait_motion(deadline_s=deadline, timed_out=timed_out)
             finally:
                 timer.cancel()
