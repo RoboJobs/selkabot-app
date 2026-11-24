@@ -131,6 +131,10 @@ class Design:
     interpolation: str = "cartesian"  # "cartesian" or "joint"
     ramp_fraction: float | None = None  # joint mode: cruise profile, see joint_path
     format: str = DEFAULT_FORMAT  # "landscape" or "portrait" (D11)
+    # Joint mode: solve J4-J6 at every sample for the exact roll (default), or
+    # follow the joint blend (for moves whose wrist sits at the singularity
+    # but whose blend keeps the roll; check_roll still verifies it).
+    level_wrist: bool = True
 
     @property
     def camera_roll_deg(self) -> float:
@@ -308,6 +312,7 @@ def design_from_dict(
         "user_id",
         "interpolation",
         "ramp_fraction",
+        "level_wrist",
         "sample_period_ms",
         "anchor",
         "seed_joints",
@@ -367,6 +372,11 @@ def design_from_dict(
             raise SchemaError(path, "ramp_fraction", "only with interpolation: joint")
         if not 0.0 < ramp <= 0.5:
             raise SchemaError(path, "ramp_fraction", "must be in (0, 0.5]")
+    level_wrist = raw.get("level_wrist", True)
+    if not isinstance(level_wrist, bool):
+        raise SchemaError(path, "level_wrist", "must be true or false")
+    if not level_wrist and interpolation != "joint":
+        raise SchemaError(path, "level_wrist", "only with interpolation: joint")
     limits = _limits(raw.get("limits"), path)
     workspace = raw.get("workspace")
     if not isinstance(workspace, dict):
@@ -400,6 +410,7 @@ def design_from_dict(
         interpolation,
         ramp,
         _format(raw.get("format", DEFAULT_FORMAT), path),
+        level_wrist,
     )
 
 

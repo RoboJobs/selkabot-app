@@ -590,6 +590,16 @@ def level_joint_path(
     a handful of FK calls.
     """
     times, blend = sample_joint_path(design, kf_joints)
+    if not design.level_wrist:
+        return (
+            CheckResult(
+                "check_wrist_level",
+                True,
+                "skipped: level_wrist is false, J4-J6 follow the joint blend",
+            ),
+            times,
+            [list(q) for q in blend],
+        )
     kf_times = [kf.t for kf in design.keyframes]
     stop = [i for i, kf in enumerate(design.keyframes) if kf.stop]
     kf_pans, kf_tilts = _keyframe_view(design, kin, kf_joints)
@@ -647,7 +657,16 @@ def _validate_joint(design: Design, kin: Kinematics) -> ValidationReport:
     ]
 
     peaks = _compute_peaks(design, samples, joints)
-    checks.append(check_wrist_singularity(design, samples, joints))
+    if design.level_wrist:
+        checks.append(check_wrist_singularity(design, samples, joints))
+    else:  # no wrist solve to be ill-conditioned; check_roll verifies the level
+        checks.append(
+            CheckResult(
+                "check_wrist_singularity",
+                True,
+                "skipped: level_wrist is false (the wrist is not solved)",
+            )
+        )
     roll_result, peaks.max_roll_deg = check_roll(
         poses, design.limits.max_roll_deg, design.camera_roll_deg
     )

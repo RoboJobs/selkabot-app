@@ -398,3 +398,14 @@ def test_committed_motion_json_still_loads():
     )
     config = schema.load_motion_config(meta)
     assert config.format == "landscape"
+
+
+def test_level_wrist_defaults_true_and_is_joint_mode_only():
+    assert schema.design_from_dict(JOINT, "demo").level_wrist is True
+    off = _mutate(JOINT, lambda r: r.update(level_wrist=False))
+    assert schema.design_from_dict(off, "demo").level_wrist is False
+    for bad, base in [(False, ANGLES), ("no", JOINT)]:
+        raw = _mutate(base, lambda r, v=bad: r.update(level_wrist=v))
+        with pytest.raises(schema.SchemaError) as exc:
+            schema.design_from_dict(raw, "demo")
+        assert exc.value.field == "level_wrist"

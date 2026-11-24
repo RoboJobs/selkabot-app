@@ -253,6 +253,15 @@ def cmd_capture(args: argparse.Namespace) -> None:
             f"J5 margin {_j5_margin(joints):.1f}deg"
         )
     print(f"{len(keyframes)} keyframe(s) in {path}")
+    if raw.get("interpolation") == "joint":
+        foreign = [k["t"] for k in keyframes if "seed" not in k and "joints" not in k]
+        if foreign:
+            print(
+                "Warning: keyframe(s) at t="
+                + ", ".join(f"{float(t):g}" for t in foreign)
+                + " did not come from capture (left from the template?). Remove "
+                "them from design.yaml, or capture the first keyframe with --reset."
+            )
 
 
 # -- derive ----------------------------------------------------------------

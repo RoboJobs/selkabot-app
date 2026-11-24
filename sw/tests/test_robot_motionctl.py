@@ -894,3 +894,16 @@ def test_derive_output_is_a_draft_that_may_fail_validation(connect, _redirect_di
     assert _derive(["--wrist", "0", "0"]) == 0
     assert (motions / "drv" / "design.yaml").exists()
     assert _run(["validate", "drv"]) == 1  # the original box rejects the path
+
+
+def test_capture_warns_about_keyframes_left_from_the_template(
+    connect, _redirect_dirs, capsys
+):
+    motions, _build = _redirect_dirs
+    _capture_setup(connect, motions)  # first_test template: keyframes at 0 and 4
+    connect.robot_state_pkg.jt_cur_pos = _pose_to_joints([600.0, 0, 300, -90, 0, -90])
+    assert _run(["capture", "demo", "--t", "0"]) == 0  # no --reset
+    out = capsys.readouterr().out
+    assert "keyframe(s) at t=4 did not come from capture" in out
+    assert _run(["capture", "demo", "--t", "0", "--reset"]) == 0
+    assert "did not come from capture" not in capsys.readouterr().out
