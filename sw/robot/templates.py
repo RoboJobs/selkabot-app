@@ -1,7 +1,8 @@
 """Starter designs for `motionctl new`. Each returns a dict that loads as a Design.
 
 Values are placeholders for a subject 400 mm ahead of the robot base; edit the
-keyframes and the workspace box for the real set before validating.
+keyframes and the workspace box for the real set before validating. tool_id 0
+is the flange (D5: camera tool calibration is deferred).
 """
 
 from __future__ import annotations
@@ -13,10 +14,31 @@ def _workspace() -> dict[str, list[float]]:
     return {"min": [200, -900, 100], "max": [950, 900, 1100]}
 
 
+def first_test() -> dict[str, Any]:
+    """Small, slow vertical move for the first robot test (Phase 4 milestone).
+
+    Placeholders only: before use, run `motionctl pose` at a safe starting
+    pose and copy its position, pan, tilt into the first keyframe below, and
+    its joints into seed_joints. The second keyframe is 100 mm higher, same
+    orientation, held at rest.
+    """
+    return {
+        "tool_id": 0,
+        "sample_period_ms": 8,
+        "seed_joints": [0, -90, 90, -90, -90, 0],
+        "orientation": {"mode": "angles"},
+        "workspace": _workspace(),
+        "keyframes": [
+            {"t": 0.0, "pos": [500, 0, 400], "pan": 0, "tilt": 0},
+            {"t": 4.0, "pos": [500, 0, 500], "pan": 0, "tilt": 0, "stop": True},
+        ],
+    }
+
+
 def sweep() -> dict[str, Any]:
     """Horizontal sweep, camera pans while the body moves sideways."""
     return {
-        "tool_id": 1,
+        "tool_id": 0,
         "sample_period_ms": 8,
         "seed_joints": [0, -90, 90, -90, -90, 0],
         "orientation": {"mode": "angles"},
@@ -32,7 +54,7 @@ def sweep() -> dict[str, Any]:
 def crane() -> dict[str, Any]:
     """Vertical crane, camera rises while it keeps a fixed heading."""
     return {
-        "tool_id": 1,
+        "tool_id": 0,
         "sample_period_ms": 8,
         "seed_joints": [0, -90, 90, -90, -90, 0],
         "orientation": {"mode": "angles"},
@@ -47,7 +69,7 @@ def crane() -> dict[str, Any]:
 def orbit() -> dict[str, Any]:
     """Arc around a fixed subject point, the camera keeps it in frame."""
     return {
-        "tool_id": 1,
+        "tool_id": 0,
         "sample_period_ms": 8,
         "seed_joints": [0, -90, 90, -90, -90, 0],
         "orientation": {"mode": "target", "target": [400, 0, 300]},
@@ -62,7 +84,7 @@ def orbit() -> dict[str, Any]:
 def push_in() -> dict[str, Any]:
     """Slow approach toward the subject, the camera stays on it."""
     return {
-        "tool_id": 1,
+        "tool_id": 0,
         "sample_period_ms": 8,
         "seed_joints": [0, -90, 90, -90, -90, 0],
         "orientation": {"mode": "target", "target": [400, 0, 300]},
@@ -74,7 +96,13 @@ def push_in() -> dict[str, Any]:
     }
 
 
-TEMPLATES = {"sweep": sweep, "crane": crane, "orbit": orbit, "push_in": push_in}
+TEMPLATES = {
+    "sweep": sweep,
+    "crane": crane,
+    "orbit": orbit,
+    "push_in": push_in,
+    "first_test": first_test,
+}
 
 
 def new_design(template: str, name: str) -> dict[str, Any]:

@@ -18,7 +18,7 @@ import yaml
 NAME_RE = re.compile(r"^[a-z0-9_]{1,19}$")
 ALLOWED_PERIODS_MS = (2, 4, 8)
 MAX_ABS_TILT_DEG = 85.0
-BACKENDS = ("trajectory_file", "lua")
+BACKENDS = ("tpd",)
 ANGLE_VEL_CHANNELS = ("x", "y", "z", "pan", "tilt")
 TARGET_VEL_CHANNELS = ("x", "y", "z", "tx", "ty", "tz")
 
@@ -279,9 +279,9 @@ def design_from_dict(
     if (
         not isinstance(tool_id, int)
         or isinstance(tool_id, bool)
-        or not 1 <= tool_id <= 14
+        or not 0 <= tool_id <= 14
     ):
-        raise SchemaError(path, "tool_id", "must be an integer 1..14")
+        raise SchemaError(path, "tool_id", "must be an integer 0..14")
     user_id = raw.get("user_id", 0)
     if (
         not isinstance(user_id, int)
@@ -406,10 +406,9 @@ def load_camera_tool(path: Path) -> CameraTool:
 
 
 MOTION_FILE_KEYS = (
-    "name", "backend", "controller_file", "md5", "num_points", "sample_period_ms",
-    "duration_s", "design_duration_s", "start_joints", "start_pose", "tool_id",
-    "tcp_offset", "approved_ovl", "design_sha256", "camera_tool_sha256",
-    "validated_sha256", "rehearsal", "published_at",
+    "name", "backend", "controller_file", "tpd_name", "md5", "num_points",
+    "sample_period_ms", "duration_s", "design_duration_s", "start_joints",
+    "start_pose", "tool_id", "approved_ovl", "design_sha256", "published_at",
 )  # fmt: skip
 
 
@@ -420,6 +419,7 @@ class MotionConfig:
     name: str
     backend: str
     controller_file: str
+    tpd_name: str
     md5: str
     num_points: int
     sample_period_ms: int
@@ -428,12 +428,8 @@ class MotionConfig:
     start_joints: tuple[float, ...]
     start_pose: tuple[float, ...]
     tool_id: int
-    tcp_offset: tuple[float, ...]
     approved_ovl: int
     design_sha256: str
-    camera_tool_sha256: str
-    validated_sha256: str
-    rehearsal: dict[str, Any]
     published_at: str
 
     def check_consistent(self, path: object = "motion.json") -> None:
@@ -443,6 +439,9 @@ class MotionConfig:
         expected = f"/fruser/traj/motion_{self.name}.txt"
         if self.controller_file != expected:
             raise SchemaError(path, "controller_file", f"must be {expected}")
+        expected_tpd = f"traj/motion_{self.name}"
+        if self.tpd_name != expected_tpd:
+            raise SchemaError(path, "tpd_name", f"must be {expected_tpd}")
         if self.num_points < 2:
             raise SchemaError(path, "num_points", "needs at least 2 points")
         expected_duration = (self.num_points - 1) * self.sample_period_ms / 1000.0
@@ -452,19 +451,14 @@ class MotionConfig:
                 "duration_s",
                 f"must equal (num_points - 1) * period = {expected_duration}",
             )
-        rehearsal_ovl = int(self.rehearsal.get("ovl", 0))
-        if not 1 <= self.approved_ovl <= rehearsal_ovl <= 100:
+        if not 1 <= self.approved_ovl <= 100:
             raise SchemaError(
-                path,
-                "approved_ovl",
-                "must satisfy 1 <= approved_ovl <= rehearsal.ovl <= 100",
+                path, "approved_ovl", "must satisfy 1 <= approved_ovl <= 100"
             )
         if len(self.start_joints) != 6:
             raise SchemaError(path, "start_joints", "expected 6 values")
         if len(self.start_pose) != 6:
             raise SchemaError(path, "start_pose", "expected 6 values")
-        if len(self.tcp_offset) != 6:
-            raise SchemaError(path, "tcp_offset", "expected 6 values")
 
 
 def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
@@ -477,6 +471,7 @@ def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
         name=str(raw["name"]),
         backend=str(raw["backend"]),
         controller_file=str(raw["controller_file"]),
+        tpd_name=str(raw["tpd_name"]),
         md5=str(raw["md5"]),
         num_points=int(raw["num_points"]),
         sample_period_ms=int(raw["sample_period_ms"]),
@@ -485,12 +480,8 @@ def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
         start_joints=_vec(raw["start_joints"], 6, path, "start_joints"),
         start_pose=_vec(raw["start_pose"], 6, path, "start_pose"),
         tool_id=int(raw["tool_id"]),
-        tcp_offset=_vec(raw["tcp_offset"], 6, path, "tcp_offset"),
         approved_ovl=int(raw["approved_ovl"]),
         design_sha256=str(raw["design_sha256"]),
-        camera_tool_sha256=str(raw["camera_tool_sha256"]),
-        validated_sha256=str(raw["validated_sha256"]),
-        rehearsal=dict(raw["rehearsal"]),
         published_at=str(raw["published_at"]),
     )
     config.check_consistent(path)
@@ -499,7 +490,7 @@ def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
 
 def motion_config_to_dict(config: MotionConfig) -> dict[str, Any]:
     out = {k: getattr(config, k) for k in MOTION_FILE_KEYS}
-    for key in ("start_joints", "start_pose", "tcp_offset"):
+    for key in ("start_joints", "start_pose"):
         out[key] = list(out[key])
     return out
 
@@ -531,11 +522,10 @@ def load_motion_configs(motions_dir: Path) -> dict[str, MotionConfig]:
 @dataclass(frozen=True)
 class RobotSettings:
     ip: str = "192.168.58.2"
-    backend: str = "trajectory_file"
+    backend: str = "tpd"
     start_tolerance_deg: float = 0.5
     move_to_start_speed_pct: int = 10
     safe_default_speed_pct: int = 10
-    stop_confirm_timeout_s: float = 2.0
     pre_roll_s: float = 0.5
     post_roll_s: float = 1.0
     auto_stop_after_motion: bool = True

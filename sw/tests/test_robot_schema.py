@@ -57,7 +57,8 @@ def test_valid_target_design_loads():
     [
         (lambda r: r.update(name="Bad-Name"), "name"),
         (lambda r: r.update(name="x" * 20), "name"),
-        (lambda r: r.update(tool_id=0), "tool_id"),
+        (lambda r: r.update(tool_id=15), "tool_id"),
+        (lambda r: r.update(tool_id=-1), "tool_id"),
         (lambda r: r.update(sample_period_ms=5), "sample_period_ms"),
         (lambda r: r.update(seed_joints=[0, 0, 0]), "seed_joints"),
         (
@@ -163,8 +164,9 @@ def test_load_design_rejects_invalid_yaml(tmp_path):
 def _motion_dict(**overrides):
     base = {
         "name": "demo",
-        "backend": "trajectory_file",
+        "backend": "tpd",
         "controller_file": "/fruser/traj/motion_demo.txt",
+        "tpd_name": "traj/motion_demo",
         "md5": "0" * 32,
         "num_points": 251,
         "sample_period_ms": 8,
@@ -172,18 +174,9 @@ def _motion_dict(**overrides):
         "design_duration_s": 2.0,
         "start_joints": [0, -90, 90, -90, -90, 0],
         "start_pose": [600, -400, 450, 180, 0, 90],
-        "tool_id": 1,
-        "tcp_offset": [0, 0, 0, 0, 0, 0],
+        "tool_id": 0,
         "approved_ovl": 50,
         "design_sha256": "a" * 64,
-        "camera_tool_sha256": "b" * 64,
-        "validated_sha256": "c" * 64,
-        "rehearsal": {
-            "ovl": 100,
-            "max_roll_deg": 0.12,
-            "max_pos_err_mm": 1.8,
-            "date": "2026-11-24",
-        },
         "published_at": "2026-11-24T10:00:00",
     }
     base.update(overrides)
@@ -202,10 +195,10 @@ def test_motion_config_round_trips_through_json(tmp_path):
     "override, field",
     [
         ({"controller_file": "/fruser/traj/other.txt"}, "controller_file"),
+        ({"tpd_name": "traj/other"}, "tpd_name"),
         ({"duration_s": 1.5}, "duration_s"),
         ({"approved_ovl": 0}, "approved_ovl"),
         ({"approved_ovl": 101}, "approved_ovl"),
-        ({"rehearsal": {"ovl": 40}}, "approved_ovl"),  # approved 50 > rehearsed 40
         ({"start_joints": [0, 0]}, "start_joints"),
         ({"backend": "servo"}, "backend"),
     ],
@@ -251,7 +244,9 @@ def test_camera_tool_requires_approval():
 
 
 def test_robot_settings_defaults_and_validation():
-    assert schema.robot_settings_from_dict(None).move_to_start_speed_pct == 10
+    defaults = schema.robot_settings_from_dict(None)
+    assert defaults.move_to_start_speed_pct == 10
+    assert defaults.backend == "tpd"
     with pytest.raises(schema.SchemaError):
         schema.robot_settings_from_dict({"move_to_start_speed_pct": 200})
     with pytest.raises(schema.SchemaError):
@@ -267,6 +262,8 @@ def test_every_template_loads_and_samples(name):
     raw = templates.new_design(name, "demo")
     design = schema.design_from_dict(raw, "demo", folder_name="demo")
     assert len(path.sample_path(design)) > 1
+    assert design.sample_period_ms == 8
+    assert design.tool_id == 0
 
 
 def test_unknown_template_is_rejected():
