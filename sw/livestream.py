@@ -39,9 +39,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import dataclasses
 import functools
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -51,7 +53,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Any
 
 import cv2
@@ -66,6 +68,15 @@ from sw.camera.gopro_hero10 import HeroBackend
 from sw.camera.mode_persistence import load_mode, save_mode
 from sw.camera.mode_picker import ModePicker
 from sw.camera.modes import AXES, ModeCatalog, VideoMode
+from sw.robot import ui_state as us
+from sw.robot.motion_runner import MotionRunner, RunnerState
+from sw.robot.schema import (
+    MotionConfig,
+    RobotSettings,
+    SchemaError,
+    load_motion_config,
+    robot_settings_from_dict,
+)
 from sw.sync_uploads import sync_uploads
 from sw.uploader import make_qr, public_url, upload_video
 
@@ -92,6 +103,9 @@ DEFAULT_IMAGE = (
     ""  # Optional watermark, a file name in the current directory; "" means none
 )
 CONFIG_FILE = Path(__file__).resolve().parent / "livestream_config.json"
+MOTIONS_DIR = Path(__file__).resolve().parent / "robot" / "motions"
+ROBOT_CHECK_TIMEOUT_S = 20.0  # startup check; the SDK can hang on a dead link
+ROBOT_REFRESH_TICKS = 30  # re-evaluate "at start" every ~0.5 s of _poll
 DISPLAY_WIDTH = 960
 KEEP_ALIVE_PERIOD_S = 3.0
 
@@ -527,6 +541,57 @@ def save_config(
         logger.exception("Could not save the config file %s", config_file)
 
 
+def _read_config(config_file: Path) -> dict:
+    try:
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_robot_config(config_file: Path) -> tuple[str, Any]:
+    """Return (selected motion name or "", raw "robot" block or None)."""
+    data = _read_config(config_file)
+    motion = data.get("motion", "")
+    if not isinstance(motion, str):
+        logger.warning("Ignoring invalid 'motion' in the config file")
+        motion = ""
+    return motion, data.get("robot")
+
+
+def save_motion(config_file: Path, motion: str) -> None:
+    """Store the selected motion ("" for none), keeping every other key."""
+    config = _read_config(config_file)
+    config["motion"] = motion
+    try:
+        config_file.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        logger.exception("Could not save the config file %s", config_file)
+
+
+def load_motions(motions_dir: Path) -> tuple[dict[str, MotionConfig], dict[str, str]]:
+    """Published motions (folders with a motion.json), and the ones whose
+    motion.json is unusable with the reason. Folders without one are skipped."""
+    configs: dict[str, MotionConfig] = {}
+    broken: dict[str, str] = {}
+    if not motions_dir.is_dir():
+        return configs, broken
+    for folder in sorted(motions_dir.iterdir()):
+        meta = folder / "motion.json"
+        if not (folder.is_dir() and meta.exists()):
+            continue
+        try:
+            config = load_motion_config(meta)
+            if config.name != folder.name:
+                raise SchemaError(meta, "name", "must equal the folder name")
+            config.check_consistent()
+        except (SchemaError, OSError, TypeError, KeyError) as e:
+            broken[folder.name] = f"invalid motion.json: {e}"
+            continue
+        configs[config.name] = config
+    return configs, broken
+
+
 class LivestreamApp:
     """Tkinter window with the live preview, resolution selector, folder box and record
     button."""
@@ -541,6 +606,12 @@ class LivestreamApp:
         fadein_image: str,
         fadeout_image: str,
         config_file: Path,
+        *,
+        motion_runner: MotionRunner | None = None,
+        motions: dict[str, MotionConfig] | None = None,
+        broken_motions: dict[str, str] | None = None,
+        motion: str = "",
+        robot_settings: RobotSettings | None = None,
     ) -> None:
         self.root = root
         self.controller = controller
@@ -565,6 +636,7 @@ class LivestreamApp:
         self._photo: ImageTk.PhotoImage | None = None
         self._last_frame: Any = None
         self._qr_window: tk.Toplevel | None = None
+        self._init_robot(motion_runner, motions, broken_motions, motion, robot_settings)
 
         root.title("GoPro Livestream")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -581,6 +653,11 @@ class LivestreamApp:
         modes_frame.pack(fill="x", padx=8, pady=(0, 4))
         self._build_mode_rows(modes_frame)
 
+        if self.motion_runner is not None:
+            motion_frame = ttk.Frame(root)
+            motion_frame.pack(fill="x", padx=8, pady=(0, 4))
+            self._build_motion_row(motion_frame)
+
         controls = ttk.Frame(root)
         controls.pack(fill="x", padx=8, pady=(0, 8))
 
@@ -588,6 +665,11 @@ class LivestreamApp:
             controls, text="Start recording", width=16, command=self._on_record
         )
         self.record_button.pack(side="right")
+        if self.motion_runner is not None:
+            self.robot_button = tk.Button(
+                controls, text="Move to Start", width=14, command=self._on_robot_button
+            )
+            self.robot_button.pack(side="right", padx=(0, 8))
 
         # Packed right-to-left, so the label sits left of the box, which sits left
         # of the button.
@@ -617,6 +699,8 @@ class LivestreamApp:
             "Connecting to GoPro over USB…",
             self._on_connected,
         )
+        if self.motion_runner is not None:
+            self._start_robot_check()
         root.after(15, self._poll)
 
     # Camera operations ------------------------------------------------------
@@ -834,47 +918,88 @@ class LivestreamApp:
 
     def _on_record(self) -> None:
         if not self._recording:
-            name = self._folder_name()
-            if name is None:
+            if (
+                self._motion is not None
+                and self._ui_state is not us.UiState.UNAVAILABLE
+            ):
+                self._robot_event(us.Ev.RECORD_PRESSED)
                 return
-            image = self._image_name()
-            if image is None:
-                return
-            self._on_config_commit()
-            clip_dir = self.controller.output_dir / name
-            if image_missing(image):
-                # The image is not used, so the recording only gets the always-used
-                # watermarks.
-                status = f"Image {image!r} not found in {
-                    Path.cwd()
-                }; only selkabot.png is used. Starting recording…"
-                watermark_image = None
-            else:
-                status = "Starting recording…"
-                watermark_image = image or None
-            fadein_path = self._fade_image_path(self.fadein_image)
-            fadeout_path = self._fade_image_path(self.fadeout_image)
-            self._run(
-                self.controller.start_recording(
-                    clip_dir, watermark_image, fadein_path, fadeout_path
-                ),
-                status,
-                self._on_recording_started,
-            )
+            self._start_recording()
+        elif self._ui_state in us.MOTION_STATES:
+            self._robot_event(us.Ev.STOP_PRESSED)
         else:
-            self._run(
-                self.controller.stop_recording(),
-                "Stopping recording…",
-                self._on_recording_stopped,
-            )
+            self._stop_recording()
+
+    def _start_recording(
+        self,
+        on_started: Callable[[], None] | None = None,
+        on_failed: Callable[[Exception], None] | None = None,
+    ) -> bool:
+        """Start the GoPro recording. False (status set) if the folder or
+        image name is unusable, in which case nothing was started."""
+        name = self._folder_name()
+        if name is None:
+            return False
+        image = self._image_name()
+        if image is None:
+            return False
+        self._on_config_commit()
+        clip_dir = self.controller.output_dir / name
+        if image_missing(image):
+            # The image is not used, so the recording only gets the always-used
+            # watermarks.
+            status = f"Image {image!r} not found in {
+                Path.cwd()
+            }; only selkabot.png is used. Starting recording…"
+            watermark_image = None
+        else:
+            status = "Starting recording…"
+            watermark_image = image or None
+        fadein_path = self._fade_image_path(self.fadein_image)
+        fadeout_path = self._fade_image_path(self.fadeout_image)
+
+        def started(result: None) -> None:
+            self._on_recording_started(result)
+            if on_started:
+                on_started()
+
+        self._run(
+            self.controller.start_recording(
+                clip_dir, watermark_image, fadein_path, fadeout_path
+            ),
+            status,
+            started,
+            on_failed,
+        )
+        return True
+
+    def _stop_recording(self) -> None:
+        """Stop the GoPro recording, at most once per recording."""
+        if self._stop_recording_requested:
+            return
+        self._stop_recording_requested = True
+        self._run(
+            self.controller.stop_recording(),
+            "Stopping recording…",
+            self._on_recording_stopped,
+            self._on_stop_recording_failed,
+        )
+
+    def _on_stop_recording_failed(self, _error: Exception) -> None:
+        self._stop_recording_requested = False  # let the operator press Stop again
+        if self._ui_state is us.UiState.STOPPING:
+            self._robot_event(us.Ev.RECORDING_STOPPED)
 
     def _on_recording_started(self, _: None) -> None:
         self._recording = True
+        self._stop_recording_requested = False
         self._record_started = time.monotonic()
         self._show_paused()
 
     def _on_recording_stopped(self, camera_files: list[str]) -> None:
         self._recording = False
+        if self._ui_state is us.UiState.STOPPING:
+            self._robot_event(us.Ev.RECORDING_STOPPED)
         if not camera_files:
             self.status.set(
                 "Recording stopped, but no new file was found on the camera."
@@ -920,6 +1045,316 @@ class LivestreamApp:
     def _on_process_error(self, clip: Clip, error: Exception) -> None:
         self.status.set(f"Error processing {clip.original.name}: {error}")
 
+    # Robot motions ------------------------------------------------------------
+    # The flow is driven by sw/robot/ui_state.py; these methods feed it events
+    # and carry out the actions it returns. Robot results arrive on worker
+    # threads and are posted to self._events, so widgets are only touched here.
+
+    def _init_robot(
+        self,
+        runner: MotionRunner | None,
+        motions: dict[str, MotionConfig] | None,
+        broken: dict[str, str] | None,
+        motion: str,
+        settings: RobotSettings | None,
+    ) -> None:
+        self.motion_runner = runner
+        self.motions = dict(motions or {})
+        self.robot_settings = settings or RobotSettings()
+        # Disabled motions and why (startup check, broken motion.json, load).
+        self._motion_reasons: dict[str, str] = dict(broken or {})
+        known = motion in self.motions or motion in self._motion_reasons
+        self._motion: str | None = motion if runner is not None and known else None
+        if runner is not None and motion and not known:
+            logger.warning("Saved motion %r is not published; using none", motion)
+        self._ui_state = (
+            us.UiState.CHECKING if runner is not None else us.UiState.UNAVAILABLE
+        )
+        self._robot_op = 0
+        self._timers: list[str] = []
+        self._stop_recording_requested = False
+        self._poll_ticks = 0
+        self.motion_buttons: dict[str | None, tk.Button] = {}
+        self.robot_button: tk.Button | None = None
+        self.robot_status = tk.StringVar(master=self.root)
+
+    def _build_motion_row(self, parent: ttk.Frame) -> None:
+        """One button per motion plus "No motion"; disabled motions stay visible
+        and show their reason on mouse-over."""
+        ttk.Label(parent, text="Motion", width=10, anchor="w").pack(side="left")
+        names: list[str | None] = [None]
+        names += sorted(set(self.motions) | set(self._motion_reasons))
+        for name in names:
+            button = tk.Button(
+                parent,
+                text=name or "No motion",
+                command=functools.partial(self._on_motion_click, name),
+            )
+            button.pack(side="left", padx=2)
+            button.bind("<Enter>", functools.partial(self._on_motion_hover, name))
+            self.motion_buttons[name] = button
+        ttk.Label(parent, textvariable=self.robot_status, anchor="w").pack(
+            side="left", fill="x", expand=True, padx=(8, 0)
+        )
+
+    def _motion_ok(self, name: str | None) -> bool:
+        return name is None or (
+            name in self.motions and name not in self._motion_reasons
+        )
+
+    def _can_change_motion(self) -> bool:
+        return self._ui_state is us.UiState.IDLE and not self._recording
+
+    def _on_motion_hover(self, name: str | None, _event: Any = None) -> None:
+        if name in self._motion_reasons:
+            self.robot_status.set(f"'{name}' disabled: {self._motion_reasons[name]}")
+
+    def _on_motion_click(self, name: str | None) -> None:
+        if name == self._motion or not self._can_change_motion():
+            return
+        if not self._motion_ok(name):
+            return
+        label = name or "No motion"
+        if not messagebox.askyesno("Change motion", f"Change the motion to '{label}'?"):
+            return
+        # The dialog runs a nested event loop: things may have changed meanwhile.
+        if not (self._can_change_motion() and self._motion_ok(name)):
+            self.robot_status.set("Motion not changed: the robot or camera got busy.")
+            return
+        self._motion = name
+        save_motion(self.config_file, name or "")
+        self._robot_event(us.Ev.SELECT_CONFIRMED, name)
+
+    def _on_robot_button(self) -> None:
+        """Move to Start, or Stop robot while moving, or Clear fault."""
+        state = self._ui_state
+        if state is us.UiState.IDLE:
+            self._robot_event(us.Ev.MOVE_TO_START)
+        elif state is us.UiState.MOVING_TO_START:
+            self._robot_event(us.Ev.STOP_PRESSED)
+        elif state is us.UiState.FAULT:
+            self._robot_event(us.Ev.FAULT_CLEARED)
+
+    def _robot_context(self) -> us.Context:
+        runner = self.motion_runner
+        at_start, error = False, math.inf
+        if runner is not None and self._motion in self.motions:
+            at_start, error = runner.at_start(self._motion)
+        return us.Context(
+            motion=self._motion,
+            at_start=at_start,
+            start_error_deg=error,
+            auto_stop=self.robot_settings.auto_stop_after_motion,
+            runner_fault=runner is not None and runner.state is RunnerState.FAULT,
+            move_speed_pct=self.robot_settings.move_to_start_speed_pct,
+        )
+
+    def _robot_event(self, kind: us.Ev, arg: Any = None) -> None:
+        state = self._ui_state
+        new, actions = us.transition(state, us.Event(kind, arg), self._robot_context())
+        if new is state and not actions:
+            logger.debug("Robot UI: %s ignored in %s", kind.value, state.value)
+        else:
+            logger.info("Robot UI: %s: %s -> %s", kind.value, state.value, new.value)
+        self._ui_state = new
+        for action in actions:
+            self._do_robot_action(action)
+        if new is not us.UiState.CLOSED:
+            self._update_controls()
+
+    def _do_robot_action(self, action: us.Action) -> None:
+        kind, arg = action.kind, action.arg
+        runner = self.motion_runner
+        assert runner is not None
+        ev = self._robot_event
+        if kind is us.Act.STATUS:
+            self.robot_status.set(arg)
+        elif kind is us.Act.LOAD:
+            self._run_robot(
+                lambda: runner.load(arg),
+                lambda _: ev(us.Ev.LOADED),
+                lambda e: ev(us.Ev.LOAD_FAILED, e),
+            )
+        elif kind is us.Act.MOVE_TO_START:
+            self._run_robot(
+                lambda: runner.move_to_start(arg),
+                lambda _: ev(us.Ev.MOVE_DONE),
+                lambda e: ev(us.Ev.MOVE_FAILED, e),
+            )
+        elif kind is us.Act.RUN:
+            self._run_robot(
+                lambda: runner.run(arg),
+                lambda _: ev(us.Ev.MOTION_DONE),
+                lambda e: ev(us.Ev.MOTION_FAILED, e),
+            )
+        elif kind is us.Act.START_RECORDING:
+            started = self._start_recording(
+                on_started=lambda: ev(us.Ev.RECORDING_STARTED),
+                on_failed=lambda e: ev(us.Ev.RECORDING_FAILED, e),
+            )
+            if not started:  # bad folder/image name; the status says why
+                self._events.put(
+                    lambda: ev(us.Ev.RECORDING_FAILED, "check the folder and image")
+                )
+        elif kind is us.Act.SCHEDULE_PRE_ROLL:
+            self._schedule(self.robot_settings.pre_roll_s, us.Ev.PRE_ROLL_ELAPSED)
+        elif kind is us.Act.SCHEDULE_POST_ROLL:
+            self._schedule(self.robot_settings.post_roll_s, us.Ev.POST_ROLL_ELAPSED)
+        elif kind is us.Act.CANCEL_TIMERS:
+            for handle in self._timers:
+                self.root.after_cancel(handle)
+            self._timers.clear()
+        elif kind is us.Act.STOP_ROBOT:
+            self._stop_robot()
+        elif kind is us.Act.STOP_RECORDING:
+            self._stop_recording()
+        elif kind is us.Act.CLEAR_FAULT:
+            runner.clear_fault()
+        elif kind is us.Act.CLOSE_RUNNER:
+            runner.close()
+        elif kind is us.Act.MARK_INVALID:
+            name, reason = arg
+            if name is not None:
+                self._motion_reasons[name] = reason
+                if self._motion == name:
+                    self._motion = None  # in memory only; the config keeps it
+
+    def _stop_robot(self) -> None:
+        # stop() never raises but can wait ~1 s for the RPC lock; keep the UI
+        # responsive.
+        runner = self.motion_runner
+        assert runner is not None
+        threading.Thread(target=runner.stop, name="robot-stop", daemon=True).start()
+
+    def _schedule(self, seconds: float, kind: us.Ev) -> None:
+        handle = ""
+
+        def fire() -> None:
+            if handle in self._timers:
+                self._timers.remove(handle)
+            self._robot_event(kind)
+
+        handle = self.root.after(int(seconds * 1000), fire)
+        self._timers.append(handle)
+
+    def _run_robot(
+        self,
+        start: Callable[[], concurrent.futures.Future],
+        on_done: Callable[[Any], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        """Start a MotionRunner job; callbacks run on the Tk thread. A result
+        from an operation older than the latest one is ignored."""
+        self._robot_op += 1
+        op = self._robot_op
+
+        def deliver(future: concurrent.futures.Future | None, error: Exception | None):
+            if op != self._robot_op:
+                logger.info("Ignoring a stale robot result (op %d)", op)
+                return
+            if future is not None:
+                error = future.exception()
+            if error is not None:
+                logger.warning("Robot operation failed: %s", error)
+                on_error(error)
+            else:
+                assert future is not None
+                on_done(future.result())
+
+        try:
+            future = start()
+        except Exception as e:  # pylint: disable=broad-except
+            self._events.put(functools.partial(deliver, None, e))
+            return
+        future.add_done_callback(
+            lambda f: self._events.put(functools.partial(deliver, f, None))
+        )
+
+    def _start_robot_check(self) -> None:
+        runner = self.motion_runner
+        assert runner is not None
+        self.robot_status.set("Checking robot…")
+        self._run_robot(
+            runner.connect_and_check, self._on_robot_checked, self._on_robot_unreachable
+        )
+        op = self._robot_op
+        self.root.after(
+            int(ROBOT_CHECK_TIMEOUT_S * 1000), lambda: self._robot_check_timeout(op)
+        )
+
+    def _robot_check_timeout(self, op: int) -> None:
+        if self._ui_state is us.UiState.CHECKING and op == self._robot_op:
+            self._robot_op += 1  # a late answer is now stale
+            self._on_robot_unreachable(TimeoutError("no answer from the robot"))
+
+    def _on_robot_unreachable(self, error: Exception) -> None:
+        for name in self.motions:
+            self._motion_reasons.setdefault(name, f"robot unreachable: {error}")
+        self._motion = None
+        self._robot_event(us.Ev.STARTUP_FAILED, error)
+
+    def _on_robot_checked(self, reasons: dict[str, str | None]) -> None:
+        for name, reason in reasons.items():
+            if reason is not None:
+                self._motion_reasons[name] = reason
+        saved = self._motion
+        if saved is not None and not self._motion_ok(saved):
+            self._motion = None  # in memory only; the config keeps the saved value
+        self._robot_event(us.Ev.STARTUP_CHECKED)
+        if saved is not None and self._motion is None:
+            self.robot_status.set(
+                f"Saved motion '{saved}' is disabled ({self._motion_reasons[saved]}); "
+                "using No motion."
+            )
+        elif self._motion is not None:
+            self._robot_event(us.Ev.SELECT_CONFIRMED, self._motion)
+
+    def _record_allowed_by_robot(self) -> bool:
+        if self.motion_runner is None or self._motion is None:
+            return True
+        return self._ui_state in (
+            us.UiState.IDLE,
+            us.UiState.UNAVAILABLE,
+            us.UiState.FAULT,
+            *us.MOTION_STATES,
+        )
+
+    def _update_robot_controls(self) -> None:
+        if self.motion_runner is None or self._ui_state is us.UiState.CLOSED:
+            return
+        state = self._ui_state
+        can_change = self._can_change_motion()
+        for name, button in self.motion_buttons.items():
+            active = name == self._motion
+            ok = self._motion_ok(name)
+            button.config(
+                relief="sunken" if active else "raised",
+                bg="#1565c0" if active else "#e0e0e0",
+                fg="white" if active else "black",
+                disabledforeground="#9e9e9e" if ok else "#c62828",
+                state="normal" if can_change and ok else "disabled",
+            )
+        if self.robot_button is None:
+            return
+        if state is us.UiState.MOVING_TO_START:
+            self.robot_button.config(
+                text="Stop robot", bg="#c62828", fg="white", state="normal"
+            )
+        elif state is us.UiState.FAULT:
+            self.robot_button.config(
+                text="Clear fault", bg="#f9a825", fg="black", state="normal"
+            )
+        else:
+            usable = state is us.UiState.IDLE and self._motion is not None
+            usable = usable and not self._recording
+            at_start = usable and self._robot_context().at_start
+            self.robot_button.config(
+                text="Move to Start",
+                bg="#ef6c00" if usable and not at_start else "#e0e0e0",
+                fg="white" if usable and not at_start else "black",
+                state="normal" if usable else "disabled",
+            )
+
     # UI ---------------------------------------------------------------------
 
     def _update_controls(self) -> None:
@@ -937,8 +1372,10 @@ class LivestreamApp:
                 fg="white",
                 activebackground="#1b5e20",
             )
-        self.record_button.config(state="disabled" if self._busy else "normal")
+        record_ok = not self._busy and self._record_allowed_by_robot()
+        self.record_button.config(state="normal" if record_ok else "disabled")
         self._update_mode_states()
+        self._update_robot_controls()
         # The folder and image are fixed for the duration of a recording
         # and its download.
         radio_state = "disabled" if self._busy or self._recording else "normal"
@@ -958,6 +1395,10 @@ class LivestreamApp:
                 f"● Recording {self.picker.mode.label} — \
                 {elapsed // 60:02d}:{elapsed % 60:02d}"
             )
+
+        self._poll_ticks += 1
+        if self._poll_ticks % ROBOT_REFRESH_TICKS == 0:
+            self._update_robot_controls()
 
         frame = self.reader.latest_frame()
         # Ignore frames still buffered from before the preview was paused.
@@ -1012,6 +1453,10 @@ class LivestreamApp:
         self._show_message("REC - preview paused while recording", color=(60, 60, 230))
 
     def _on_close(self) -> None:
+        # Stop the robot first: the GoPro shutdown below can take seconds. The
+        # shutdown also stops a recording in progress.
+        if self.motion_runner is not None:
+            self._robot_event(us.Ev.CLOSE)
         self.reader.stop()
         self.record_button.config(state="disabled")
         self.status.set("Closing…")
@@ -1050,6 +1495,16 @@ def main() -> None:
         action="store_true",
         help="Only download and watermark; skip the upload and QR code",
     )
+    parser.add_argument(
+        "--robot-ip",
+        default=None,
+        help="Fairino controller IP (overrides 'robot.ip' in the config file)",
+    )
+    parser.add_argument(
+        "--no-robot",
+        action="store_true",
+        help="Run without the robot: no motion buttons, recording only",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -1063,6 +1518,18 @@ def main() -> None:
     )
 
     folder, image, fadein_image, fadeout_image = load_config(CONFIG_FILE)
+    motion, robot_raw = load_robot_config(CONFIG_FILE)
+    runner, settings, motions, broken = None, None, {}, {}
+    if not args.no_robot:
+        try:
+            settings = robot_settings_from_dict(robot_raw)
+        except (SchemaError, TypeError) as e:
+            logger.error("Robot disabled: invalid 'robot' settings: %s", e)
+        else:
+            if args.robot_ip:
+                settings = dataclasses.replace(settings, ip=args.robot_ip)
+            motions, broken = load_motions(MOTIONS_DIR)
+            runner = MotionRunner.for_robot(settings, motions)
     root = tk.Tk()
     LivestreamApp(
         root,
@@ -1073,6 +1540,11 @@ def main() -> None:
         fadein_image=fadein_image,
         fadeout_image=fadeout_image,
         config_file=CONFIG_FILE,
+        motion_runner=runner,
+        motions=motions,
+        broken_motions=broken,
+        motion=motion,
+        robot_settings=settings,
     )
     root.mainloop()
 

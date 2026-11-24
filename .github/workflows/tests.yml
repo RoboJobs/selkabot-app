@@ -17,5 +17,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # The Fairino SDK is git-ignored; pyproject.toml installs it from third_party/.
+      - name: Fetch the Fairino SDK
+        run: bash sw/setup_fairino_sdk.sh
       - run: uv sync --locked
       - run: uv run pytest --cov=sw.livestream --cov=sw.camera --cov=sw.shotcut_watermark --cov=sw.shotcut_pipeline --cov-report=term-missing sw/tests/
