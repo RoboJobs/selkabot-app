@@ -115,3 +115,18 @@ def test_unwrap_keeps_multiple_turns():
     values = [0.0, 150.0, 300.0, 450.0, 600.0]
     wrapped = [((v + 180) % 360) - 180 for v in values]
     assert pose.unwrap_deg(wrapped) == pytest.approx(values, abs=1e-9)
+
+
+def test_camera_angles_reads_pan_tilt_and_roll():
+    from scipy.spatial.transform import Rotation
+
+    level_pose = pose.rotation_to_sdk_euler(pose.level_rotation(30.0, -12.0))
+    assert pose.camera_angles(*level_pose) == pytest.approx(
+        (30.0, -12.0, 0.0), abs=1e-9
+    )
+    rolled = (
+        pose.level_rotation(30.0, -12.0)
+        @ Rotation.from_euler("z", 5.0, degrees=True).as_matrix()
+    )
+    pan, tilt, roll = pose.camera_angles(*pose.rotation_to_sdk_euler(rolled))
+    assert (pan, tilt, roll) == pytest.approx((30.0, -12.0, 5.0), abs=1e-9)

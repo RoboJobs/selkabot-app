@@ -20,13 +20,16 @@ import yaml
 from sw.robot import path as path_module
 from sw.robot import schema, templates, tpd_file, validate
 from sw.robot.fr5 import FR5, FairinoError, FileTransferError
+from sw.robot.frames import base_to_authoring
+from sw.robot.level import LevelError, level_keyframe
+from sw.robot.pose import camera_angles
 
 SIM_IP = "192.168.50.2"
 ROBOT_IP = "192.168.58.2"
 MOTIONS_DIR = Path(__file__).resolve().parent / "motions"
 BUILD_DIR = Path(__file__).resolve().parent / "build"
 POSE_TOLERANCE = 0.01
-MOVE_TO_START_SPEED_PCT = 10
+MOVE_TO_START_SPEED_PCT = 50
 
 
 class CommandError(Exception):
@@ -77,6 +80,11 @@ def cmd_new(args: argparse.Namespace) -> None:
         raise CommandError(f"{folder} already exists")
     folder.mkdir(parents=True)
     design = templates.new_design(args.template, args.name)
+    if args.tool is not None:
+        design["tool_id"] = args.tool
+    if args.interpolation:
+        design = {"name": design.pop("name"), "interpolation": args.interpolation,
+                  **design}  # fmt: skip
     (folder / "design.yaml").write_text(yaml.safe_dump(design, sort_keys=False))
     print(f"Wrote {folder / 'design.yaml'} from template '{args.template}'.")
     print("Edit its keyframes and workspace before validating.")
@@ -85,29 +93,114 @@ def cmd_new(args: argparse.Namespace) -> None:
 # -- pose -----------------------------------------------------------------
 
 
-def cmd_pose(args: argparse.Namespace) -> None:
-    from sw.robot.pose import level_rotation, roll_error_deg, sdk_euler_to_rotation
+def _r(values, digits=4):
+    return [round(float(v), digits) for v in values]
 
+
+def cmd_pose(args: argparse.Namespace) -> None:
+    """Show the robot's current camera pose and what leveling would change."""
     robot = FR5.connect(args.ip)
     try:
         joints = robot.joints()
-        pose = robot.tcp_pose()
         tool = robot.active_tool()
+        pose = robot.fk(joints)
+        try:
+            leveled = level_keyframe(robot.fk, joints)
+        except LevelError as exc:
+            leveled = exc
     finally:
         robot.close()
-    print("Joints (deg):", [round(v, 4) for v in joints])
-    print("Active tool:", tool)
-    print("TCP pose [x,y,z,rx,ry,rz] (mm, deg):", [round(v, 4) for v in pose])
-    rotation = sdk_euler_to_rotation(*pose[3:])
-    roll = roll_error_deg(rotation)
-    # pan/tilt of the current pose, assuming it is level: invert level_rotation
-    # is not available directly, so report roll and let the operator read
-    # pan/tilt off the pose's own rz/combination if they need it precisely.
-    print(f"Roll relative to level: {roll:.3f}deg (0 if level)")
-    print()
-    print("Copy the position into a keyframe's 'pos', the joints into")
-    print("'seed_joints', and read pan/tilt from the pendant or by trial.")
-    _ = level_rotation  # kept for future use; silence unused-import lint
+    pan, tilt, roll = camera_angles(*pose[3:])
+    print("Joints (deg):", _r(joints))
+    print(
+        f"Active tool: {tool}"
+        + ("  (tool 0 is the flange, not the camera)" if tool == 0 else "")
+    )
+    print("Pose [x,y,z,rx,ry,rz] (mm, deg):", _r(pose))
+    print(f"Camera: pan {pan:.3f}, tilt {tilt:.3f}, roll {roll:.3f} (0 = horizontal)")
+    if isinstance(leveled, LevelError):
+        print(f"Cannot level here: {leveled}")
+    else:
+        print(
+            f"Leveled by the wrist: joints {_r(leveled.joints)}, camera moves "
+            f"{leveled.moved_mm:.1f}mm"
+        )
+    print("'motionctl capture NAME --t T' writes this pose (leveled) as a keyframe.")
+
+
+# -- capture ---------------------------------------------------------------
+
+
+def cmd_capture(args: argparse.Namespace) -> None:
+    """Write the robot's current pose (or --joints) as a leveled keyframe.
+
+    Joints are read, not the pendant's pose readout: they do not depend on the
+    active tool, and FK with the design's tool gives the exact camera pose.
+    """
+    path = _design_path(args.name)
+    if not path.exists():
+        raise CommandError(f"no design.yaml for {args.name!r} (run 'new' first)")
+    if args.t < 0:
+        raise CommandError("--t must be >= 0")
+    raw = yaml.safe_load(path.read_text())
+    robot = FR5.connect(args.ip)
+    try:
+        tool = robot.active_tool()
+        if tool != raw.get("tool_id"):
+            raise CommandError(
+                f"the controller's active tool is {tool} but the design uses "
+                f"{raw.get('tool_id')}; apply the camera tool on the pendant first"
+            )
+        joints = list(args.joints) if args.joints else robot.joints()
+        if args.no_level:
+            pose = robot.fk(joints)
+            roll_before = camera_angles(*pose[3:])[2]
+            moved = 0.0
+        else:
+            try:
+                result = level_keyframe(robot.fk, joints)
+            except LevelError as exc:
+                raise CommandError(f"cannot level this keyframe: {exc}") from exc
+            joints, pose = result.joints, result.pose
+            roll_before, moved = result.roll_before, result.moved_mm
+    finally:
+        robot.close()
+
+    pan, tilt, _roll = camera_angles(*pose[3:])
+    anchor_raw = raw.get("anchor") or {}
+    anchor_obj = schema.Anchor(
+        tuple(anchor_raw.get("pos", (0.0, 0.0, 0.0))),
+        float(anchor_raw.get("yaw_deg", 0.0)),
+    )
+    pos_a = base_to_authoring(pose[:3], anchor_obj)
+    kf = {
+        "t": float(args.t),
+        "pos": _r(pos_a, 3),
+        "pan": round(pan - anchor_obj.yaw_deg, 4),
+        "tilt": round(tilt, 4),
+    }
+    if raw.get("interpolation") == "joint":
+        kf["seed"] = _r(joints)
+    keyframes = [] if args.reset else list(raw.get("keyframes") or [])
+    keyframes = [k for k in keyframes if abs(float(k["t"]) - args.t) > 1e-9]
+    keyframes.append(kf)
+    keyframes.sort(key=lambda k: float(k["t"]))
+    raw["keyframes"] = keyframes
+    if args.reset or args.t == 0:
+        raw["seed_joints"] = _r(joints)
+    path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    print(f"Keyframe t={args.t}: pos {kf['pos']}, pan {kf['pan']}, tilt {kf['tilt']}")
+    if args.no_level:
+        print(
+            f"Not leveled (roll {roll_before:.3f}deg is dropped when the keyframe "
+            "is solved; near full reach that can make it unreachable)."
+        )
+    else:
+        print(
+            f"Leveled by the wrist: removed {roll_before:.3f}deg of roll, camera "
+            f"moved {moved:.1f}mm. Joints {_r(joints)}"
+        )
+    print(f"{len(keyframes)} keyframe(s) in {path}")
 
 
 # -- plan -----------------------------------------------------------------
@@ -442,7 +535,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("new")
     p.add_argument("name")
     p.add_argument("--template", required=True, choices=sorted(templates.TEMPLATES))
+    p.add_argument("--interpolation", choices=schema.INTERPOLATIONS)
+    p.add_argument("--tool", type=int, help="tool_id (the camera is tool 1)")
     p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("capture")
+    p.add_argument("name")
+    p.add_argument("--t", type=float, required=True, help="keyframe time (s)")
+    p.add_argument(
+        "--joints", type=float, nargs=6, help="use these instead of the robot's"
+    )
+    p.add_argument("--reset", action="store_true", help="drop existing keyframes")
+    p.add_argument("--no-level", action="store_true")
+    _add_ip(p)
+    p.set_defaults(func=cmd_capture)
 
     p = sub.add_parser("pose")
     _add_ip(p)

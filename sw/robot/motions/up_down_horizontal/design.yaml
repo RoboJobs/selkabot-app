@@ -1,4 +1,4 @@
-name: camtest
+name: up_down_horizontal
 tool_id: 1
 interpolation: joint
 sample_period_ms: 8

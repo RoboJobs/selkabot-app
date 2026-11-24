@@ -114,6 +114,21 @@ def sdk_euler_to_rotation(rx: float, ry: float, rz: float) -> np.ndarray:
     return Rotation.from_euler(SDK_EULER, [rx, ry, rz], degrees=True).as_matrix()
 
 
+def camera_angles(rx: float, ry: float, rz: float) -> tuple[float, float, float]:
+    """(pan, tilt, roll) in degrees of a camera whose SDK orientation is rx, ry, rz.
+
+    pan and tilt describe where the optical axis points; roll is the rotation
+    about it relative to level (roll_error_deg). "Horizontal" means roll = 0:
+    image-right has no vertical component (x_cam . z_base = 0) and image-down
+    points downward (y_cam . z_base < 0).
+    """
+    rotation = sdk_euler_to_rotation(rx, ry, rz)
+    z_cam = rotation[:, 2]
+    pan = math.degrees(math.atan2(z_cam[1], z_cam[0]))
+    tilt = math.degrees(math.atan2(z_cam[2], math.hypot(z_cam[0], z_cam[1])))
+    return pan, tilt, roll_error_deg(rotation)
+
+
 def unwrap_deg(values: Sequence[float]) -> list[float]:
     """Remove ±360° jumps from a sequence of angles in degrees."""
     radians = np.unwrap(np.radians(np.asarray(values, dtype=float)))

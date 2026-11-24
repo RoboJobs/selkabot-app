@@ -398,3 +398,60 @@ def test_joint_report_serialises_fk_poses_and_interpolation():
     assert data["num_points"] == 501
     assert data["samples"]["pose"][0] == pytest.approx(report.poses[0])
     assert "max_roll_deg" in data["peaks"]
+
+
+# -- joint mode is exactly level (wrist solved at every sample) -------------------
+
+
+def test_joint_mode_is_exactly_level_while_pan_and_tilt_change():
+    raw = copy.deepcopy(JOINT)
+    raw["keyframes"] = [
+        {"t": 0.0, "pos": [600, -200, 300], "pan": 20, "tilt": -10},
+        {"t": 4.0, "pos": [600, 200, 800], "pan": -25, "tilt": 15},
+    ]
+    report = validate.validate(_design(raw), [], FakeKinematics())
+    assert report.passed, [c for c in report.checks if not c.passed]
+    assert report.peaks.max_roll_deg < 1e-3
+    assert (report.samples[0].pan, report.samples[0].tilt) == pytest.approx(
+        (20, -10), abs=1e-3
+    )
+    assert (report.samples[-1].pan, report.samples[-1].tilt) == pytest.approx(
+        (-25, 15), abs=1e-3
+    )
+
+
+def test_joint_mode_levels_a_rolled_joints_keyframe_with_the_wrist_only():
+    from scipy.spatial.transform import Rotation
+
+    from sw.robot.pose import level_rotation, rotation_to_sdk_euler
+
+    rot = level_rotation(0, 0) @ Rotation.from_euler("z", 6, degrees=True).as_matrix()
+    rolled = FakeKinematics().ik([600, 0, 800, *rotation_to_sdk_euler(rot)], [0] * 6)
+    raw = copy.deepcopy(JOINT)
+    raw["keyframes"][1] = {"t": 4.0, "joints": rolled}
+    report = validate.validate(_design(raw), [], FakeKinematics())
+    assert report.passed
+    assert report.peaks.max_roll_deg < 1e-3
+    assert report.joints[-1][:3] == pytest.approx(rolled[:3])  # arm as given
+    assert report.joints[-1][3:] != pytest.approx(rolled[3:])  # wrist re-solved
+
+
+def test_joint_mode_reports_when_the_wrist_cannot_level():
+    class StuckWrist(FakeKinematics):
+        def fk(self, joints6):  # the wrist does nothing: orientation is fixed
+            return super().fk([*joints6[:3], -100.0, -80.0, 170.0])
+
+    report = validate.validate(_design(JOINT), [], StuckWrist())
+    assert not report.passed
+    check = next(c for c in report.checks if c.name == "check_wrist_level")
+    assert not check.passed and "sample 0" in check.detail
+
+
+def test_check_wrist_singularity_flags_j5_near_zero():
+    design = _design(JOINT)
+    samples = [validate.Sample(0.0, (0, 0, 0), 0, 0, None)] * 2
+    near = [[0, -90, 90, -90, -90, 0], [0, -90, 90, -90, 3.0, 0]]
+    check = validate.check_wrist_singularity(design, samples, near)
+    assert not check.passed and "sample 1" in check.detail
+    far = [[0, -90, 90, -90, -90, 0]] * 2
+    assert validate.check_wrist_singularity(design, samples, far).passed

@@ -359,3 +359,96 @@ def test_fit_refuses_when_a_non_timing_check_fails(connect, _redirect_dirs):
     raw = dict(JOINT_DESIGN, tool_id=3)  # active tool is 0: check_active_tool fails
     _write_design(motions, raw)
     assert _run(["fit", "crane", "--write"]) == 1
+
+
+# -- new --tool/--interpolation, capture ----------------------------------------
+
+
+def test_new_sets_tool_and_interpolation(_redirect_dirs):
+    motions, _build = _redirect_dirs
+    _run(
+        [
+            "new",
+            "demo",
+            "--template",
+            "first_test",
+            "--tool",
+            "1",
+            "--interpolation",
+            "joint",
+        ]
+    )
+    d = schema.load_design(motions / "demo" / "design.yaml")
+    assert (d.tool_id, d.interpolation) == (1, "joint")
+
+
+def _capture_setup(connect, motions, interpolation="joint"):
+    import yaml
+
+    _seed_ik_fk(connect)
+    args = ["new", "demo", "--template", "first_test", "--interpolation", interpolation]
+    _run(args)
+    path = motions / "demo" / "design.yaml"
+    return path, yaml
+
+
+def test_capture_reset_writes_one_leveled_keyframe_and_the_seed(
+    connect, _redirect_dirs
+):
+    motions, _build = _redirect_dirs
+    path, yaml = _capture_setup(connect, motions)
+    joints = _pose_to_joints([600.0, 0.0, 300.0, -90.0, 0.0, -90.0])
+    connect.robot_state_pkg.jt_cur_pos = joints
+    assert _run(["capture", "demo", "--t", "0", "--reset"]) == 0
+    raw = yaml.safe_load(path.read_text())
+    assert len(raw["keyframes"]) == 1
+    kf = raw["keyframes"][0]
+    assert kf["t"] == 0.0 and kf["pos"] == pytest.approx([600, 0, 300], abs=1e-3)
+    assert "seed" in kf
+    assert raw["seed_joints"] == pytest.approx(kf["seed"])
+
+
+def test_capture_appends_and_replaces_by_time_then_validates(connect, _redirect_dirs):
+    motions, _build = _redirect_dirs
+    path, yaml = _capture_setup(connect, motions)
+    level_start = _pose_to_joints([600.0, 0.0, 300.0, -90.0, 0.0, -90.0])
+    level_end = _pose_to_joints([600.0, 0.0, 800.0, -90.0, 0.0, -90.0])
+    _run(["capture", "demo", "--t", "0", "--reset", "--joints", *map(str, level_start)])
+    _run(["capture", "demo", "--t", "4", "--joints", *map(str, level_end)])
+    _run(["capture", "demo", "--t", "4", "--joints", *map(str, level_end)])  # replace
+    raw = yaml.safe_load(path.read_text())
+    assert [k["t"] for k in raw["keyframes"]] == [0.0, 4.0]
+    assert _run(["validate", "demo"]) == 0
+
+
+def test_capture_levels_a_rolled_pose(connect, _redirect_dirs):
+    from scipy.spatial.transform import Rotation
+
+    from sw.robot.pose import camera_angles, level_rotation, rotation_to_sdk_euler
+
+    motions, _build = _redirect_dirs
+    path, yaml = _capture_setup(connect, motions)
+    rot = level_rotation(10, -5) @ Rotation.from_euler("z", 8, degrees=True).as_matrix()
+    joints = _pose_to_joints([600.0, 0.0, 300.0, *rotation_to_sdk_euler(rot)])
+    assert _run(["capture", "demo", "--t", "0", "--reset", "--joints",
+                 *map(str, joints)]) == 0  # fmt: skip
+    kf = yaml.safe_load(path.read_text())["keyframes"][0]
+    assert (kf["pan"], kf["tilt"]) == pytest.approx((10, -5), abs=1e-3)
+    seeded_pose = _joints_to_pose(kf["seed"])
+    assert abs(camera_angles(*seeded_pose[3:])[2]) < 1e-3  # the seed is level
+
+
+def test_capture_refuses_when_the_active_tool_differs(connect, _redirect_dirs):
+    motions, _build = _redirect_dirs
+    _capture_setup(connect, motions)
+    connect.robot_state_pkg.tool = 1  # design uses tool 0
+    assert _run(["capture", "demo", "--t", "0", "--reset"]) == 1
+
+
+def test_capture_in_cartesian_mode_writes_no_seed(connect, _redirect_dirs):
+    motions, _build = _redirect_dirs
+    path, yaml = _capture_setup(connect, motions, interpolation="cartesian")
+    connect.robot_state_pkg.jt_cur_pos = _pose_to_joints([600.0, 0, 300, -90, 0, -90])
+    assert _run(["capture", "demo", "--t", "0", "--reset"]) == 0
+    kf = yaml.safe_load(path.read_text())["keyframes"][0]
+    assert "seed" not in kf

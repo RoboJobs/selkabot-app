@@ -49,7 +49,7 @@ Consequences for implementation and testing:
 | D6 | Joint values in the file come from the controller's kinematics. Cartesian mode: IK at every sample (`GetInverseKinRef`, seeded with the previous sample); the pose columns are the planned pose. Joint mode (D10): IK only at the keyframes; the pose columns are the controller's FK of every sample. | File joints and poses must agree. We don't know which of the two `MoveTPD` uses, so both must be right. |
 | D7 | Keep motions **≤ 20 s** for now. | The verified recording is 23 s (11520 points at 2 ms, 1.3 MB). |
 | D8 | Safety minimum: operator YES prompt before any motion; move to start at 10% speed; `StopMotion` on Ctrl-C, Stop, close or error; controller collision detection stays on. **The physical e-stop is the primary safety device.** | — |
-| D10 | Two interpolation modes (§ Interpolation modes). **`interpolation: joint` is the default choice for large moves** (cranes and swings that reach full extension or fold the arm); `cartesian` (the default value) for moves where the camera must follow a planned spatial path or track a target. | Found on the first real motion: a Cartesian straight line between "arm straight up" and "arm straight down" needs the elbow past its 160° limit and passes the wrist past the shoulder; no timing fixes that. The pendant's joint move does the same swing smoothly. |
+| D10 | Two interpolation modes (§ Interpolation modes), both exactly level. **`interpolation: joint` is the default choice for large moves** (cranes and swings that reach full extension or fold the arm); `cartesian` (the default value) for moves where the camera must follow a planned spatial path or track a target. | Found on the first real motion: a Cartesian straight line between "arm straight up" and "arm straight down" needs the elbow past its 160° limit and passes the wrist past the shoulder; no timing fixes that. The pendant's joint move does the same swing smoothly. |
 | D9 | The sim preview (`motionctl simplay`) streams a compiled TPD file's joints with `ServoJ`, one row per call, timed by the file's own period. **Never `ServoJT` (torque control).** | `ServoJ` is a direct joint-position stream, the closest thing to "replay this file" the sim can do, since `upload`/`MoveTPD` don't work there (§ Simulator vs real robot). `ServoJT` has no position reference; using it to track a trajectory needs a PD controller we have not built and do not need for visualization. |
 
 ## TPD file format (binding)
@@ -132,7 +132,7 @@ Package `sw/robot/`. Arrows mean "may import".
  │ pose.py ← path.py ← validate.py                  │   │ fr5.py               │
  │   ↑                    ↑                         │   │  RobotClient Protocol│
  │ schema.py   frames.py  tpd_file.py               │   │  FR5, FairinoError,  │
- │ joint_path.py  ui_state.py                       │   │  FileTransferError   │
+ │ joint_path.py  level.py  ui_state.py             │   │  FileTransferError   │
  └───────────────▲──────────────────────────────────┘   └──────────▲───────────┘
                  │                                                 │
       motionctl.py (CLI: new/pose/plan/validate/compile/upload/play/publish/list)
@@ -141,7 +141,7 @@ Package `sw/robot/`. Arrows mean "may import".
 ```
 Rules:
 - Only `fr5.py` imports `fairino`, and it imports it lazily inside `FR5.connect`, so tests never need the SDK.
-- `pose`, `path`, `joint_path`, `frames`, `schema`, `validate`, `tpd_file`, `ui_state` never import `fr5` or `fairino`.
+- `pose`, `path`, `joint_path`, `level`, `frames`, `schema`, `validate`, `tpd_file`, `ui_state` never import `fr5` or `fairino`.
 - `validate.py` gets IK/FK through the `Kinematics` Protocol. `FR5` satisfies it; tests use a fake.
 - There is no backend abstraction. TPD is the only backend.
 
@@ -189,17 +189,28 @@ Target-mode geometry limits (checked at every sample): `|d| ≥ min_target_dista
 | What is interpolated | camera position and pan/tilt (or target), per channel (§ Path and timing) | the six joint angles, per joint, with the same quintic/PCHIP machinery (`joint_path.py`) |
 | IK | every sample, seeded with the previous sample | keyframes only; a keyframe gives a pose (`pos`, `pan`, `tilt`, optional `seed`) or the exact `joints` |
 | Camera path between keyframes | exactly as planned (straight-ish chords) | whatever the arm does: an arc; checked against the workspace box via FK |
-| Level horizon | exact by construction | exact when J5 and J6 are equal at all keyframes (then J1 only pans and J2+J3+J4 only tilts, about axes the image-right axis is parallel to); otherwise small, measured by `check_roll` against `max_roll_deg` (default 0.5°) |
-| Singularities and joint limits | must stay away from them (`check_singularity`); a straight path can demand an impossible elbow angle mid-path | harmless: the joints are a smooth blend, and a box of joint limits contains any blend of in-limit keyframes |
+| Level horizon | exact by construction | exact: J1–J3 follow the joint blend, and at every sample the wrist J4–J6 is solved (`level.py`) so roll = 0 with pan/tilt blended between the keyframes'; `check_roll` verifies it on FK (limit `max_roll_deg`) |
+| Singularities and joint limits | must stay away from them (`check_singularity`); a straight path can demand an impossible elbow angle mid-path | the arm (J1–J3) is a smooth blend, so elbow singularity and joint-limit trouble cannot appear mid-path; the wrist must stay away from J5 = 0/180 (`check_wrist_singularity`), so keyframes whose J5 have opposite signs cannot be connected level |
 | Target mode (`orientation.mode: target`) | supported | not allowed (only per-sample IK can keep re-aiming at a point) |
 | Speed limits vs duration | approximate | exact: speeds scale as 1/T, accelerations as 1/T² |
 
-**Authoring a large move (what "largest motion while pointing" means here).** On this arm the biggest camera moves are swings of J2/J3/J4 (vertical crane) and J1 (horizontal pan swing) with the wrist (J5, J6) held. Author them in joint mode: jog to each end pose on the pendant (camera tool 1 active), record the pose and the joints, write pose keyframes with the joints as their `seed` (or `joints` keyframes directly), then `validate` and `fit`. Full extension at a keyframe is fine in joint mode. Keep J5/J6 the same at all keyframes for an exactly level horizon.
+**Authoring a large move (what "largest motion while pointing" means here).** On this arm the biggest camera moves are swings of J2/J3/J4 (vertical crane) and J1 (horizontal swing around the base). Author them in joint mode with `capture` (§ Capturing keyframes): `motionctl new NAME --template first_test --tool 1 --interpolation joint`, jog the robot to each keyframe and run `motionctl capture NAME --t T` (the first with `--reset`), then `validate` and `fit`. Full extension at a keyframe is fine in joint mode. Keep the wrist in the same configuration (same sign of J5) at every keyframe: a wrist flip between keyframes passes through the wrist singularity, where the camera cannot stay level.
+
+**The horizontal constraint, precisely.** With R the camera's rotation in the base frame (columns x = image right, y = image down, z = optical axis): x · ẑ = 0 (R[2,0] = 0, image-right has no vertical component) and y · ẑ < 0 (image-down points down, so the camera is not upside down). Together: zero roll about the optical axis, `pose.roll_error_deg` / `pose.camera_angles`. It is ill-defined when the optical axis is vertical, so `level.py` refuses |tilt| > 85°.
+
+### Capturing keyframes
+`motionctl capture NAME --t T [--joints J1..J6] [--reset] [--no-level]` writes a keyframe from the robot's current joints (or `--joints` read off the pendant):
+1. Refuses unless the controller's active tool is the design's `tool_id` (the camera, tool 1).
+2. **Uses joints, not the pendant's pose readout.** Joints do not depend on the active tool; FK with the camera tool gives the exact camera pose. (Pose readouts depend on which tool was active when read: the first br2tl keyframes were read with the flange active and looked 33°/126° off level.)
+3. **Levels with the wrist** (`level.level_keyframe`): J1–J3 kept, J4–J6 solved so roll = 0 while pan and tilt stay where the camera pointed. Rotating the camera about its own optical axis instead would swing the flange around the camera's ~400 mm offset and push near-full-reach keyframes out of reach (it did for br2tl's start).
+4. Writes `{t, pos, pan, tilt}` (authoring frame, anchor applied) plus `seed` (the leveled joints) in joint mode, replacing a keyframe at the same `t`; `--reset` starts the list over; `t = 0` or `--reset` also sets `seed_joints`.
+
+`motionctl pose` prints the current joints, tool, camera pose, pan/tilt/roll and what leveling would change.
 
 **Time.** `validate` prints the fastest duration that fits every speed/acceleration limit; `motionctl fit NAME --write` rescales all keyframe times uniformly (10 % margin by default, rounded up), which keeps the relative timing the designer chose.
 
 ### Level constraint: what is checked now
-Cartesian mode is level by construction, and the Phase 1 tests prove it (roll < 1e-9° at every sample). Joint mode measures roll on the controller's FK of every sample (`check_roll`). On the robot, the operator checks the horizon visually during the Phase 4 test. Measuring roll on the robot and calibrating the camera frame are deferred.
+Cartesian mode is level by construction, and the Phase 1 tests prove it (roll < 1e-9° at every sample). Joint mode solves the wrist for zero roll at every sample (tolerance 0.001°, limited by the controller's float32 poses) and re-checks roll on FK (`check_roll`). On the robot, the operator checks the horizon visually during the Phase 4 test. Measuring roll on the robot and calibrating the camera frame are deferred.
 
 ### Motion runner (Phase 5)
 - **Worker.** `MotionRunner` owns one daemon `threading.Thread` that runs jobs from a `queue.Queue`; each public method (except `stop`, `at_start`, `close`) enqueues a job and returns a `concurrent.futures.Future`. Daemon on purpose: SDK calls can block forever and must not keep the app alive.
@@ -282,7 +293,7 @@ keyframes:                     # t strictly increasing, first t == 0, at least 2
 ```
 Target mode: `orientation: {mode: target, target: [0, 0, 300]}` (plus the optional geometry limits) and keyframes with `pos` only, or a `target` on every keyframe. Schema rules (already enforced by `schema.py`): ≥ 2 keyframes; first and last at rest; angles mode needs `pan` and `tilt` on every keyframe and no `target`; target mode has exactly one target source and no `pan`/`tilt`; `|tilt| ≤ 85`; `sample_period_ms ∈ {2, 4, 8}`; segments ≥ `min_segment_s`; `vel` keys valid for the mode.
 
-Joint mode (D10), e.g. `sw/robot/motions/camtest/design.yaml`:
+Joint mode (D10), e.g. `sw/robot/motions/up_down_horizontal/design.yaml`:
 ```yaml
 interpolation: joint           # default: cartesian
 orientation: {mode: angles}    # required for joint mode
@@ -339,6 +350,8 @@ Signatures are binding. Private helpers are free.
 
 - **`frames.py`, `pose.py`, `path.py`**: done in Phase 1 (`design_to_base`, `base_to_authoring`, `within_workspace`; `level_rotation`, `look_at_angles`, `roll_error_deg`, `pointing_error_deg`, `rotation_to_sdk_euler`, `sdk_euler_to_rotation`, `unwrap_deg`, `SDK_EULER = "xyz"`; `Sample`, `sample_count`, `sample_times`, `build_trajectory`, `sample_path`, `to_sdk_pose`).
 - **`schema.py`**: `Design`, `Keyframe`, `MotionConfig`, `RobotSettings`, `load_design`, `load_motion_config`, `load_motion_configs`, `sha256_file`, `motion_config_to_dict`. (`CameraTool` stays but is unused until calibration.)
+- **`level.py`**: `solve_wrist(fk, joints, pan, tilt, wrist_guess=None) -> joints` (J1–J3 kept; J4–J6 by least squares on [roll, pan error, tilt error], tolerance 0.001°; raises `LevelError`), `level_keyframe(fk, joints, pan=None, tilt=None) -> LevelResult(joints, pose, pan, tilt, roll_before, moved_mm)`.
+- **`pose.py`** also has `camera_angles(rx, ry, rz) -> (pan, tilt, roll)`.
 - **`joint_path.py`**: `joint_channels(times, keyframe_joints, stop)`, `sample_joint_path(design, keyframe_joints) -> (times, joints)` (same quintic/PCHIP channels and sampling rule as `path.py`).
 - **`tpd_file.py`** (Phase 4):
   - `write(path, joints: list[list[float]], poses: list[list[float]], period_ms: int, tool_id: int) -> None` (format above; raises `ValueError` on length mismatch or rows ≠ 6 values).
@@ -347,7 +360,8 @@ Signatures are binding. Private helpers are free.
 - **`validate.py`** (Phase 3):
   - `class Kinematics(Protocol)`: `ik(pose6, ref6) -> list[float] | None`, `fk(joints6) -> list[float]`, `active_tool() -> int`, `install_angle() -> tuple[float, float]`, `joint_soft_limits() -> list[tuple[float, float]]`.
   - `validate(design, samples, kin) -> ValidationReport` (`passed`, `checks`, `peaks`, `joints`).
-  - Checks, each its own function: `check_active_tool`, `check_install_angle`, `check_target_geometry`, `check_pan_turn`, `check_path_overshoot`, `check_workspace`, `check_tcp_speed`, `check_ik` (failure message explains elbow-limit / full-extension causes), `check_singularity` (cartesian: |J3| ≥ `min_elbow_margin_deg`, |sin J5| ≥ sin `min_wrist_margin_deg`), `check_joint_steps`, `check_joint_limits`, `check_joint_speed_acc`, `check_fk_roundtrip` (cartesian, every 10th sample: < 0.1 mm, < 0.05°, angles compared modulo 360°), `check_keyframe_ik` (joint), `check_roll` (joint).
+  - Checks, each its own function: `check_active_tool`, `check_install_angle`, `check_target_geometry`, `check_pan_turn`, `check_path_overshoot`, `check_workspace`, `check_tcp_speed`, `check_ik` (failure message explains elbow-limit / full-extension causes), `check_singularity` (cartesian: |J3| ≥ `min_elbow_margin_deg`, |sin J5| ≥ sin `min_wrist_margin_deg`), `check_joint_steps`, `check_joint_limits`, `check_joint_speed_acc`, `check_fk_roundtrip` (cartesian, every 10th sample: < 0.1 mm, < 0.05°, angles compared modulo 360°), `check_keyframe_ik` (joint), `check_wrist_level` (joint: the per-sample wrist solve succeeded), `check_wrist_singularity` (joint; also part of `check_singularity`), `check_roll` (joint).
+  - `level_joint_path(design, kin, kf_joints) -> (check, times, joints)`: the joint-mode samples (J1–J3 blended, wrist solved per sample, warm-started).
   - `min_time_scale(design, peaks) -> float`: the uniform keyframe-time scale k = max(v/v_max, sqrt(a/a_max)) that fits every limit (k < 1: could be faster).
   - `ValidationReport` also carries `samples` and `poses` (the validated samples and their SDK poses: planned for cartesian, FK for joint).
   - `report_to_validated(report, design, samples) -> dict` (the `validated.json` content).
@@ -364,9 +378,10 @@ Signatures are binding. Private helpers are free.
     - `load_tpd(name)`, `tpd_start_pose(name) -> list[float]`, `move_tpd(name, blend, ovl)`, `stop()`
     - `stream_joints(rows: list[list[float]], period_s: float, ovl: int = 100)` (D9, sim preview): `ServoMoveStart()`; for each row, `ServoJ(row, [0,0,0,0], cmdT=period_s)` then sleep `period_s * 100/ovl` (clamped to ≥ 0 after subtracting the call's own elapsed time); `ServoMoveEnd()` in `finally`. Never `ServoJT`.
 - **`motionctl.py`** (Phase 4, `publish`/`list` in Phase 5): `uv run python -m sw.robot.motionctl <cmd> …`:
-  - `new NAME --template sweep|crane|orbit|push_in|first_test`
+  - `new NAME --template sweep|crane|orbit|push_in|first_test [--tool N] [--interpolation cartesian|joint]`
+  - `capture NAME --t T [--joints J1..J6] [--reset] [--no-level] [--ip IP]` (default sim): § Capturing keyframes.
   - All commands take `--ip IP`, default `192.168.50.2` (the simulator; § Simulator vs real robot). `upload`, `play` and `publish` need `--ip 192.168.58.2` and operator confirmation; they refuse to run against the default sim IP since they need the real file/motion services.
-  - `pose [--ip IP]` (default sim): print current joints, tool, TCP pose, and the pan/tilt/roll of that pose (no motion). Used to author keyframes and seed joints.
+  - `pose [--ip IP]` (default sim): print current joints, tool, camera pose, pan/tilt/roll, and what wrist leveling would change (no motion).
   - `plan NAME`: sample count, duration, peak TCP speed (no robot; joint mode prints counts only, its camera path needs FK).
   - `fit NAME [--write] [--margin 1.1] [--ip IP]` (default sim): validates, then prints the duration that fits every limit (`min_time_scale` × margin, rounded up to 0.01 s); `--write` rescales the keyframe times (and `vel` overrides) in `design.yaml`. Refuses when a non-timing check fails. `validate` also prints the fastest feasible duration.
   - `validate NAME [--ip IP]` (default sim): IK on the controller (no motion), writes `validated.json`.
@@ -461,7 +476,7 @@ Small, mechanical. Tasks:
 | Anything with `LoadTrajectoryJ`/`MoveTrajectoryJ`, Lua programs, `ServoJ` | **Not planned at all.** |
 
 ## Critical files
-- New: `sw/robot/tpd_file.py`, `joint_path.py`, `validate.py`, `fr5.py`, `ui_state.py`, `motion_runner.py`, `motionctl.py`; `sw/robot/motions/<name>/{design.yaml,motion.json}`; `sw/tests/fakes/fake_robot.py`; `sw/tests/test_robot_{fr5,validate,tpd_file,motionctl,ui_state}.py`, `sw/tests/test_motion_runner.py`.
+- New: `sw/robot/tpd_file.py`, `joint_path.py`, `level.py`, `validate.py`, `fr5.py`, `ui_state.py`, `motion_runner.py`, `motionctl.py`; `sw/robot/motions/<name>/{design.yaml,motion.json}`; `sw/tests/fakes/fake_robot.py`; `sw/tests/test_robot_{fr5,validate,tpd_file,motionctl,ui_state}.py`, `sw/tests/test_motion_runner.py`.
 - Modified: `sw/robot/schema.py`, `sw/robot/templates.py`, `sw/tests/test_robot_schema.py`, `sw/livestream.py`, `sw/tests/test_livestream_ui.py`, `.gitignore`, `README.md`.
 - Reference (read, don't modify): `sw/fairino_basic_query.py`, `sw/robot/spike/file_port_probe.py`, `sw/robot/spike/tpd_upload_check.py`, `third_party/fairino_sdk/linux/fairino/Robot.py`. `sw/tracktestpc.txt` is a local, untracked copy of a pendant recording (1.3 MB); tests must not depend on it.
 
@@ -471,14 +486,14 @@ Small, mechanical. Tasks:
 3. End to end in `livestream.py` (Phase 6): the startup check enables `first_test`; selecting it loads it without moving; Record before Move to Start is refused; Move to Start moves at 10%; Record starts the GoPro, the motion runs after the pre-roll, recording auto-stops; Stop mid-motion halts the robot and stops recording; closing the app during a motion halts the robot.
 4. Failure handling: edit `motion.json`'s md5 → the motion is disabled with "md5 mismatch"; delete the controller file → "file missing on controller".
 
-## Resolved: large swings fail in cartesian mode (camtest, 2026-11-24)
-The first real motion (`sw/robot/motions/camtest/design.yaml`) is a crane swing from the camera high and forward to low and back, with the camera level and pan near −90°. It could not be made to pass in cartesian mode; a hand-off note blamed a "velocity kink" at a detour keyframe. **That diagnosis was wrong**, and the fix is joint interpolation (D10). Findings, all measured against the simulator's real IK/FK:
+## Resolved: large swings fail in cartesian mode (camtest, now up_down_horizontal; 2026-11-24)
+The first real motion (`sw/robot/motions/up_down_horizontal/design.yaml`) is a crane swing from the camera high and forward to low and back, with the camera level and pan near −90°. It could not be made to pass in cartesian mode; a hand-off note blamed a "velocity kink" at a detour keyframe. **That diagnosis was wrong**, and the fix is joint interpolation (D10). Findings, all measured against the simulator's real IK/FK:
 
 1. **No Cartesian kink existed.** Every channel (x, y, z, pan, tilt) was monotonic through the middle keyframe, PCHIP gave it non-zero velocities, and the Cartesian path's peak acceleration was 60 mm/s².
 2. **Both endpoints are the elbow singularity.** IK gives J3 = 0.0° at both keyframes (arm straight up: the user's seed J3 = 0.077; arm straight down: the user's end joints `[90, 71, 0, -181, -90, 45]`). Near J3 = 0 the elbow angle behaves like √(distance to full reach), so following a Cartesian path into or out of it makes the joint accelerations grow without bound as the path comes to rest. The J2 acceleration "spike" (1086 deg/s² at 18 s) sat in the last and first 0.25 s, and stretching time barely reduced it (12 s → 18 s: 1322 → 1086), which is the signature of a singularity, not of a too-fast path.
 3. **The straight path is geometrically impossible mid-way.** Interpolating the camera straight from up to down needs the elbow past its 160° limit (IK fails for t ∈ [0.45, 0.55] from either side, J3 ≈ 152–156° at the edges) and swings the wrist past the shoulder (J2 travels 98° in 2 s of an 18 s move). A detour keyframe fixed reachability but not the singularities.
 4. **The joint-space blend is what the user wanted.** The user reported the pendant "computes a nice path ... the arm almost fully extends and smoothly blends the camera angle ... by simply rotating j2 and j4" — a joint move. Interpolating J1–J6 between the two keyframe solutions: J1, J5, J6 nearly constant, J2 −90 → 71, J4 30 → −181, J3 stays 0; the camera sweeps out to y = −1319 mm (the user's own "middle" pose was y = −1320.8) with pan in [−91.2°, −90°], tilt blending −29.5° → 20°, roll ≤ 0.30° (from J5/J6 differing by 0.7°/1.2° between the keyframes; the user's own start pose has 0.79° roll).
-5. **Result:** camtest in joint mode passes every check on the simulator. At 6 s: TCP 614 mm/s, joint speed 66 deg/s, joint acc 34 deg/s². `fit` gives 5.07 s (fastest within limits: 4.61 s, TCP-bound; the user's first wish of 2 s would need about 1850 mm/s, beyond the default 800 mm/s limit and the FR5's roughly 1 m/s). Compiled: `sw/robot/build/motion_camtest.txt`, 635 rows, header `635,1,8,1,0,0`. Not yet previewed (`simplay`) or run on the robot.
+5. **Result:** camtest in joint mode passes every check on the simulator. At 6 s: TCP 614 mm/s, joint speed 66 deg/s, joint acc 34 deg/s². `fit` gives 5.07 s (fastest within limits: 4.61 s, TCP-bound; the user's first wish of 2 s would need about 1850 mm/s, beyond the default 800 mm/s limit and the FR5's roughly 1 m/s). Compiled: `sw/robot/build/motion_up_down_horizontal.txt`, 635 rows, header `635,1,8,1,0,0`. Not yet previewed (`simplay`) or run on the robot.
 6. **Also fixed on the way:** `check_fk_roundtrip` compared Euler angles by plain subtraction, so rz ≈ +180° vs −180° looked like a 360° error (commit `ffa3d3d`); `fit` rounds the new duration up, not to nearest, so it never lands just over a limit.
 
 **Open-source libraries considered and not adopted (for now):**
@@ -497,4 +512,6 @@ Full earlier text of this document: `git show efdd2df:docs/design/feature/fairin
 - **End-to-end TPD route on the real robot (2026-11-24).** `sw/tracktestpc.txt` uploaded as type 20 → `/fruser/traj/tracktestpc.txt` (MD5 `442c28842962b0e814d6ff9aa151a9f8` matches) → `LoadTPD("traj/tracktestpc")` = 0 → `GetTPDStartPose` = first row's pose within 0.000013 → `MoveTPD("traj/tracktestpc", 0, 50)` played the track (`sw/fairino_basic_query.py`, `MOVE_OVL` 50, `PLAY_OVL` 50).
 - Pendant recordings live at `/fruser/<name>.txt` and load as `LoadTPD("<name>")`.
 - **Joint interpolation (2026-11-24).** First real motion (camtest) resolved by `interpolation: joint` (§ Resolved: large swings fail in cartesian mode); camera tool 1 (`t_coord = [-282, -282, -40, 90, 0, -45]`) set up on the simulator; `simplay` of `smoketest` (first_test template, tool 0) confirmed on the simulator: moves to start, then rises 100 mm with the flange level.
+- **Exact-level joint mode and keyframe capture (2026-11-24).** `up_down_horizontal` re-validated: roll 0.000° (was 0.30°), same peaks, validation about 14 s (controller FK is 0.36 ms per call). A stress test (keyframes whose J6 differ by 109° and pan by 20°) stayed at 0.000° roll with smooth joints.
+- **br2tl_horizontal (bottom right → top left), first attempt (2026-11-24), not built.** The keyframes had been read with the flange (tool 0) active: as camera poses they looked 33°/126° off level; as flange poses composed with tool 1 they were within 3.7°/2.7°, and FK of the given start joints with tool 1 matched in orientation (the position readout was 28 mm off in y, so joints are the record to trust). Leveling by rotation about the optical axis pushed the start (J3 = −3.5°, near full reach) out of reach; wrist leveling worked (roll −3.69° → 0, camera moved 7.9 mm). The start is reachable only with J5 ≈ −74° and the end only with J5 ≈ +106° (about 600 IK seeds searched), so the move needs a wrist flip through J5 = 0 and cannot stay level. It is also a 189° J2 swing over the top with the arm extended (about 3 m of camera travel): 2 s would need about 214 deg/s on J6 and over 2 m/s at the camera, beyond the FR5's roughly 180 deg/s and 1 m/s. **Next:** the user re-records both keyframes with tool 1 active and the same wrist configuration, using `capture`; then `validate` and `fit` give the feasible duration.
 - Phase 4 robot test results: *(to be filled in: played at 8 ms yes/no and fallback used, `move_tpd` return time, measured vs expected duration, visual level check)*.

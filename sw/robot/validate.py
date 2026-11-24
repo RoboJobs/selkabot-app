@@ -9,8 +9,10 @@ Two pipelines, chosen by `design.interpolation`:
   called sample by sample, seeded with the previous sample's solution (the
   first with design.seed_joints). The camera is level exactly by construction.
 - joint: IK runs only at the keyframes (or the keyframe gives `joints`
-  directly); the joints are blended in joint space (joint_path.py) and FK of
-  every sample gives the camera poses, whose roll is then checked.
+  directly). J1-J3 follow the joint-space blend (joint_path.py); at every
+  sample the wrist J4-J6 is solved (level.py) so the camera is exactly level
+  with pan/tilt blended between the keyframes'. FK of every sample gives the
+  camera poses; check_roll verifies the result.
 
 Peaks (speed, acceleration, joint steps) come from finite differences of the
 samples at the controller's own sample_period_ms, which is dense enough to
@@ -28,8 +30,14 @@ import numpy as np
 
 from sw.robot.frames import design_to_base, within_workspace
 from sw.robot.joint_path import sample_joint_path
-from sw.robot.path import Sample, to_sdk_pose
-from sw.robot.pose import roll_error_deg, sdk_euler_to_rotation, unwrap_deg
+from sw.robot.level import LevelError, solve_wrist
+from sw.robot.path import Channel, Sample, keyframe_velocities, to_sdk_pose
+from sw.robot.pose import (
+    camera_angles,
+    roll_error_deg,
+    sdk_euler_to_rotation,
+    unwrap_deg,
+)
 from sw.robot.schema import Design
 
 JOINT_LIMIT_MARGIN_DEG = 2.0
@@ -307,7 +315,6 @@ def check_singularity(
     construction even at a singular keyframe.
     """
     elbow_min = design.limits.min_elbow_margin_deg
-    wrist_min = math.sin(math.radians(design.limits.min_wrist_margin_deg))
     for i, js in enumerate(joints):
         if abs(js[2]) < elbow_min:
             return CheckResult(
@@ -317,14 +324,30 @@ def check_singularity(
                 f"within {elbow_min}deg of straight (singular). Use 'interpolation: "
                 "joint' for moves that reach full extension, or bend the elbow more",
             )
+    wrist = check_wrist_singularity(design, samples, joints)
+    return CheckResult("check_singularity", wrist.passed, wrist.detail)
+
+
+def check_wrist_singularity(
+    design: Design, samples: list[Sample], joints: list[list[float]]
+) -> CheckResult:
+    """|J5| stays min_wrist_margin_deg away from 0 and 180 (wrist singular).
+
+    Used by both modes: joint mode solves the wrist at every sample to keep
+    the camera level, which is ill-conditioned there too.
+    """
+    wrist_min = math.sin(math.radians(design.limits.min_wrist_margin_deg))
+    for i, js in enumerate(joints):
         if abs(math.sin(math.radians(js[4]))) < wrist_min:
             return CheckResult(
-                "check_singularity",
+                "check_wrist_singularity",
                 False,
                 f"sample {i} (t={samples[i].t:.3f}s): wrist J5={js[4]:.2f}deg is "
-                f"within {design.limits.min_wrist_margin_deg}deg of 0/180 (singular)",
+                f"within {design.limits.min_wrist_margin_deg}deg of 0/180 (singular). "
+                "Keyframes whose J5 have opposite signs need the wrist to flip "
+                "through this point: re-jog one of them with the other's wrist",
             )
-    return CheckResult("check_singularity", True)
+    return CheckResult("check_wrist_singularity", True)
 
 
 def check_roll(poses: list[list[float]], limit_deg: float) -> tuple[CheckResult, float]:
@@ -533,10 +556,66 @@ def validate(
 
 def _sample_from_pose(t: float, pose: list[float]) -> Sample:
     """A Sample (base frame) whose pan/tilt are read off an SDK pose."""
-    z_cam = sdk_euler_to_rotation(*pose[3:])[:, 2]
-    pan = math.degrees(math.atan2(z_cam[1], z_cam[0]))
-    tilt = math.degrees(math.atan2(z_cam[2], math.hypot(z_cam[0], z_cam[1])))
+    pan, tilt, _roll = camera_angles(*pose[3:])
     return Sample(t, (pose[0], pose[1], pose[2]), pan, tilt, None)
+
+
+def _keyframe_view(design: Design, kin: Kinematics, kf_joints) -> tuple[list, list]:
+    """Pan and tilt wanted at each keyframe: the pose keyframe's own values,
+    or where the camera points at a `joints` keyframe. Pans are unwrapped."""
+    base = design_to_base(design)
+    pans, tilts = [], []
+    for kf, joints in zip(base.keyframes, kf_joints, strict=True):
+        if kf.joints is None:
+            pans.append(kf.pan)
+            tilts.append(kf.tilt)
+        else:
+            pan, tilt, _roll = camera_angles(*kin.fk(joints)[3:])
+            pans.append(pan)
+            tilts.append(tilt)
+    return unwrap_deg(pans), tilts
+
+
+def level_joint_path(
+    design: Design, kin: Kinematics, kf_joints: list[list[float]]
+) -> tuple[CheckResult, list[float], list[list[float]]]:
+    """Joint-mode samples: J1-J3 from the joint blend, J4-J6 solved at every
+    sample so the camera is level with pan/tilt blended between keyframes.
+
+    The blended wrist is the starting guess; the previous sample's solution
+    (shifted by the blend's change) warm-starts the next, so each solve takes
+    a handful of FK calls.
+    """
+    times, blend = sample_joint_path(design, kf_joints)
+    kf_times = [kf.t for kf in design.keyframes]
+    stop = [i for i, kf in enumerate(design.keyframes) if kf.stop]
+    kf_pans, kf_tilts = _keyframe_view(design, kin, kf_joints)
+    pan_ch = Channel(
+        kf_times, kf_pans, keyframe_velocities(kf_times, kf_pans, {}, stop)
+    )
+    tilt_ch = Channel(
+        kf_times, kf_tilts, keyframe_velocities(kf_times, kf_tilts, {}, stop)
+    )
+    joints: list[list[float]] = []
+    guess = blend[0][3:]
+    for i, (t, q) in enumerate(zip(times, blend, strict=True)):
+        if i > 0:
+            guess = [g + q[k + 3] - blend[i - 1][k + 3] for k, g in enumerate(guess)]
+        try:
+            solved = solve_wrist(kin.fk, q, pan_ch.value(t), tilt_ch.value(t), guess)
+        except LevelError as exc:
+            return (
+                CheckResult(
+                    "check_wrist_level",
+                    False,
+                    f"sample {i} (t={t:.3f}s): {exc}",
+                ),
+                times,
+                joints,
+            )
+        joints.append(solved)
+        guess = solved[3:]
+    return CheckResult("check_wrist_level", True), times, joints
 
 
 def _validate_joint(design: Design, kin: Kinematics) -> ValidationReport:
@@ -550,7 +629,10 @@ def _validate_joint(design: Design, kin: Kinematics) -> ValidationReport:
     if not kf_result.passed:
         return ValidationReport(passed=False, checks=checks)
 
-    times, joints = sample_joint_path(design, kf_joints)
+    level_result, times, joints = level_joint_path(design, kin, kf_joints)
+    checks.append(level_result)
+    if not level_result.passed:
+        return ValidationReport(passed=False, checks=checks)
     poses = [list(kin.fk(j)) for j in joints]
     raw = [_sample_from_pose(t, p) for t, p in zip(times, poses, strict=True)]
     pans = unwrap_deg([s.pan for s in raw])
@@ -559,6 +641,7 @@ def _validate_joint(design: Design, kin: Kinematics) -> ValidationReport:
     ]
 
     peaks = _compute_peaks(design, samples, joints)
+    checks.append(check_wrist_singularity(design, samples, joints))
     roll_result, peaks.max_roll_deg = check_roll(poses, design.limits.max_roll_deg)
     checks += [
         check_workspace(design, samples),
