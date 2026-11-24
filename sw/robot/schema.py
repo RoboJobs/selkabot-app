@@ -19,6 +19,7 @@ NAME_RE = re.compile(r"^[a-z0-9_]{1,19}$")
 ALLOWED_PERIODS_MS = (2, 4, 8)
 MAX_ABS_TILT_DEG = 85.0
 BACKENDS = ("tpd",)
+INTERPOLATIONS = ("cartesian", "joint")
 ANGLE_VEL_CHANNELS = ("x", "y", "z", "pan", "tilt")
 TARGET_VEL_CHANNELS = ("x", "y", "z", "tx", "ty", "tz")
 
@@ -61,12 +62,14 @@ def _check_keys(raw: dict, allowed: set[str], path: object, where: str) -> None:
 @dataclass(frozen=True)
 class Keyframe:
     t: float
-    pos: tuple[float, float, float]
+    pos: tuple[float, float, float] | None  # None only for a joint-mode `joints` kf
     pan: float | None = None
     tilt: float | None = None
     target: tuple[float, float, float] | None = None
     vel: dict[str, float] = field(default_factory=dict)
     stop: bool = False
+    joints: tuple[float, ...] | None = None  # joint mode: exact joint target
+    seed: tuple[float, ...] | None = None  # joint mode: IK seed for a pose keyframe
 
 
 @dataclass(frozen=True)
@@ -96,9 +99,10 @@ class Limits:
     max_joint_acc_deg_s2: float = 600.0
     max_joint_step_deg: float = 2.0
     max_wrist_step_deg: float = 1.0
-    min_wrist_margin_deg: float = 15.0
+    min_wrist_margin_deg: float = 15.0  # cartesian mode: |J5| away from 0/180
+    min_elbow_margin_deg: float = 5.0  # cartesian mode: |J3| away from 0 (straight)
     overshoot_pct: float = 2.0
-    max_roll_deg: float = 0.05
+    max_roll_deg: float = 0.5  # joint mode only; cartesian mode is level exactly
     max_pointing_error_deg: float = 0.1
     min_segment_s: float = 0.05
 
@@ -119,14 +123,39 @@ class Design:
     anchor: Anchor = Anchor()
     user_id: int = 0
     limits: Limits = Limits()
+    interpolation: str = "cartesian"  # "cartesian" or "joint"
 
 
-def _keyframe(raw: Any, index: int, path: object, mode: str) -> Keyframe:
+def _keyframe(
+    raw: Any, index: int, path: object, mode: str, interpolation: str = "cartesian"
+) -> Keyframe:
     where = f"keyframes[{index}]"
     if not isinstance(raw, dict):
         raise SchemaError(path, where, "must be a mapping")
-    allowed = {"t", "pos", "pan", "tilt", "target", "vel", "stop"}
+    allowed = {"t", "pos", "pan", "tilt", "target", "vel", "stop", "joints", "seed"}
     _check_keys(raw, allowed, path, where)
+    if interpolation != "joint":
+        for key in ("joints", "seed"):
+            if key in raw:
+                raise SchemaError(
+                    path, f"{where}.{key}", "only allowed with interpolation: joint"
+                )
+    elif "vel" in raw:
+        raise SchemaError(path, f"{where}.vel", "not allowed with interpolation: joint")
+    stop = raw.get("stop", False)
+    if not isinstance(stop, bool):
+        raise SchemaError(path, f"{where}.stop", "must be true or false")
+    if interpolation == "joint" and "joints" in raw:
+        extra = sorted({"pos", "pan", "tilt", "target", "seed"} & set(raw))
+        if extra:
+            raise SchemaError(
+                path, where, f"a 'joints' keyframe cannot also set {', '.join(extra)}"
+            )
+        if "t" not in raw:
+            raise SchemaError(path, where, "needs 't'")
+        t = _number(raw["t"], path, f"{where}.t")
+        joints = _vec(raw["joints"], 6, path, f"{where}.joints")
+        return Keyframe(t, None, stop=stop, joints=joints)
     if "t" not in raw or "pos" not in raw:
         raise SchemaError(path, where, "needs 't' and 'pos'")
     t = _number(raw["t"], path, f"{where}.t")
@@ -152,10 +181,8 @@ def _keyframe(raw: Any, index: int, path: object, mode: str) -> Keyframe:
     if not isinstance(vel_raw, dict):
         raise SchemaError(path, f"{where}.vel", "must be a mapping of channel: value")
     vel = {str(k): _number(v, path, f"{where}.vel.{k}") for k, v in vel_raw.items()}
-    stop = raw.get("stop", False)
-    if not isinstance(stop, bool):
-        raise SchemaError(path, f"{where}.stop", "must be true or false")
-    return Keyframe(t, pos, pan, tilt, target, vel, stop)
+    seed = _vec(raw["seed"], 6, path, f"{where}.seed") if "seed" in raw else None
+    return Keyframe(t, pos, pan, tilt, target, vel, stop, seed=seed)
 
 
 def _orientation(raw: Any, path: object) -> Orientation:
@@ -261,6 +288,7 @@ def design_from_dict(
         "name",
         "tool_id",
         "user_id",
+        "interpolation",
         "sample_period_ms",
         "anchor",
         "seed_joints",
@@ -303,6 +331,16 @@ def design_from_dict(
         _number(anchor_raw.get("yaw_deg", 0.0), path, "anchor.yaw_deg"),
     )
     orientation = _orientation(raw.get("orientation"), path)
+    interpolation = raw.get("interpolation", "cartesian")
+    if interpolation not in INTERPOLATIONS:
+        raise SchemaError(path, "interpolation", f"must be one of {INTERPOLATIONS}")
+    if interpolation == "joint" and orientation.mode != "angles":
+        raise SchemaError(
+            path,
+            "interpolation",
+            "joint interpolation needs orientation mode 'angles' (target mode must "
+            "re-aim the camera at every sample, which only cartesian mode does)",
+        )
     limits = _limits(raw.get("limits"), path)
     workspace = raw.get("workspace")
     if not isinstance(workspace, dict):
@@ -315,7 +353,8 @@ def design_from_dict(
     if not isinstance(kf_raw, list):
         raise SchemaError(path, "keyframes", "must be a list")
     keyframes = tuple(
-        _keyframe(kf, i, path, orientation.mode) for i, kf in enumerate(kf_raw)
+        _keyframe(kf, i, path, orientation.mode, interpolation)
+        for i, kf in enumerate(kf_raw)
     )
     _check_keyframes(
         keyframes, orientation, orientation.target is not None, limits, path
@@ -332,6 +371,7 @@ def design_from_dict(
         anchor,
         user_id,
         limits,
+        interpolation,
     )
 
 

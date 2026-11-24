@@ -10,6 +10,7 @@ and "Simulator vs real robot" sections before changing this file.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -114,6 +115,18 @@ def cmd_pose(args: argparse.Namespace) -> None:
 
 def cmd_plan(args: argparse.Namespace) -> None:
     design = load_design(args.name)
+    if design.interpolation == "joint":
+        count = path_module.sample_count(
+            design.keyframes[-1].t, design.sample_period_ms
+        )
+        print(f"Design: {design.name}")
+        print(f"Interpolation: joint, tool_id: {design.tool_id}")
+        print(
+            f"Keyframes: {len(design.keyframes)}, samples: {count} at "
+            f"{design.sample_period_ms}ms, duration {design.keyframes[-1].t:.3f}s"
+        )
+        print("Camera path and speeds come from the robot's FK: run 'validate'.")
+        return
     samples = path_module.sample_path(design)
     dt = design.sample_period_ms / 1000.0
     import numpy as np
@@ -134,20 +147,46 @@ def cmd_plan(args: argparse.Namespace) -> None:
 # -- validate --------------------------------------------------------------
 
 
-def cmd_validate(args: argparse.Namespace) -> None:
-    design = load_design(args.name)
-    samples = path_module.sample_path(design)
-    robot = FR5.connect(args.ip)
+def _run_validation(name: str, ip: str):
+    """Validate a design against the robot's kinematics (no motion)."""
+    design = load_design(name)
+    samples = path_module.sample_path(design) if design.interpolation != "joint" else []
+    robot = FR5.connect(ip)
     try:
         report = validate.validate(design, samples, robot)
         install_angle = robot.install_angle()
     finally:
         robot.close()
+    return design, samples, report, install_angle
 
+
+# Checks that only depend on how fast the path is run, which `fit` can fix.
+TIMING_CHECKS = {"check_tcp_speed", "check_joint_steps", "check_joint_speed_acc"}
+
+
+def _print_report(design, report) -> None:
     for check in report.checks:
         status = "OK" if check.passed else "FAIL"
         detail = f": {check.detail}" if check.detail else ""
         print(f"[{status}] {check.name}{detail}")
+    if report.joints:
+        pk = report.peaks
+        duration = design.keyframes[-1].t
+        k = validate.min_time_scale(design, pk)
+        print(
+            f"Peaks: TCP {pk.tcp_speed_mm_s:.0f}mm/s, joint speed "
+            f"{max(pk.joint_speed_deg_s):.1f}deg/s, joint acc "
+            f"{max(pk.joint_acc_deg_s2):.1f}deg/s^2"
+        )
+        print(
+            f"Fastest duration within the limits: about {duration * k:.2f}s "
+            f"(now {duration:.2f}s). 'motionctl fit {design.name} --write' rescales."
+        )
+
+
+def cmd_validate(args: argparse.Namespace) -> None:
+    design, samples, report, install_angle = _run_validation(args.name, args.ip)
+    _print_report(design, report)
 
     if not report.passed:
         raise CommandError(f"validation failed for {args.name!r}")
@@ -164,6 +203,42 @@ def _dumps(data: dict) -> str:
     import json
 
     return json.dumps(data, indent=2)
+
+
+# -- fit -------------------------------------------------------------------
+
+
+def cmd_fit(args: argparse.Namespace) -> None:
+    """Find the uniform time scale that fits the limits; optionally apply it."""
+    design, _samples, report, _angle = _run_validation(args.name, args.ip)
+    blocking = [
+        c for c in report.checks if not c.passed and c.name not in TIMING_CHECKS
+    ]
+    if blocking or not report.joints:
+        _print_report(design, report)
+        raise CommandError(
+            "cannot fit the timing: fix the non-timing failures first "
+            f"({', '.join(c.name for c in blocking) or 'no joint solution'})"
+        )
+    k = validate.min_time_scale(design, report.peaks) * args.margin
+    old = design.keyframes[-1].t
+    new = math.ceil(old * k * 100.0) / 100.0  # round up: never below the fit
+    print(
+        f"Current duration {old:.2f}s; fitted duration {new:.2f}s "
+        f"(scale {k:.3f}, margin {args.margin})."
+    )
+    if not args.write:
+        print("Re-run with --write to rescale the keyframe times in design.yaml.")
+        return
+    path = _design_path(args.name)
+    raw = yaml.safe_load(path.read_text())
+    scale = new / old
+    for kf in raw["keyframes"]:
+        kf["t"] = round(float(kf["t"]) * scale, 4)
+        for channel, value in (kf.get("vel") or {}).items():
+            kf["vel"][channel] = value / scale  # velocities scale as 1/time
+    path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    print(f"Rewrote {path}. Run 'validate {args.name}' again to confirm.")
 
 
 def _load_validated(name: str) -> dict:
@@ -381,6 +456,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     _add_ip(p)
     p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("fit")
+    p.add_argument("name")
+    p.add_argument("--margin", type=float, default=1.1)
+    p.add_argument("--write", action="store_true")
+    _add_ip(p)
+    p.set_defaults(func=cmd_fit)
 
     p = sub.add_parser("compile")
     p.add_argument("name")

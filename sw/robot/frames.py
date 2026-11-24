@@ -47,6 +47,9 @@ def design_to_base(design: Design) -> Design:
     anchor = design.anchor
     keyframes = []
     for kf in design.keyframes:
+        if kf.pos is None:  # joint-mode `joints` keyframe: nothing to convert
+            keyframes.append(kf)
+            continue
         pan = kf.pan
         if pan is not None:
             pan = pan + anchor.yaw_deg

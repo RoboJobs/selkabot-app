@@ -272,3 +272,129 @@ def test_ik_is_seeded_with_the_previous_solution(design_raw):
     assert seen_refs[0] == list(design.seed_joints)
     for i in range(1, len(seen_refs)):
         assert seen_refs[i] == report.joints[i - 1]
+
+
+# -- singularity (cartesian mode) and IK hints ----------------------------------
+
+
+def test_cartesian_path_near_the_elbow_singularity_fails():
+    design = _design(ANGLES)
+    kin = FakeKinematics(joint_offset={2: -45.0})  # J3 = z/100: nearly straight
+    report = validate.validate(design, _samples(design), kin)
+    check = next(c for c in report.checks if c.name == "check_singularity")
+    assert not check.passed
+    assert "interpolation: joint" in check.detail
+
+
+def test_cartesian_path_near_the_wrist_singularity_fails():
+    design = _design(ANGLES)
+    kin = FakeKinematics(joint_offset={4: 90.0})  # J5 = ry: near 0
+    report = validate.validate(design, _samples(design), kin)
+    check = next(c for c in report.checks if c.name == "check_singularity")
+    assert not check.passed
+    assert "wrist" in check.detail
+
+
+def test_ik_hint_explains_the_elbow_limit_and_full_extension():
+    assert "160deg limit" in validate._ik_hint([0, 0, 155.0, 0, -90, 0])
+    assert "singularity" in validate._ik_hint([0, 0, 1.0, 0, -90, 0])
+    assert validate._ik_hint([0, 0, 90.0, 0, -90, 0]) == ""
+
+
+def test_min_time_scale_uses_speed_and_sqrt_of_acceleration():
+    design = _design(ANGLES)  # limits: tcp 800, joint 120 deg/s, 600 deg/s^2
+    peaks = validate.Peaks(
+        tcp_speed_mm_s=400.0,
+        joint_speed_deg_s=(60.0,) * 6,
+        joint_acc_deg_s2=(2400.0,) * 6,  # 4x the limit -> needs 2x the time
+        max_joint_step_deg=0.5,
+    )
+    assert validate.min_time_scale(design, peaks) == pytest.approx(2.0)
+    fast = validate.Peaks(400.0, (60.0,) * 6, (150.0,) * 6, 0.5)
+    assert validate.min_time_scale(design, fast) == pytest.approx(0.5)
+
+
+# -- interpolation: joint ------------------------------------------------------
+
+JOINT = {
+    "name": "demo",
+    "tool_id": 0,
+    "interpolation": "joint",
+    "sample_period_ms": 8,
+    "seed_joints": [0, -90, 90, -90, -90, 0],
+    "orientation": {"mode": "angles"},
+    "workspace": {"min": [0, -1000, 0], "max": [1000, 1000, 1000]},
+    "keyframes": [  # constant pan/tilt: a pure crane, level throughout
+        {"t": 0.0, "pos": [600, 0, 300], "pan": 0, "tilt": 0},
+        {"t": 4.0, "pos": [600, 0, 800], "pan": 0, "tilt": 0},
+    ],
+}
+
+
+def test_joint_design_passes_and_reports_fk_samples():
+    design = _design(JOINT)
+    report = validate.validate(design, [], FakeKinematics())
+    assert report.passed, [c for c in report.checks if not c.passed]
+    assert len(report.joints) == len(report.samples) == len(report.poses) == 501
+    assert report.samples[0].pos == pytest.approx((600, 0, 300), abs=1e-6)
+    assert report.samples[-1].pos == pytest.approx((600, 0, 800), abs=1e-6)
+    assert report.peaks.max_roll_deg < 1e-6
+    names = [c.name for c in report.checks]
+    assert "check_keyframe_ik" in names and "check_roll" in names
+    assert "check_ik" not in names  # IK runs only at the keyframes
+
+
+def test_joint_design_solves_ik_only_at_keyframes_with_their_seeds():
+    raw = copy.deepcopy(JOINT)
+    raw["keyframes"][1]["seed"] = [1, 2, 3, 4, 5, 6]
+    design = _design(raw)
+    kin = FakeKinematics()
+    refs = []
+    real_ik = kin.ik
+    kin.ik = lambda pose, ref: refs.append(list(ref)) or real_ik(pose, ref)
+    validate.validate(design, [], kin)
+    assert refs == [list(design.seed_joints), [1, 2, 3, 4, 5, 6]]
+
+
+def test_joint_design_uses_joints_keyframes_as_given():
+    raw = copy.deepcopy(JOINT)
+    end = validate.Sample(4.0, (600, 0, 800), 0, 0, None)
+    end_joints = FakeKinematics().ik(validate.to_sdk_pose(end), [0] * 6)
+    raw["keyframes"][1] = {"t": 4.0, "joints": end_joints}
+    report = validate.validate(_design(raw), [], FakeKinematics())
+    assert report.passed
+    assert report.joints[-1] == pytest.approx(end_joints)
+
+
+def test_joint_design_keyframe_ik_failure_names_the_keyframe():
+    report = validate.validate(_design(JOINT), [], FakeKinematics(fail_ik_at={1}))
+    assert not report.passed
+    check = next(c for c in report.checks if c.name == "check_keyframe_ik")
+    assert "keyframe 1" in check.detail and "seed" in check.detail
+    assert report.joints == []
+
+
+def test_check_roll_fails_for_a_rolled_camera():
+    from scipy.spatial.transform import Rotation
+
+    from sw.robot.pose import level_rotation, rotation_to_sdk_euler
+
+    rolled = (
+        level_rotation(0, 0) @ Rotation.from_euler("z", 1.0, degrees=True).as_matrix()
+    )
+    pose = [0, 0, 0, *rotation_to_sdk_euler(rolled)]
+    result, worst = validate.check_roll([pose], limit_deg=0.5)
+    assert not result.passed
+    assert worst == pytest.approx(1.0, abs=1e-6)
+    ok, _ = validate.check_roll([pose], limit_deg=2.0)
+    assert ok.passed
+
+
+def test_joint_report_serialises_fk_poses_and_interpolation():
+    design = _design(JOINT)
+    report = validate.validate(design, [], FakeKinematics())
+    data = validate.report_to_validated(report, design, [])
+    assert data["interpolation"] == "joint"
+    assert data["num_points"] == 501
+    assert data["samples"]["pose"][0] == pytest.approx(report.poses[0])
+    assert "max_roll_deg" in data["peaks"]

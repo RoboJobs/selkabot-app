@@ -2,10 +2,15 @@
 
 `validate(design, samples, kin)` runs every check below and returns a
 ValidationReport. Each check is a separate function so it can be unit
-tested alone with a FakeKinematics. IK is called sample by sample, seeded
-with the previous sample's solution (the first sample is seeded with
-design.seed_joints), since consecutive samples are close together and a good
-seed avoids IK branch flips.
+tested alone with a FakeKinematics.
+
+Two pipelines, chosen by `design.interpolation`:
+- cartesian: the camera pose is planned at every sample (path.py) and IK is
+  called sample by sample, seeded with the previous sample's solution (the
+  first with design.seed_joints). The camera is level exactly by construction.
+- joint: IK runs only at the keyframes (or the keyframe gives `joints`
+  directly); the joints are blended in joint space (joint_path.py) and FK of
+  every sample gives the camera poses, whose roll is then checked.
 
 Peaks (speed, acceleration, joint steps) come from finite differences of the
 samples at the controller's own sample_period_ms, which is dense enough to
@@ -21,8 +26,10 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from sw.robot.frames import within_workspace
+from sw.robot.frames import design_to_base, within_workspace
+from sw.robot.joint_path import sample_joint_path
 from sw.robot.path import Sample, to_sdk_pose
+from sw.robot.pose import roll_error_deg, sdk_euler_to_rotation, unwrap_deg
 from sw.robot.schema import Design
 
 JOINT_LIMIT_MARGIN_DEG = 2.0
@@ -54,6 +61,7 @@ class Peaks:
     max_joint_step_deg: float = 0.0
     max_fk_pos_err_mm: float = 0.0
     max_fk_rot_err_deg: float = 0.0
+    max_roll_deg: float = 0.0
 
 
 @dataclass
@@ -61,7 +69,9 @@ class ValidationReport:
     passed: bool
     checks: list[CheckResult] = field(default_factory=list)
     peaks: Peaks = field(default_factory=Peaks)
-    joints: list[list[float]] = field(default_factory=list)  # per-sample IK solution
+    joints: list[list[float]] = field(default_factory=list)  # per-sample joints
+    samples: list[Sample] = field(default_factory=list)  # the samples validated
+    poses: list[list[float]] = field(default_factory=list)  # per-sample SDK pose
 
 
 def _dt(design: Design) -> float:
@@ -79,7 +89,7 @@ def check_pan_turn(design: Design) -> CheckResult:
         return CheckResult("check_pan_turn", True, "not applicable (target mode)")
     limit = design.orientation.max_cumulative_pan_deg
     allow_long = design.orientation.allow_long_pan
-    kfs = design.keyframes
+    kfs = [kf for kf in design.keyframes if kf.pan is not None]
     cumulative = 0.0
     for i in range(1, len(kfs)):
         step = kfs[i].pan - kfs[i - 1].pan
@@ -256,13 +266,139 @@ def check_ik(
                 CheckResult(
                     "check_ik",
                     False,
-                    f"sample {i} (t={s.t:.3f}s): no IK solution for pose {pose}",
+                    f"sample {i} (t={s.t:.3f}s): no IK solution for pose {pose}"
+                    + _ik_hint(ref),
                 ),
                 joints,
             )
         joints.append(solution)
         ref = solution
     return CheckResult("check_ik", True), joints
+
+
+def _ik_hint(last_joints: list[float]) -> str:
+    """Explain the usual causes of an IK failure from the last good solution."""
+    elbow = abs(last_joints[2])
+    if elbow > 150.0:
+        return (
+            f". The elbow (J3) was already at {last_joints[2]:.1f}deg, near its "
+            "160deg limit: the straight Cartesian path folds the arm too far. Use "
+            "'interpolation: joint' for large swings, or add a keyframe that keeps "
+            "the camera farther from the base"
+        )
+    if elbow < 5.0:
+        return (
+            f". The elbow (J3) was at {last_joints[2]:.1f}deg: the arm is nearly "
+            "straight (elbow singularity) and the pose is at the edge of the reach. "
+            "Use 'interpolation: joint', or keep the elbow bent a few degrees"
+        )
+    return ""
+
+
+def check_singularity(
+    design: Design, samples: list[Sample], joints: list[list[float]]
+) -> CheckResult:
+    """Cartesian mode: keep away from the elbow and wrist singularities.
+
+    On this arm the elbow is singular when J3 = 0 (arm straight) and the
+    wrist when J5 = 0 or 180. Following a Cartesian path near either makes
+    the joint speeds and accelerations blow up; time scaling cannot fix it.
+    Joint mode does not need this check: its joints are smooth by
+    construction even at a singular keyframe.
+    """
+    elbow_min = design.limits.min_elbow_margin_deg
+    wrist_min = math.sin(math.radians(design.limits.min_wrist_margin_deg))
+    for i, js in enumerate(joints):
+        if abs(js[2]) < elbow_min:
+            return CheckResult(
+                "check_singularity",
+                False,
+                f"sample {i} (t={samples[i].t:.3f}s): elbow J3={js[2]:.2f}deg is "
+                f"within {elbow_min}deg of straight (singular). Use 'interpolation: "
+                "joint' for moves that reach full extension, or bend the elbow more",
+            )
+        if abs(math.sin(math.radians(js[4]))) < wrist_min:
+            return CheckResult(
+                "check_singularity",
+                False,
+                f"sample {i} (t={samples[i].t:.3f}s): wrist J5={js[4]:.2f}deg is "
+                f"within {design.limits.min_wrist_margin_deg}deg of 0/180 (singular)",
+            )
+    return CheckResult("check_singularity", True)
+
+
+def check_roll(poses: list[list[float]], limit_deg: float) -> tuple[CheckResult, float]:
+    """Joint mode: the camera's roll about its optical axis stays within limit."""
+    worst, worst_i = 0.0, 0
+    for i, pose in enumerate(poses):
+        roll = abs(roll_error_deg(sdk_euler_to_rotation(*pose[3:])))
+        if roll > worst:
+            worst, worst_i = roll, i
+    if worst > limit_deg:
+        return (
+            CheckResult(
+                "check_roll",
+                False,
+                f"sample {worst_i}: camera roll {worst:.3f}deg exceeds max_roll_deg "
+                f"({limit_deg}). Give the keyframes equal J5 and J6 to keep it level",
+            ),
+            worst,
+        )
+    return CheckResult("check_roll", True, f"max roll {worst:.3f}deg"), worst
+
+
+def check_keyframe_ik(
+    design: Design, kin: Kinematics
+) -> tuple[CheckResult, list[list[float]]]:
+    """Joint mode: one joint vector per keyframe.
+
+    A `joints` keyframe is used as given. A pose keyframe is solved by IK for
+    its level camera pose, seeded with its own `seed`, else the previous
+    keyframe's joints, else design.seed_joints.
+    """
+    base = design_to_base(design)
+    result: list[list[float]] = []
+    prev = list(design.seed_joints)
+    for i, kf in enumerate(base.keyframes):
+        if kf.joints is not None:
+            joints = list(kf.joints)
+        else:
+            pose = to_sdk_pose(Sample(kf.t, kf.pos, kf.pan, kf.tilt, None))
+            seed = list(kf.seed) if kf.seed is not None else prev
+            joints = kin.ik(pose, seed)
+            if joints is None:
+                return (
+                    CheckResult(
+                        "check_keyframe_ik",
+                        False,
+                        f"keyframe {i} (t={kf.t:.3f}s): no IK solution near seed "
+                        f"{[round(v, 3) for v in seed]} for pose "
+                        f"{[round(v, 3) for v in pose]}. Give the keyframe a 'seed' "
+                        "(the joints read on the pendant at that pose) or 'joints'",
+                    ),
+                    result,
+                )
+        result.append(list(joints))
+        prev = list(joints)
+    return CheckResult("check_keyframe_ik", True), result
+
+
+def min_time_scale(design: Design, peaks: Peaks) -> float:
+    """Smallest uniform time scale k (multiply every keyframe time by k) that
+    brings the measured peaks within the design's limits.
+
+    Speeds and joint steps scale as 1/k, accelerations as 1/k^2, so
+    k = max(v/v_max, sqrt(a/a_max)). k < 1 means the motion could run faster.
+    Exact for joint mode; for cartesian mode it is an estimate (re-validate).
+    """
+    lim = design.limits
+    ratios = [
+        peaks.tcp_speed_mm_s / lim.max_tcp_speed_mm_s,
+        max(peaks.joint_speed_deg_s) / lim.max_joint_speed_deg_s,
+        math.sqrt(max(peaks.joint_acc_deg_s2) / lim.max_joint_acc_deg_s2),
+        peaks.max_joint_step_deg / lim.max_joint_step_deg,
+    ]
+    return max(ratios)
 
 
 def check_joint_steps(design: Design, joints: list[list[float]]) -> CheckResult:
@@ -387,9 +523,60 @@ def validate(
 ) -> ValidationReport:
     """Run every check and return a ValidationReport.
 
-    Checks run in an order that fails fast on cheap, design-only problems
-    before the (relatively expensive) sample-by-sample IK pass.
+    `samples` is path.sample_path(design) for cartesian designs; joint designs
+    ignore it (their samples come from FK of the joint blend).
     """
+    if design.interpolation == "joint":
+        return _validate_joint(design, kin)
+    return _validate_cartesian(design, samples, kin)
+
+
+def _sample_from_pose(t: float, pose: list[float]) -> Sample:
+    """A Sample (base frame) whose pan/tilt are read off an SDK pose."""
+    z_cam = sdk_euler_to_rotation(*pose[3:])[:, 2]
+    pan = math.degrees(math.atan2(z_cam[1], z_cam[0]))
+    tilt = math.degrees(math.atan2(z_cam[2], math.hypot(z_cam[0], z_cam[1])))
+    return Sample(t, (pose[0], pose[1], pose[2]), pan, tilt, None)
+
+
+def _validate_joint(design: Design, kin: Kinematics) -> ValidationReport:
+    checks: list[CheckResult] = [
+        check_pan_turn(design),
+        check_active_tool(design, kin),
+        check_install_angle(kin),
+    ]
+    kf_result, kf_joints = check_keyframe_ik(design, kin)
+    checks.append(kf_result)
+    if not kf_result.passed:
+        return ValidationReport(passed=False, checks=checks)
+
+    times, joints = sample_joint_path(design, kf_joints)
+    poses = [list(kin.fk(j)) for j in joints]
+    raw = [_sample_from_pose(t, p) for t, p in zip(times, poses, strict=True)]
+    pans = unwrap_deg([s.pan for s in raw])
+    samples = [
+        Sample(s.t, s.pos, pan, s.tilt, None) for s, pan in zip(raw, pans, strict=True)
+    ]
+
+    peaks = _compute_peaks(design, samples, joints)
+    roll_result, peaks.max_roll_deg = check_roll(poses, design.limits.max_roll_deg)
+    checks += [
+        check_workspace(design, samples),
+        check_tcp_speed(design, samples, peaks),
+        check_joint_steps(design, joints),
+        check_joint_limits(joints, kin),
+        check_joint_speed_acc(design, joints, peaks),
+        roll_result,
+    ]
+    passed = all(c.passed for c in checks)
+    return ValidationReport(passed, checks, peaks, joints, samples, poses)
+
+
+def _validate_cartesian(
+    design: Design, samples: list[Sample], kin: Kinematics
+) -> ValidationReport:
+    """Checks run in an order that fails fast on cheap, design-only problems
+    before the (relatively expensive) sample-by-sample IK pass."""
     checks: list[CheckResult] = []
 
     checks.append(check_pan_turn(design))
@@ -406,6 +593,7 @@ def validate(
     checks.append(check_tcp_speed(design, samples, peaks))
 
     if ik_result.passed:
+        checks.append(check_singularity(design, samples, joints))
         checks.append(check_joint_steps(design, joints))
         checks.append(check_joint_limits(joints, kin))
         checks.append(check_joint_speed_acc(design, joints, peaks))
@@ -415,13 +603,20 @@ def validate(
         checks.append(fk_result)
 
     passed = all(c.passed for c in checks)
-    return ValidationReport(passed=passed, checks=checks, peaks=peaks, joints=joints)
+    poses = [to_sdk_pose(s) for s in samples]
+    return ValidationReport(passed, checks, peaks, joints, list(samples), poses)
 
 
 def report_to_validated(
     report: ValidationReport, design: Design, samples: list[Sample]
 ) -> dict[str, Any]:
-    """Build the validated.json content. Only meaningful when report.passed."""
+    """Build the validated.json content. Only meaningful when report.passed.
+
+    Uses the samples and poses the report validated (for joint designs those
+    come from FK, not from `samples`); `samples` is kept for older callers.
+    """
+    samples = report.samples or samples
+    poses = report.poses or [to_sdk_pose(s) for s in samples]
     duration_s = design.sample_period_ms * (len(samples) - 1) / 1000.0
     design_duration_s = float(design.keyframes[-1].t)
     return {
@@ -430,13 +625,14 @@ def report_to_validated(
         "created": datetime.datetime.now(datetime.UTC).isoformat(),
         "sample_period_ms": design.sample_period_ms,
         "tool_id": design.tool_id,
+        "interpolation": design.interpolation,
         "install_angle": None,  # filled by the caller from kin.install_angle()
         "num_points": len(samples),
         "duration_s": duration_s,
         "design_duration_s": design_duration_s,
         "samples": {
             "t": [s.t for s in samples],
-            "pose": [to_sdk_pose(s) for s in samples],
+            "pose": poses,
             "pan": [s.pan for s in samples],
             "tilt": [s.tilt for s in samples],
             "joints": report.joints,
@@ -448,6 +644,7 @@ def report_to_validated(
             "max_joint_step_deg": report.peaks.max_joint_step_deg,
             "max_fk_pos_err_mm": report.peaks.max_fk_pos_err_mm,
             "max_fk_rot_err_deg": report.peaks.max_fk_rot_err_deg,
+            "max_roll_deg": report.peaks.max_roll_deg,
         },
         "checks": [
             {"name": c.name, "passed": c.passed, "detail": c.detail}

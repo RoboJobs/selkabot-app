@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Offsets keep J3 (elbow) and J5 (wrist) away from 0, like a real bent arm, so
+# the singularity check does not reject every fake design.
+J3_OFFSET = 45.0
+J5_OFFSET = -90.0
+
 
 def _pose_to_joints(pose6: list[float]) -> list[float]:
     """A fixed, invertible, deterministic stand-in for real IK."""
     x, y, z, rx, ry, rz = pose6
-    return [x / 100.0, y / 100.0, z / 100.0, rx, ry, rz]
+    return [x / 100.0, y / 100.0, z / 100.0 + J3_OFFSET, rx, ry + J5_OFFSET, rz]
 
 
 def _joints_to_pose(joints6: list[float]) -> list[float]:
     j1, j2, j3, j4, j5, j6 = joints6
-    return [j1 * 100.0, j2 * 100.0, j3 * 100.0, j4, j5, j6]
+    return [j1 * 100.0, j2 * 100.0, (j3 - J3_OFFSET) * 100.0, j4, j5 - J5_OFFSET, j6]
 
 
 @dataclass

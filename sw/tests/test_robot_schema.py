@@ -269,3 +269,73 @@ def test_every_template_loads_and_samples(name):
 def test_unknown_template_is_rejected():
     with pytest.raises(ValueError, match="unknown template"):
         templates.new_design("nope", "demo")
+
+
+# -- interpolation: joint ------------------------------------------------------
+
+JOINT = {
+    "name": "demo",
+    "tool_id": 1,
+    "interpolation": "joint",
+    "sample_period_ms": 8,
+    "seed_joints": [90, -90, 0, 30, -90, 45],
+    "orientation": {"mode": "angles"},
+    "workspace": {"min": [-1000, -1500, -700], "max": [1000, 0, 1000]},
+    "keyframes": [
+        {"t": 0.0, "pos": [96, -403, 673], "pan": -91, "tilt": -29},
+        {"t": 5.0, "joints": [90, 71, 0, -181, -90, 45]},
+    ],
+}
+
+
+def test_interpolation_defaults_to_cartesian():
+    assert schema.design_from_dict(ANGLES, "demo").interpolation == "cartesian"
+
+
+def test_joint_design_with_pose_and_joints_keyframes_loads():
+    d = schema.design_from_dict(JOINT, "demo", folder_name="demo")
+    assert d.interpolation == "joint"
+    assert d.keyframes[0].pos == (96.0, -403.0, 673.0)
+    assert d.keyframes[1].pos is None
+    assert d.keyframes[1].joints == (90.0, 71.0, 0.0, -181.0, -90.0, 45.0)
+
+
+def test_joint_design_pose_keyframe_accepts_a_seed():
+    raw = copy.deepcopy(JOINT)
+    raw["keyframes"][1] = {
+        "t": 5.0,
+        "pos": [102, -758, -508],
+        "pan": -90,
+        "tilt": 20,
+        "seed": [90, 71, 0, -181, -90, 45],
+    }
+    d = schema.design_from_dict(raw, "demo")
+    assert d.keyframes[1].seed == (90.0, 71.0, 0.0, -181.0, -90.0, 45.0)
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
+        (lambda r: r.update(interpolation="spline"), "interpolation"),
+        (
+            lambda r: r.update(orientation={"mode": "target", "target": [0, 0, 0]}),
+            "interpolation",
+        ),
+        (lambda r: r["keyframes"][1].update(pos=[1, 2, 3]), "keyframes[1]"),
+        (lambda r: r["keyframes"][0].update(vel={"x": 1}), "keyframes[0].vel"),
+        (lambda r: r["keyframes"][1].update(joints=[1, 2, 3]), "keyframes[1].joints"),
+    ],
+)
+def test_invalid_joint_designs_raise_with_field(mutate, field):
+    with pytest.raises(schema.SchemaError) as exc:
+        schema.design_from_dict(_mutate(JOINT, mutate), "demo")
+    assert exc.value.field == field
+
+
+@pytest.mark.parametrize("key", ["joints", "seed"])
+def test_joints_and_seed_are_rejected_in_cartesian_mode(key):
+    raw = copy.deepcopy(ANGLES)
+    raw["keyframes"][1][key] = [0, 0, 0, 0, 0, 0]
+    with pytest.raises(schema.SchemaError) as exc:
+        schema.design_from_dict(raw, "demo")
+    assert exc.value.field == f"keyframes[1].{key}"

@@ -7,6 +7,7 @@ import json
 import pytest
 
 from sw.robot import fr5, motionctl, schema, tpd_file
+from sw.tests.fakes.fake_kinematics import _joints_to_pose, _pose_to_joints
 from sw.tests.fakes.fake_robot import FakeRobotClient
 
 
@@ -44,12 +45,10 @@ def _seed_ik_fk(client):
     """A trivial but invertible IK/FK so validate() can run end to end."""
 
     def ik(type, desc_pos, joint_pos_ref):
-        x, y, z, rx, ry, rz = desc_pos
-        return 0, [x / 100.0, y / 100.0, z / 100.0, rx, ry, rz]
+        return 0, _pose_to_joints(desc_pos)
 
     def fk(joint_pos):
-        j1, j2, j3, j4, j5, j6 = joint_pos
-        return 0, [j1 * 100.0, j2 * 100.0, j3 * 100.0, j4, j5, j6]
+        return 0, _joints_to_pose(joint_pos)
 
     client.GetInverseKinRef = ik
     client.GetForwardKin = fk
@@ -296,3 +295,67 @@ def test_play_ctrl_c_calls_stop_motion(connect, _redirect_dirs, monkeypatch):
     code = _run(["play", "demo", "--ip", motionctl.ROBOT_IP])
     assert code == 0
     assert "StopMotion" in [c[0] for c in connect.calls]
+
+
+# -- interpolation: joint, and fit ---------------------------------------------
+
+JOINT_DESIGN = {
+    "name": "crane",
+    "tool_id": 0,
+    "interpolation": "joint",
+    "sample_period_ms": 8,
+    "seed_joints": [0, -90, 90, -90, -90, 0],
+    "orientation": {"mode": "angles"},
+    "workspace": {"min": [0, -1000, 0], "max": [1000, 1000, 1000]},
+    "keyframes": [
+        {"t": 0.0, "pos": [600, 0, 300], "pan": 0, "tilt": 0},
+        {"t": 4.0, "pos": [600, 0, 800], "pan": 0, "tilt": 0},
+    ],
+}
+
+
+def _write_design(motions, raw):
+    import yaml
+
+    folder = motions / raw["name"]
+    folder.mkdir(parents=True)
+    (folder / "design.yaml").write_text(yaml.safe_dump(raw, sort_keys=False))
+    return folder / "design.yaml"
+
+
+def test_joint_design_validates_and_compiles_fk_poses(connect, _redirect_dirs):
+    motions, build = _redirect_dirs
+    _seed_ik_fk(connect)
+    _write_design(motions, JOINT_DESIGN)
+    assert _run(["validate", "crane"]) == 0
+    data = json.loads((motions / "crane" / "validated.json").read_text())
+    assert data["interpolation"] == "joint"
+    assert _run(["compile", "crane"]) == 0
+    tpd = tpd_file.read(build / "motion_crane.txt")
+    assert tpd.num_points == data["num_points"] == 501
+    for got, want in zip(tpd.joints, data["samples"]["joints"], strict=True):
+        assert got == pytest.approx(want, abs=1e-4)
+    # pose columns are FK of the joints (here the fake's exact inverse)
+    assert tpd.poses[0] == pytest.approx(_joints_to_pose(tpd.joints[0]), abs=1e-3)
+
+
+def test_fit_write_rescales_keyframe_times_to_the_limits(connect, _redirect_dirs):
+    import yaml
+
+    motions, _build = _redirect_dirs
+    _seed_ik_fk(connect)
+    raw = dict(JOINT_DESIGN, limits={"max_tcp_speed_mm_s": 100.0})
+    path = _write_design(motions, raw)
+    assert _run(["validate", "crane"]) == 1  # too fast for 100 mm/s
+    assert _run(["fit", "crane", "--write", "--margin", "1.0"]) == 0
+    t_end = yaml.safe_load(path.read_text())["keyframes"][-1]["t"]
+    assert t_end > 4.0
+    assert _run(["validate", "crane"]) == 0
+
+
+def test_fit_refuses_when_a_non_timing_check_fails(connect, _redirect_dirs):
+    motions, _build = _redirect_dirs
+    _seed_ik_fk(connect)
+    raw = dict(JOINT_DESIGN, tool_id=3)  # active tool is 0: check_active_tool fails
+    _write_design(motions, raw)
+    assert _run(["fit", "crane", "--write"]) == 1

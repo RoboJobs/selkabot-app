@@ -1,5 +1,6 @@
 name: camtest
 tool_id: 1
+interpolation: joint
 sample_period_ms: 8
 seed_joints:
 - 89.718
@@ -13,7 +14,7 @@ orientation:
 workspace:
   min:
   - -50
-  - -900
+  - -1400
   - -650
   max:
   - 250
@@ -27,18 +28,17 @@ keyframes:
   - 673.525
   pan: -91.165
   tilt: -29.453
-- t: 9.0
-  pos:
-  - 99.0
-  - -580.0
-  - 450.0
-  pan: -90.8
-  tilt: -20.0
-- t: 18.0
+- t: 5.07
   pos:
   - 102
   - -758.094
   - -508.421
   pan: -90.0
   tilt: 20.0
-  stop: true
+  seed:
+  - 90
+  - 71
+  - 0
+  - -181
+  - -90
+  - 45
