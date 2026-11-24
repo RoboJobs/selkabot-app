@@ -29,7 +29,7 @@ ROBOT_IP = "192.168.58.2"
 MOTIONS_DIR = Path(__file__).resolve().parent / "motions"
 BUILD_DIR = Path(__file__).resolve().parent / "build"
 POSE_TOLERANCE = 0.01
-MOVE_TO_START_SPEED_PCT = 50
+MOVE_TO_START_SPEED_PCT = 10
 
 
 class CommandError(Exception):
