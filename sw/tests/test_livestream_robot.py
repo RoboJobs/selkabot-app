@@ -530,3 +530,12 @@ def test_load_motions_reports_broken_files(tmp_path):
     configs, broken = l.load_motions(tmp_path)
     assert list(configs) == ["up_down_horizontal"]
     assert list(broken) == ["bad"]
+
+
+def test_portrait_motions_are_marked_on_their_button(make_app, monkeypatch):
+    ui, *_ = make_app()
+    assert ui.motion_buttons["up_down_horizontal"].cget("text") == "up_down_horizontal"
+    assert ui.motion_buttons[None].cget("text") == "No motion"
+    portrait = dataclasses.replace(ui.motions["other"], format="portrait")
+    ui.motions["other"] = portrait
+    assert ui._motion_label("other") == "other (portrait)"

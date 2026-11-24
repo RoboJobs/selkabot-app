@@ -53,6 +53,12 @@ $M publish NAME --ovl 100 --ip 192.168.58.2       # upload + write motion.json
 $M list --check --ip 192.168.58.2
 ```
 
+**Portrait motions** hold the camera rolled +90° about its optical axis
+(image-x down, image-y left), turned by the wrist with the same camera tool:
+`$M new NAME ... --format portrait`, or draft one from a joint-mode landscape
+motion with `$M derive NEW --from NAME --format portrait --wrist J4OFF J5OFF`,
+then validate as usual. See `docs/design/feature/fairino-control-2.md`.
+
 Capture, validate and compile against the robot that will play the file
 (`--ip 192.168.58.2`). The simulator's arm model is about 28 mm off the real
 robot's, and the controller rejects files computed on it.

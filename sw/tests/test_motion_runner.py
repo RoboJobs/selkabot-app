@@ -267,3 +267,17 @@ def test_close_during_a_run_stops_and_rejects_new_jobs(client, auto):
         r.run("demo")
     r.close()  # idempotent
     assert r.state is mr.RunnerState.CLOSED and client.closed
+
+
+def test_portrait_motion_checks_and_runs_like_a_landscape_one(client, monkeypatch):
+    monkeypatch.setattr("sw.robot.fr5.time.sleep", lambda s: None)
+    client.robot_state_pkg.robot_mode = 0
+    r = _runner(client, {"demo": _config(format="portrait")})
+    try:
+        assert r.connect_and_check().result(timeout=5) == {"demo": None}
+        r.move_to_start("demo").result(timeout=5)
+        r.run("demo").result(timeout=5)
+    finally:
+        r.close()
+    assert client.move_j_calls[-1][1] == 1  # same camera tool
+    assert client.move_tpd_calls == [("traj/motion_demo", 1, 100)]  # blend 1

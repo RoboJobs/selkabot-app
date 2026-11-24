@@ -1086,7 +1086,7 @@ class LivestreamApp:
         for name in names:
             button = tk.Button(
                 parent,
-                text=name or "No motion",
+                text=self._motion_label(name),
                 command=functools.partial(self._on_motion_click, name),
             )
             button.pack(side="left", padx=2)
@@ -1095,6 +1095,15 @@ class LivestreamApp:
         ttk.Label(parent, textvariable=self.robot_status, anchor="w").pack(
             side="left", fill="x", expand=True, padx=(8, 0)
         )
+
+    def _motion_label(self, name: str | None) -> str:
+        """Button text; portrait motions are marked (D11)."""
+        if name is None:
+            return "No motion"
+        config = self.motions.get(name)
+        if config is not None and config.format == "portrait":
+            return f"{name} (portrait)"
+        return name
 
     def _motion_ok(self, name: str | None) -> bool:
         return name is None or (

@@ -10,6 +10,7 @@ and "Simulator vs real robot" sections before changing this file.
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import sys
 import time
@@ -28,7 +29,12 @@ from sw.robot.fr5 import (
 )
 from sw.robot.frames import base_to_authoring
 from sw.robot.level import LevelError, level_keyframe
-from sw.robot.pose import camera_angles
+from sw.robot.pose import (
+    camera_angles,
+    pose_rotation_diff_deg,
+    unwrap_deg,
+    wrap_deg,
+)
 
 SIM_IP = "192.168.50.2"
 ROBOT_IP = "192.168.58.2"
@@ -92,6 +98,8 @@ def cmd_new(args: argparse.Namespace) -> None:
     design = templates.new_design(args.template, args.name)
     if args.tool is not None:
         design["tool_id"] = args.tool
+    if args.format:
+        design = {"name": design.pop("name"), "format": args.format, **design}
     if args.interpolation:
         design = {"name": design.pop("name"), "interpolation": args.interpolation,
                   **design}  # fmt: skip
@@ -107,15 +115,30 @@ def _r(values, digits=4):
     return [round(float(v), digits) for v in values]
 
 
+def _design_roll(raw: dict) -> float:
+    """The roll a raw design.yaml asks for (its 'format'; default landscape)."""
+    fmt = raw.get("format", schema.DEFAULT_FORMAT)
+    if fmt not in schema.CAMERA_ROLL_DEG:
+        raise CommandError(
+            f"format {fmt!r} must be one of {tuple(schema.CAMERA_ROLL_DEG)}"
+        )
+    return schema.CAMERA_ROLL_DEG[fmt]
+
+
 def cmd_pose(args: argparse.Namespace) -> None:
-    """Show the robot's current camera pose and what leveling would change."""
+    """Show the robot's current camera pose and what leveling would change.
+    With a design NAME, roll is shown relative to that design's format."""
+    target = None
+    if args.name:
+        load_design(args.name)  # a clear error if it does not exist
+        target = _design_roll(yaml.safe_load(_design_path(args.name).read_text()))
     robot = FR5.connect(args.ip)
     try:
         joints = robot.joints()
         tool = robot.active_tool()
         pose = robot.fk(joints)
         try:
-            leveled = level_keyframe(robot.fk, joints)
+            leveled = level_keyframe(robot.fk, joints, roll=target or 0.0)
         except LevelError as exc:
             leveled = exc
     finally:
@@ -127,15 +150,31 @@ def cmd_pose(args: argparse.Namespace) -> None:
         + ("  (tool 0 is the flange, not the camera)" if tool == 0 else "")
     )
     print("Pose [x,y,z,rx,ry,rz] (mm, deg):", _r(pose))
-    print(f"Camera: pan {pan:.3f}, tilt {tilt:.3f}, roll {roll:.3f} (0 = horizontal)")
+    print(f"Camera: pan {pan:.3f}, tilt {tilt:.3f}, roll {roll:.3f}")
+    if target is None:
+        print(
+            f"  landscape roll error {wrap_deg(roll):.3f}deg, portrait roll error "
+            f"{wrap_deg(roll - 90.0):.3f}deg"
+        )
+    else:
+        print(
+            f"  {args.name} wants roll {target:g}: off by "
+            f"{wrap_deg(roll - target):.3f}deg"
+        )
     if isinstance(leveled, LevelError):
         print(f"Cannot level here: {leveled}")
     else:
         print(
-            f"Leveled by the wrist: joints {_r(leveled.joints)}, camera moves "
-            f"{leveled.moved_mm:.1f}mm"
+            f"Leveled by the wrist to roll {target or 0.0:g}: joints "
+            f"{_r(leveled.joints)}, camera moves {leveled.moved_mm:.1f}mm, "
+            f"J5 margin {_j5_margin(leveled.joints):.1f}deg"
         )
     print("'motionctl capture NAME --t T' writes this pose (leveled) as a keyframe.")
+
+
+def _j5_margin(joints: list[float]) -> float:
+    """Distance (deg) of J5 from the wrist singularity at 0/180."""
+    return math.degrees(math.asin(min(1.0, abs(math.sin(math.radians(joints[4]))))))
 
 
 # -- capture ---------------------------------------------------------------
@@ -153,6 +192,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
     if args.t < 0:
         raise CommandError("--t must be >= 0")
     raw = yaml.safe_load(path.read_text())
+    roll = _design_roll(raw)
     robot = FR5.connect(args.ip)
     try:
         tool = robot.active_tool()
@@ -164,15 +204,16 @@ def cmd_capture(args: argparse.Namespace) -> None:
         joints = list(args.joints) if args.joints else robot.joints()
         if args.no_level:
             pose = robot.fk(joints)
-            roll_before = camera_angles(*pose[3:])[2]
+            roll_before = wrap_deg(camera_angles(*pose[3:])[2] - roll)
             moved = 0.0
         else:
             try:
-                result = level_keyframe(robot.fk, joints)
+                result = level_keyframe(robot.fk, joints, roll=roll)
             except LevelError as exc:
                 raise CommandError(f"cannot level this keyframe: {exc}") from exc
             joints, pose = result.joints, result.pose
-            roll_before, moved = result.roll_before, result.moved_mm
+            roll_before = wrap_deg(result.roll_before - roll)
+            moved = result.moved_mm
     finally:
         robot.close()
 
@@ -207,10 +248,94 @@ def cmd_capture(args: argparse.Namespace) -> None:
         )
     else:
         print(
-            f"Leveled by the wrist: removed {roll_before:.3f}deg of roll, camera "
-            f"moved {moved:.1f}mm. Joints {_r(joints)}"
+            f"Leveled by the wrist to roll {roll:g}: removed {roll_before:.3f}deg "
+            f"of roll error, camera moved {moved:.1f}mm. Joints {_r(joints)}, "
+            f"J5 margin {_j5_margin(joints):.1f}deg"
         )
     print(f"{len(keyframes)} keyframe(s) in {path}")
+
+
+# -- derive ----------------------------------------------------------------
+
+
+def cmd_derive(args: argparse.Namespace) -> None:
+    """Make an unvalidated draft in another format from a joint-mode design.
+
+    Each source keyframe's joints are resolved like validation does; the
+    --wrist J4/J5 offsets are added (the operator's maneuver, a starting
+    guess), and the wrist re-levels the camera to the new format's roll
+    keeping where it then points (like 'capture'). Read-only robot calls.
+    """
+    if _motion_dir(args.name).exists():
+        raise CommandError(f"{_motion_dir(args.name)} already exists")
+    source = load_design(args.source)
+    if source.interpolation != "joint":
+        raise CommandError(
+            f"{args.source} uses interpolation '{source.interpolation}'; derive "
+            "needs a joint-mode design (its keyframes resolve to joints)"
+        )
+    raw = yaml.safe_load(_design_path(args.source).read_text())
+    roll = schema.CAMERA_ROLL_DEG[args.format]
+    robot = FR5.connect(args.ip)
+    try:
+        tool = robot.active_tool()
+        if tool != source.tool_id:
+            raise CommandError(
+                f"the controller's active tool is {tool} but {args.source} uses "
+                f"{source.tool_id}"
+            )
+        result, kf_joints = validate.check_keyframe_ik(source, robot)
+        if not result.passed:
+            raise CommandError(
+                f"cannot resolve {args.source}'s keyframes: {result.detail}"
+            )
+        derived = []
+        for i, (kf_raw, joints) in enumerate(
+            zip(raw["keyframes"], kf_joints, strict=True)
+        ):
+            moved = [*joints[:3], joints[3] + args.wrist[0], joints[4] + args.wrist[1],
+                     joints[5]]  # fmt: skip
+            try:
+                lv = level_keyframe(robot.fk, moved, roll=roll)
+            except LevelError as exc:
+                raise CommandError(f"keyframe {i}: cannot level: {exc}") from exc
+            shift = math.dist(robot.fk(joints)[:3], lv.pose[:3])
+            derived.append((kf_raw, lv, shift))
+    finally:
+        robot.close()
+
+    pans = unwrap_deg([camera_angles(*lv.pose[3:])[0] for _, lv, _ in derived])
+    keyframes = []
+    for (kf_raw, lv, shift), pan in zip(derived, pans, strict=True):
+        tilt = camera_angles(*lv.pose[3:])[1]
+        kf = {
+            "t": float(kf_raw["t"]),
+            "pos": _r(base_to_authoring(lv.pose[:3], source.anchor), 3),
+            "pan": round(pan - source.anchor.yaw_deg, 4),
+            "tilt": round(tilt, 4),
+            "seed": _r(lv.joints),
+        }
+        if kf_raw.get("stop"):
+            kf["stop"] = True
+        keyframes.append(kf)
+        print(
+            f"t={kf['t']}: camera moved {shift:.1f}mm, pan {kf['pan']}, tilt "
+            f"{kf['tilt']}, J5 margin {_j5_margin(lv.joints):.1f}deg"
+        )
+    out = copy.deepcopy(raw)
+    out.pop("format", None)
+    out = {"name": args.name, "format": args.format,
+           **{k: v for k, v in out.items() if k != "name"}}  # fmt: skip
+    out["keyframes"] = keyframes
+    out["seed_joints"] = keyframes[0]["seed"]
+    folder = _motion_dir(args.name)
+    folder.mkdir(parents=True)
+    (folder / "design.yaml").write_text(yaml.safe_dump(out, sort_keys=False))
+    print(
+        f"Wrote draft {folder / 'design.yaml'} ({args.format}). It is not "
+        f"validated: run 'validate {args.name}' (widen the workspace or "
+        "re-capture keyframes if the moved camera path fails)."
+    )
 
 
 # -- plan -----------------------------------------------------------------
@@ -360,6 +485,14 @@ def _check_validated_current(name: str, validated: dict) -> None:
             f"validated.json is stale for {name!r} (design.yaml changed); "
             "re-run 'validate'"
         )
+    design = load_design(name)
+    fmt = validated.get("format", schema.DEFAULT_FORMAT)
+    if fmt != design.format or validated.get("tool_id") != design.tool_id:
+        raise CommandError(
+            f"validated.json ({fmt}, tool {validated.get('tool_id')}) does not "
+            f"match design.yaml ({design.format}, tool {design.tool_id}); "
+            "re-run 'validate'"
+        )
 
 
 # -- compile -----------------------------------------------------------
@@ -452,10 +585,8 @@ def _check_same_kinematics(robot: FR5, out: Path, rows: int = 12) -> None:
     for i in list(range(0, len(tpd.joints), step)) + [len(tpd.joints) - 1]:
         fk = robot.fk(tpd.joints[i])
         dpos = math.dist(fk[:3], tpd.poses[i][:3])
-        drot = max(
-            abs((a - b + 180.0) % 360.0 - 180.0)
-            for a, b in zip(fk[3:], tpd.poses[i][3:], strict=True)
-        )
+        # As rotations: near ry = 90 (portrait) Euler triples are not unique.
+        drot = pose_rotation_diff_deg(fk, tpd.poses[i])
         if dpos > KINEMATICS_TOLERANCE_MM or drot > KINEMATICS_TOLERANCE_DEG:
             raise CommandError(
                 f"{out.name} row {i}: this robot's FK of the joints is {dpos:.1f}mm "
@@ -553,6 +684,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
         "approved_ovl": args.ovl,
         "design_sha256": validated["design_sha256"],
         "published_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "format": validated.get("format", schema.DEFAULT_FORMAT),
     }
     schema.motion_config_from_dict(raw, "motion.json")  # check_consistent()
     path = _motion_json_path(args.name)
@@ -579,7 +711,8 @@ def cmd_list(args: argparse.Namespace) -> None:
         for name, config in configs.items():
             line = (
                 f"{name}: {config.duration_s:.2f}s, ovl {config.approved_ovl}, "
-                f"tool {config.tool_id}, published {config.published_at}"
+                f"tool {config.tool_id}, {config.format}, "
+                f"published {config.published_at}"
             )
             if robot is not None:
                 remote = robot.file_md5(config.controller_file)
@@ -722,7 +855,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--template", required=True, choices=sorted(templates.TEMPLATES))
     p.add_argument("--interpolation", choices=schema.INTERPOLATIONS)
     p.add_argument("--tool", type=int, help="tool_id (the camera is tool 1)")
+    p.add_argument("--format", choices=sorted(schema.CAMERA_ROLL_DEG))
     p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("derive", help="draft another format from a joint design")
+    p.add_argument("name", help="the new motion")
+    p.add_argument("--from", dest="source", required=True, help="source motion")
+    p.add_argument("--format", required=True, choices=sorted(schema.CAMERA_ROLL_DEG))
+    p.add_argument(
+        "--wrist",
+        type=float,
+        nargs=2,
+        required=True,
+        metavar=("J4OFF", "J5OFF"),
+        help="J4/J5 offsets (deg) applied before re-leveling, as on the pendant",
+    )
+    _add_ip(p)
+    p.set_defaults(func=cmd_derive)
 
     p = sub.add_parser("capture")
     p.add_argument("name")
@@ -736,6 +885,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_capture)
 
     p = sub.add_parser("pose")
+    p.add_argument("name", nargs="?", help="show roll relative to this design")
     _add_ip(p)
     p.set_defaults(func=cmd_pose)
 

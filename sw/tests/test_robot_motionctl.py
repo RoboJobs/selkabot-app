@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import copy
 import json
 
 import pytest
 
 from sw.robot import fr5, motionctl, schema, tpd_file
+from sw.robot.pose import (
+    camera_angles,
+    level_rotation,
+    rotation_to_sdk_euler,
+)
 from sw.tests.fakes.fake_kinematics import _joints_to_pose, _pose_to_joints
 from sw.tests.fakes.fake_robot import FakeRobotClient
+from sw.tests.fakes.wrist_kinematics import WristFK
 
 
 @pytest.fixture(autouse=True)
@@ -616,3 +623,274 @@ def test_play_no_smooth_passes_blend_0_to_move_tpd(
     args = ["play", "crane", "--ip", motionctl.ROBOT_IP, "--ovl", "100", "--no-smooth"]
     assert _run(args) == 0
     assert connect.move_tpd_calls == [("traj/motion_crane", 0, 100)]
+
+
+# -- portrait (D11) -----------------------------------------------------------------
+
+WRIST_SEED = [0.0, 0.0, 0.0, 0.0, -90.0, 0.0]
+
+PORTRAIT_DESIGN = {
+    "name": "port",
+    "format": "portrait",
+    "tool_id": 1,
+    "interpolation": "joint",
+    "sample_period_ms": 8,
+    "seed_joints": WRIST_SEED,
+    "orientation": {"mode": "angles"},
+    "workspace": {"min": [-1000, -1500, -1000], "max": [1500, 1500, 1500]},
+    "keyframes": [
+        {"t": 0.0, "pos": [600, -400, 450], "pan": 20, "tilt": -5},
+        {"t": 3.0, "pos": [600, 400, 650], "pan": -20, "tilt": 10},
+    ],
+}
+
+
+def _seed_wrist(client, kin=None):
+    """Make the fake controller use WristFK kinematics, tool 1 active."""
+    kin = kin or WristFK()
+    client.GetInverseKinRef = lambda type, desc_pos, ref: (0, kin.ik(desc_pos, ref))
+    client.GetForwardKin = lambda joints: (0, kin.fk(joints))
+    client.robot_state_pkg.tool = 1
+    return kin
+
+
+def _wrist_joints(kin, pan, tilt, roll, pos=(600.0, 0.0, 400.0)):
+    return kin.ik([*pos, *rotation_to_sdk_euler(level_rotation(pan, tilt, roll))],
+                  WRIST_SEED)  # fmt: skip
+
+
+def _roll_of(kin, joints):
+    return camera_angles(*kin.fk(joints)[3:])[2]
+
+
+def test_new_with_format_portrait(_redirect_dirs):
+    motions, _build = _redirect_dirs
+    _run(["new", "p", "--template", "first_test", "--tool", "1", "--format",
+          "portrait"])  # fmt: skip
+    assert schema.load_design(motions / "p" / "design.yaml").format == "portrait"
+
+
+def test_capture_on_a_portrait_design_levels_to_roll_90(
+    connect, _redirect_dirs, capsys
+):
+    import yaml
+
+    motions, _build = _redirect_dirs
+    kin = _seed_wrist(connect)
+    _run(["new", "p", "--template", "first_test", "--tool", "1", "--interpolation",
+          "joint", "--format", "portrait"])  # fmt: skip
+    connect.robot_state_pkg.jt_cur_pos = _wrist_joints(kin, 10, -5, 80.0)
+    assert _run(["capture", "p", "--t", "0", "--reset"]) == 0
+    kf = yaml.safe_load((motions / "p" / "design.yaml").read_text())["keyframes"][0]
+    assert _roll_of(kin, kf["seed"]) == pytest.approx(90.0, abs=1e-3)
+    assert (kf["pan"], kf["tilt"]) == pytest.approx((10, -5), abs=1e-3)
+    assert "roll 90" in capsys.readouterr().out
+
+
+def test_capture_on_a_landscape_design_still_levels_to_0(connect, _redirect_dirs):
+    import yaml
+
+    motions, _build = _redirect_dirs
+    kin = _seed_wrist(connect)
+    _run(["new", "l", "--template", "first_test", "--tool", "1", "--interpolation",
+          "joint"])  # fmt: skip
+    connect.robot_state_pkg.jt_cur_pos = _wrist_joints(kin, 10, -5, 6.0)
+    assert _run(["capture", "l", "--t", "0", "--reset"]) == 0
+    kf = yaml.safe_load((motions / "l" / "design.yaml").read_text())["keyframes"][0]
+    assert _roll_of(kin, kf["seed"]) == pytest.approx(0.0, abs=1e-3)
+
+
+def test_pose_with_a_design_shows_roll_relative_to_its_format(
+    connect, _redirect_dirs, capsys
+):
+    motions, _build = _redirect_dirs
+    kin = _seed_wrist(connect)
+    _write_design(motions, PORTRAIT_DESIGN)
+    connect.robot_state_pkg.jt_cur_pos = _wrist_joints(kin, 0, 0, 87.0)
+    assert _run(["pose", "port"]) == 0
+    out = capsys.readouterr().out
+    assert "port wants roll 90: off by -3.000deg" in out
+    assert _run(["pose"]) == 0
+    out = capsys.readouterr().out
+    assert "landscape roll error 87.000deg" in out
+    assert "portrait roll error -3.000deg" in out
+
+
+def _validated_portrait(connect, motions, kin=None):
+    kin = _seed_wrist(connect, kin)
+    _write_design(motions, PORTRAIT_DESIGN)
+    assert _run(["validate", "port"]) == 0
+    return kin
+
+
+def test_compile_copies_validated_poses_without_controller_calls(
+    connect, _redirect_dirs
+):
+    motions, build = _redirect_dirs
+    _validated_portrait(connect, motions)
+    validated = json.loads((motions / "port" / "validated.json").read_text())
+    assert validated["format"] == "portrait"
+    calls_before = len(connect.calls)
+    assert _run(["compile", "port"]) == 0
+    assert len(connect.calls) == calls_before  # compile never talks to the robot
+    tpd = tpd_file.read(build / "motion_port.txt")
+    for got, want in zip(tpd.poses, validated["samples"]["pose"], strict=True):
+        assert got == pytest.approx(want, abs=1e-4)
+
+
+def test_compile_and_publish_refuse_a_format_mismatch(
+    connect, _redirect_dirs, monkeypatch
+):
+    motions, _build = _redirect_dirs
+    _validated_portrait(connect, motions)
+    path = motions / "port" / "validated.json"
+    data = json.loads(path.read_text())
+    data["format"] = "landscape"
+    path.write_text(json.dumps(data))
+    assert _run(["compile", "port"]) == 1
+    assert _run(["publish", "port", "--ovl", "50", "--ip", motionctl.ROBOT_IP]) == 1
+    data["format"], data["tool_id"] = "portrait", 2
+    path.write_text(json.dumps(data))
+    assert _run(["compile", "port"]) == 1
+
+
+def test_publish_writes_format_from_validated_json(
+    connect, _redirect_dirs, monkeypatch
+):
+    from pathlib import Path
+
+    motions, _build = _redirect_dirs
+    _validated_portrait(connect, motions)
+
+    def fake_upload(self, local_path, file_type=20):
+        connect.files[f"/fruser/traj/{Path(local_path).name}"] = Path(
+            local_path
+        ).read_bytes()
+        connect.tpd_start_poses["traj/motion_port"] = tpd_file.read(local_path).poses[0]
+        return f"/fruser/traj/{Path(local_path).name}"
+
+    monkeypatch.setattr(fr5.FR5, "upload_file", fake_upload)
+    assert _run(["publish", "port", "--ovl", "60", "--ip", motionctl.ROBOT_IP]) == 0
+    config = schema.load_motion_config(motions / "port" / "motion.json")
+    assert config.format == "portrait"
+    assert config.tool_id == 1
+
+
+def test_kinematics_guard_compares_rotations(connect, _redirect_dirs):
+    motions, build = _redirect_dirs
+    _validated_portrait(connect, motions)
+    motionctl.compile_motion("port")
+    out = build / "motion_port.txt"
+    robot = fr5.FR5(connect, motionctl.ROBOT_IP)
+    # The same rotations written as other Euler triples: accepted.
+    _seed_wrist(connect, WristFK(alternate_euler=True))
+    tpd = tpd_file.read(out)
+    assert connect.GetForwardKin(tpd.joints[0])[1][3:] != pytest.approx(
+        tpd.poses[0][3:], abs=1e-3
+    )
+    motionctl._check_same_kinematics(robot, out)
+    # 0.2 deg of real rotation error, or 2 mm: refused.
+    _seed_wrist(connect, WristFK(fk_rot_offset_deg=0.2))
+    with pytest.raises(motionctl.CommandError):
+        motionctl._check_same_kinematics(robot, out)
+    _seed_wrist(connect, WristFK(offset_mm=(102.0, 0.0, 150.0)))
+    with pytest.raises(motionctl.CommandError):
+        motionctl._check_same_kinematics(robot, out)
+
+
+# -- derive --------------------------------------------------------------------------
+
+LANDSCAPE_SOURCE = {
+    **PORTRAIT_DESIGN,
+    "name": "land",
+    "format": "landscape",
+    "ramp_fraction": 0.2,
+    "anchor": {"pos": [100, 50, 0], "yaw_deg": 30},
+    "limits": {"max_tcp_speed_mm_s": 1200},
+    "keyframes": [
+        {"t": 0.0, "pos": [500, -400, 450], "pan": -10, "tilt": -5},
+        {"t": 2.0, "pos": [500, 0, 500], "pan": -20, "tilt": 0, "stop": True},
+        {"t": 4.0, "pos": [500, 400, 650], "pan": -40, "tilt": 10},
+    ],
+}
+
+
+def _derive(args):
+    return _run(["derive", "drv", "--from", "land", "--format", "portrait", *args])
+
+
+def test_derive_applies_the_wrist_guess_and_levels_to_portrait(connect, _redirect_dirs):
+    import yaml
+
+    from sw.robot import frames
+    from sw.robot import validate as validate_module
+
+    motions, _build = _redirect_dirs
+    kin = _seed_wrist(connect)
+    _write_design(motions, LANDSCAPE_SOURCE)
+    assert _derive(["--wrist", "10", "0"]) == 0
+    raw = yaml.safe_load((motions / "drv" / "design.yaml").read_text())
+    source = schema.load_design(motions / "land" / "design.yaml")
+    _, src_joints = validate_module.check_keyframe_ik(source, kin)
+    derived = schema.load_design(motions / "drv" / "design.yaml")
+    base = frames.design_to_base(derived)
+
+    assert raw["format"] == "portrait"
+    for key in ("ramp_fraction", "limits", "workspace", "anchor", "tool_id"):
+        assert raw[key] == LANDSCAPE_SOURCE[key]
+    assert [k["t"] for k in raw["keyframes"]] == [0.0, 2.0, 4.0]
+    assert [k.get("stop", False) for k in raw["keyframes"]] == [False, True, False]
+    assert raw["seed_joints"] == raw["keyframes"][0]["seed"]
+    for kf, kf_base, src in zip(raw["keyframes"], base.keyframes, src_joints,
+                                strict=True):  # fmt: skip
+        assert _roll_of(kin, kf["seed"]) == pytest.approx(90.0, abs=1e-3)
+        assert kf["seed"][:3] == pytest.approx(src[:3], abs=1e-4)  # J1-J3 kept
+        fk = kin.fk(kf["seed"])
+        # the anchor is applied once: authoring pos -> base equals the FK pose
+        assert kf_base.pos == pytest.approx(fk[:3], abs=1e-2)
+        # J4 +10 turned the view 10deg (J4 is about base z in WristFK)
+        src_pan = camera_angles(*kin.fk(src)[3:])[0]
+        assert camera_angles(*fk[3:])[0] == pytest.approx(src_pan + 10, abs=1e-2)
+
+
+def test_derive_resolves_joints_keyframes_as_given(connect, _redirect_dirs):
+    import yaml
+
+    motions, _build = _redirect_dirs
+    kin = _seed_wrist(connect)
+    raw = copy.deepcopy(LANDSCAPE_SOURCE)
+    joints = _wrist_joints(kin, -40, 10, 0.0, pos=(500, 400, 650))
+    raw["keyframes"][2] = {"t": 4.0, "joints": joints}
+    _write_design(motions, raw)
+    assert _derive(["--wrist", "0", "0"]) == 0
+    kf = yaml.safe_load((motions / "drv" / "design.yaml").read_text())["keyframes"][2]
+    assert kf["seed"][:3] == pytest.approx(joints[:3], abs=1e-4)
+    assert _roll_of(kin, kf["seed"]) == pytest.approx(90.0, abs=1e-3)
+
+
+def test_derive_refusals(connect, _redirect_dirs):
+    motions, _build = _redirect_dirs
+    _seed_wrist(connect)
+    cart = {**LANDSCAPE_SOURCE, "interpolation": "cartesian"}
+    cart.pop("ramp_fraction")
+    _write_design(motions, cart)
+    assert _derive(["--wrist", "0", "0"]) == 1  # cartesian source
+    assert not (motions / "drv").exists()
+    _write_design(motions, {**PORTRAIT_DESIGN, "name": "drv"})
+    import shutil
+
+    shutil.rmtree(motions / "land")
+    _write_design(motions, LANDSCAPE_SOURCE)
+    assert _derive(["--wrist", "0", "0"]) == 1  # target already exists
+    with pytest.raises(SystemExit):
+        _derive([])  # --wrist is required
+
+
+def test_derive_output_is_a_draft_that_may_fail_validation(connect, _redirect_dirs):
+    motions, _build = _redirect_dirs
+    _seed_wrist(connect)
+    raw = {**LANDSCAPE_SOURCE, "workspace": {"min": [0, -500, 0], "max": [1, 1, 1]}}
+    _write_design(motions, raw)
+    assert _derive(["--wrist", "0", "0"]) == 0
+    assert (motions / "drv" / "design.yaml").exists()
+    assert _run(["validate", "drv"]) == 1  # the original box rejects the path
