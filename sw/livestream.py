@@ -513,8 +513,35 @@ def load_config(config_file: Path) -> tuple[str, str, str, str]:
     )
 
 
+def _config_bool(data: dict, key: str, default: bool = True) -> bool:
+    value = data.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if value is not None:
+        logger.warning("Ignoring invalid %r in the config file; using %r", key, default)
+    return default
+
+
+def load_effects(config_file: Path) -> tuple[bool, bool]:
+    """Return (flash_enabled, fades_enabled) from the shared config."""
+    data = _read_config(config_file)
+    return _config_bool(data, "flash_enabled"), _config_bool(data, "fades_enabled")
+
+
 def save_config(
-    config_file: Path, folder: str, image: str, fadein_image: str, fadeout_image: str
+    config_file: Path,
+    folder: str,
+    image: str,
+    fadein_image: str,
+    fadeout_image: str,
+    flash_enabled: bool = True,
+    fades_enabled: bool = True,
 ) -> None:
     """Store the recording folder, watermark image and fade stills in the config
     file."""
@@ -534,6 +561,8 @@ def save_config(
                 "image": image,
                 "fadein_image": fadein_image,
                 "fadeout_image": fadeout_image,
+                "flash_enabled": flash_enabled,
+                "fades_enabled": fades_enabled,
             }
         )
         config_file.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
@@ -607,6 +636,8 @@ class LivestreamApp:
         fadeout_image: str,
         config_file: Path,
         *,
+        flash_enabled: bool = True,
+        fades_enabled: bool = True,
         motion_runner: MotionRunner | None = None,
         motions: dict[str, MotionConfig] | None = None,
         broken_motions: dict[str, str] | None = None,
@@ -619,6 +650,8 @@ class LivestreamApp:
         # No UI box for these yet; preserved as-is whenever folder/image are saved.
         self.fadein_image = fadein_image
         self.fadeout_image = fadeout_image
+        self.flash_enabled = flash_enabled
+        self.fades_enabled = fades_enabled
         self.reader = PreviewReader(controller.port)
         self._events: queue.Queue[Callable[[], None]] = queue.Queue()
         self.postprocessor = PostProcessor(
@@ -681,12 +714,31 @@ class LivestreamApp:
         ttk.Label(controls, text="Folder:").pack(side="right", padx=(8, 4))
 
         self.image = tk.StringVar(value=image)
-        self._saved_config = (folder, image)
         self.image_entry = ttk.Entry(controls, textvariable=self.image, width=14)
         self.image_entry.pack(side="right", padx=(0, 8))
         self.image_entry.bind("<Return>", self._on_config_commit)
         self.image_entry.bind("<FocusOut>", self._on_config_commit)
         ttk.Label(controls, text="Image:").pack(side="right", padx=(8, 4))
+
+        effects = ttk.Frame(root)
+        effects.pack(fill="x", padx=8, pady=(0, 4))
+        self.flash_enabled_var = tk.BooleanVar(value=flash_enabled)
+        self.fades_enabled_var = tk.BooleanVar(value=fades_enabled)
+        self._flash_checkbutton = ttk.Checkbutton(
+            effects,
+            text="Enable camera flash effect",
+            variable=self.flash_enabled_var,
+            command=self._on_config_commit,
+        )
+        self._flash_checkbutton.pack(side="left", padx=(0, 12))
+        self._fades_checkbutton = ttk.Checkbutton(
+            effects,
+            text="Enable image fade effects",
+            variable=self.fades_enabled_var,
+            command=self._on_config_commit,
+        )
+        self._fades_checkbutton.pack(side="left")
+        self._saved_config = (folder, image, flash_enabled, fades_enabled)
 
         self.status = tk.StringVar()
         ttk.Label(root, textvariable=self.status, anchor="w").pack(
@@ -883,12 +935,20 @@ class LivestreamApp:
         image = self._image_name()
         if folder is None or image is None:
             return
-        if (folder, image) == self._saved_config:
+        flash_enabled = self.flash_enabled_var.get()
+        fades_enabled = self.fades_enabled_var.get()
+        if (folder, image, flash_enabled, fades_enabled) == self._saved_config:
             return
         save_config(
-            self.config_file, folder, image, self.fadein_image, self.fadeout_image
+            self.config_file,
+            folder,
+            image,
+            self.fadein_image,
+            self.fadeout_image,
+            flash_enabled,
+            fades_enabled,
         )
-        self._saved_config = (folder, image)
+        self._saved_config = (folder, image, flash_enabled, fades_enabled)
         if image_missing(image):
             self.status.set(
                 f"Image {image!r} not found in {
@@ -1381,6 +1441,8 @@ class LivestreamApp:
         radio_state = "disabled" if self._busy or self._recording else "normal"
         self.folder_entry.config(state=radio_state)
         self.image_entry.config(state=radio_state)
+        self._flash_checkbutton.config(state=radio_state)
+        self._fades_checkbutton.config(state=radio_state)
 
     def _poll(self) -> None:
         while True:
@@ -1518,6 +1580,7 @@ def main() -> None:
     )
 
     folder, image, fadein_image, fadeout_image = load_config(CONFIG_FILE)
+    flash_enabled, fades_enabled = load_effects(CONFIG_FILE)
     motion, robot_raw = load_robot_config(CONFIG_FILE)
     runner, settings, motions, broken = None, None, {}, {}
     if not args.no_robot:
@@ -1540,6 +1603,8 @@ def main() -> None:
         fadein_image=fadein_image,
         fadeout_image=fadeout_image,
         config_file=CONFIG_FILE,
+        flash_enabled=flash_enabled,
+        fades_enabled=fades_enabled,
         motion_runner=runner,
         motions=motions,
         broken_motions=broken,

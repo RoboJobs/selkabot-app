@@ -273,6 +273,11 @@ class Probe:
     fps_num: int
     fps_den: int
     total_frames: int  # Number of frames in the source clip
+    rotation: int = 0  # Container rotation in degrees, before display-orientation swap
+
+    @property
+    def portrait(self) -> bool:
+        return self.height > self.width
 
 
 def probe_video(path: Path) -> Probe:
@@ -284,10 +289,8 @@ def probe_video(path: Path) -> Probe:
             "error",
             "-select_streams",
             "v:0",
-            "-show_entries",
-            "stream=width,height,r_frame_rate",
-            "-show_entries",
-            "format=duration",
+            "-show_streams",
+            "-show_format",
             "-of",
             "json",
             str(path),
@@ -299,6 +302,19 @@ def probe_video(path: Path) -> Probe:
     data = json.loads(out)
     stream = data["streams"][0]
     width, height = int(stream["width"]), int(stream["height"])
+    tags = stream.get("tags") or {}
+    rotation_value = tags.get("rotate", 0)
+    side_data = stream.get("side_data_list") or []
+    for item in side_data:
+        if "rotation" in item:
+            rotation_value = item["rotation"]
+            break
+    try:
+        rotation = round(float(rotation_value))
+    except (TypeError, ValueError):
+        rotation = 0
+    if abs(rotation) % 180 == 90:
+        width, height = height, width
     fps_num, fps_den = (int(x) for x in stream["r_frame_rate"].split("/"))
     duration = float(data["format"]["duration"])
     total_frames = round(duration * fps_num / fps_den)
@@ -308,7 +324,17 @@ def probe_video(path: Path) -> Probe:
         fps_num=fps_num,
         fps_den=fps_den,
         total_frames=total_frames,
+        rotation=rotation,
     )
+
+
+def output_dimensions(probe: Probe, width: int, height: int) -> tuple[int, int]:
+    """Return the configured output profile in the source's display orientation."""
+    if probe.portrait and width > height:
+        return height, width
+    if not probe.portrait and height > width:
+        return height, width
+    return width, height
 
 
 def _prop(name: str, value: object) -> str:
@@ -435,8 +461,8 @@ def normalize_source(
     _report(progress, f"normalizing to {output_width}x{output_height}@{output_fps}fps")
     vf = (
         f"fps={output_fps},scale={output_width}:{output_height}:"
-        "force_original_aspect_ratio=decrease,"
-        f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2"
+        "force_original_aspect_ratio=increase,"
+        f"crop={output_width}:{output_height}"
     )
     cmd = [
         FFMPEG,
@@ -457,6 +483,8 @@ def normalize_source(
         "yuv420p",
         "-c:a",
         "copy",
+        "-metadata:s:v:0",
+        "rotate=0",
         "-movflags",
         "+faststart",
         str(temp),
@@ -523,8 +551,8 @@ def smooth_segment(
         )
     if output_width and output_height:
         video_filter += (
-            f",scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,"
-            f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2"
+            f",scale={output_width}:{output_height}:force_original_aspect_ratio=increase,"
+            f"crop={output_width}:{output_height}"
         )
     if mode == "native":
         cache_version = "native-v1"
@@ -1356,12 +1384,15 @@ def edit_clip(
     windows = plan_windows(source_probe, settings, clip)
     clip_first, clip_frames = clip
     output_fps = settings.output_fps
+    output_width, output_height = output_dimensions(
+        source_probe, settings.output_width, settings.output_height
+    )
     output_source, probe = normalize_source(
         original,
         source_probe,
         output_fps,
-        settings.output_width,
-        settings.output_height,
+        output_width,
+        output_height,
         progress=lambda m: say(m),
     )
     output_clip = (
@@ -1380,9 +1411,7 @@ def edit_clip(
             clip_frames / source_fps:.2f}s "
         f"long, starting at {clip_first / source_fps:.2f}s ({source_probe.width}x{
             source_probe.height
-        }, {source_fps:.3f} fps) -> {settings.output_width}x{settings.output_height}@{
-            output_fps
-        }"
+        }, {source_fps:.3f} fps) -> {output_width}x{output_height}@{output_fps}"
     )
     for k, (start, end) in enumerate(windows, start=1):
         say(
@@ -1416,8 +1445,8 @@ def edit_clip(
                 chunks=settings.chunks,
                 mode=settings.smoothing,
                 output_fps=output_fps,
-                output_width=settings.output_width,
-                output_height=settings.output_height,
+                output_width=output_width,
+                output_height=output_height,
             )
 
         # The windows are rendered in parallel: each ffmpeg process is single-threaded.
@@ -1452,8 +1481,8 @@ def edit_clip(
         flash_max_gap=settings.flash_max_gap,
         flash_enabled=settings.flash_enabled,
         output_fps=output_fps,
-        output_width=settings.output_width,
-        output_height=settings.output_height,
+        output_width=output_width,
+        output_height=output_height,
     )
     if settings.exposure:
         say(f"exposure {settings.exposure:+g} stops on the recording")
