@@ -639,3 +639,74 @@ Other observations:
 - **Simulator speed is not real time.** At `SetSpeed(5)` a 60° joint move took more than two minutes. Speed limits from the manual cannot be checked on the simulator.
 - **Robot state at the end of Phase 0:** home pose, `robot_state` 1 (stopped), `motion_done` 1, error codes 0, auto mode.
 - **Consequence for the design:** the backend decision (A, B or C in § Backend and timing contract) cannot be made on the simulator. The stop-channel assumption (Threading / Stop and shutdown) is unverified and must be treated as failing until a hardware test shows otherwise. The design's fail-closed rule for the stop channel stays in force.
+
+## Implementation
+
+This section records, per phase, what differed from the plan during implementation and what was done about it. Each phase appends its entry when it finishes.
+
+### Phase 0 (partial): hardware spike, 2026-11-24
+
+Status: **partial.** Q1 and Q7 answered; Q2 and Q3 partly answered (the file exists and is found, but is rejected by LoadTrajectoryJ); Q4 not run; Q5 postponed by the user; Q6 and Q8 not run; camera calibration not run. Commits: `1526e5a` (spike scripts and first results).
+
+Controller identity: the probes ran against `192.168.58.2`, which the design calls the simulator. The user reports that the trajectory `tracktest1` was recorded on the real robot. Confirm which controller answered before treating any number below as robot evidence.
+
+| Item | Plan assumed | What happened | Action taken |
+|---|---|---|---|
+| Q1 Euler convention | Unknown, to be measured | A 10° J1 move changed TCP rz by 9.98°. Fixed-axis XYZ (`'xyz'`) is consistent with that on the simulator. | Recorded as the value of `SDK_EULER` in `pose.py`. Not yet confirmed on the real robot. |
+| Q2 TPD recording | `SetTPDStart` in auto mode | Auto mode returned 133. `DragTeachSwitch(1)` returned -1 in auto mode. Recording then returned 0 but stored zero points because no hand motion occurred. | Switched to manual mode (`Mode(1)`) before drag teach. The probe is `sw/robot/spike/tpd_record_probe.py`. |
+| Q2 download path | `FileDownload` then the data socket works | `__FileDownLoad` requires the destination to exist (-6 client side). Then the controller reported no file (-7) because the recording was empty. A second attempt returned -1 with 0 bytes written. | Created the destination file first. The -1 transfer failure is **not diagnosed**. |
+| Q2 data ports | Reliable transfers | Ports 20010 and 20011 refuse connections when idle (observed). Their behaviour during a transfer is inferred, not observed. `TrajectoryJUpLoad` returned -1 on most attempts: 1 success in 3 in one run, and each layout needed 2 tries in another. | Retries are needed. `fr5.py` must retry upload with a bounded count and log each attempt. |
+| Q7 `ComputeFileMD5` | Works for any path | My earlier report said the function did not exist. It does (`Robot.py:4104`). Error 4 means "not found". Existing file: `(0, md5)`. | Corrected in the summary. Still open: the error code for an unreadable file. |
+| Q2/Q3 `LoadTrajectoryJ` | Works on the file the controller created | Error codes resolved: **8 = file not found, 4 = file found but rejected**. Earlier "8 for every file" was all not-found paths. `tracktest1` at `/fruser/tracktest1.txt` returns 4. The file is at that path (MD5 `442c28842962b0e814d6ff9aa151a9f8`), not under `/fruser/traj/`. | Probe rewritten to use `/fruser/<name>.txt`. |
+| Q2 file format | Documented in the manual | The manual does not document the layout. `GetTrajectoryStartPose` on `tracktest1` returned `[11520, 0, 0, 0, 0, 0]`, which means the controller read the header line `11520,1,2,0,0,0` as the first pose. This is a hypothesis, not a confirmed cause. | Open. See the layout matrix below. |
+
+Layout matrix (all rejected with 4, for `opt` 0 and 1, `ovl` 100 and 10, paths `/fruser/traj/` and `/fruser/`):
+
+| Layout | Result |
+|---|---|
+| `tracktest1` as recorded (header `11520,1,2,0,0,0` + 15 columns per row) | 4 |
+| 3 rows, 6 columns, no header | 4 |
+| 3 rows, 15 columns, no header | 4 |
+| header `3,1,2,0,0,0` + 15 columns | 4 |
+| header `3,1,2,0,0,0` + 6 columns | 4 |
+| count `3` + 6 columns | 4 |
+
+Interpretation: the controller finds every uploaded file and rejects every layout we tried, so the rejection is about content or format, not the path. The format has not been identified. Changing `opt` or `ovl` did not help.
+
+Other deviations:
+- `ComputeFileMD5` and `LoadTrajectoryJ` return a code for "not found" (4 and 8 respectively). Callers must check both code and value. `fr5.py` must not treat 4 as "generic error" for MD5 calls. Note this in the `FR5` error contract.
+- The `tracktest1` file contains 15 numbers per row. By inference from the values, columns 1–6 are joint angles in degrees and columns 7–12 are TCP pose (mm and degrees). Columns 13–15 (`2, 0, 17`) are constant across the file and are not identified. Not verified against the controller's own readout.
+- Q4, Q5, Q6, Q8 and the camera calibration were not run. Q5 is postponed by the user.
+- The simulator needs about two minutes for a 60° move at 5% speed. Phase 0 timing numbers are therefore not usable for the timing contract. The real robot is needed for that.
+
+Action required from the user to close Q2/Q3:
+1. Confirm which controller answered (simulator or real robot).
+2. Create a trajectory with the teach pendant or web UI **trajectory playback** function, then tell me the name and where the UI shows it. Some UIs write playback files to `/fruser/traj/` and recording output elsewhere. We need the file that the controller's own playback function loads.
+3. If the UI offers "export", send that file. It shows the native format directly.
+
+### Phase 1: pure geometry and schemas, 2026-11-24
+
+Status: **complete.** Commit `36d0914`. 87 robot tests pass. The full gate was 352 passed and 6 skipped at the time. Ruff reports 183 errors across the existing repo, all pre-existing. The new files pass ruff.
+
+| Item | Plan | What happened | Action taken |
+|---|---|---|---|
+| Roll metric | Roll from the image-right axis | Measuring roll about the image-right axis underestimated true roll at non-zero tilt. | Changed to optical-axis roll relative to `u = normalise(z_cam × z_base)`. Recorded in the design doc. |
+| Roll sign | Not specified | The first reference used `-x_cam` and gave the wrong sign. | Reference changed to `z_cam × z_base`, measured about `z_cam`. |
+| Acceleration continuity test | Check finite-difference acceleration at keyframes | The test failed because of jerk discontinuity at keyframes, which is a finite-difference artifact. | Test now evaluates the second derivative of each segment polynomial at its ends. |
+| Pointing error | `acos(dot)` | Precision loss near 0. | Replaced with `atan2(|cross|, dot)`. |
+| Locality test | Float equality | Float comparison. | Use `pytest.approx`. |
+| Lint | Clean | E501 in `schema.py` and the spike scripts. | Wrapped and reformatted. |
+| Dead code | None expected | `keyframe_in_base`, `_single_keyframe_design`, a `vel_key` branch, `or True` assertions, `if False`. | Removed. |
+
+Open risk carried forward: the roll and pointing results are exact by construction and tested offline. They say nothing about the controller's own interpolation. That is measured only in Phase 0 Q6 and in rehearsal.
+
+### Next phase
+
+Phase 2 (validator) has not started. It is hardware-free and does not depend on the Q2/Q3 format. It can start now, but the trajectory format must be settled before Phase 4 writes files.
+
+### Phase 0 update: TPD recordings use the TPD API, not TrajectoryJ
+
+- **Finding.** `tracktest1` is a TPD recording (`SetTPDParam`/`SetTPDStart`), not a TrajectoryJ control-point file. The layout is `N,1,2,0,0,0` followed by N rows of 15 columns: 6 joints (deg), 6 TCP pose values (mm, deg), and `k,0,17`. The header `N` equals the data row count in all 12 backup files checked. `LoadTrajectoryJ` rejected it with error 4 for every layout tried. This was a wrong-loader error, not a format problem.
+- **Manual.** TPD playback is `LoadTPD(name)` → `GetTPDStartPose(name)` → `MoveTPD(name, blend, ovl)`, where `name` has no extension. The manual reference is Chapter 2 §2.1.9.6–2.1.9.8 and the TPD recording example.
+- **Action.** `LoadTPD("tracktest1")` returned 0 and `GetTPDStartPose` returned the first row's TCP pose, so the file parses. No motion was sent. `MoveTPD` has not been run and needs operator confirmation.
+- **Consequence.** The `TrajectoryJ` file-format work (Q2/Q3 as written) applies only to control-point files. The backend decision should compare `MoveTPD` against `MoveTrajectoryJ` with a control-point file the robot has built, not with a converted TPD file.
