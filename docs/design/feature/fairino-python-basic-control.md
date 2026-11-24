@@ -434,6 +434,92 @@ Small, mechanical. Tasks:
 3. End to end in `livestream.py` (Phase 6): the startup check enables `first_test`; selecting it loads it without moving; Record before Move to Start is refused; Move to Start moves at 10%; Record starts the GoPro, the motion runs after the pre-roll, recording auto-stops; Stop mid-motion halts the robot and stops recording; closing the app during a motion halts the robot.
 4. Failure handling: edit `motion.json`'s md5 → the motion is disabled with "md5 mismatch"; delete the controller file → "file missing on controller".
 
+## Open problem: smoothing a detour keyframe's velocity kink (handed off, 2026-11-24)
+
+**Status: blocked. Not a bug in validate.py or path.py as such; the design below needs a smoother middle keyframe, and the current mechanism (PCHIP default velocities) cannot produce one without either a manual `vel` override (untried) or a different detour point. Handed to a more capable model to solve; this section is written to be self-contained.**
+
+### The motion in question
+`sw/robot/motions/camtest/design.yaml` (current content, reproduced in full since it will keep changing):
+```yaml
+name: camtest
+tool_id: 1
+sample_period_ms: 8
+seed_joints: [89.718, -90.297, 0.077, 29.659, -88.781, 45.769]
+orientation: {mode: angles}
+workspace: {min: [-50, -900, -650], max: [250, -300, 800]}
+keyframes:
+  - {t: 0.0,  pos: [95.94, -403.331, 673.525],  pan: -91.165, tilt: -29.453}
+  - {t: 9.0,  pos: [99.0,  -580.0,   450.0],    pan: -90.8,   tilt: -20.0}
+  - {t: 18.0, pos: [102,   -758.094, -508.421], pan: -90.0,   tilt: 20.0, stop: true}
+```
+This is a real cinematic move the user specified from jogged poses on the real robot's tool 1 (the camera tool, defined below). Tool 1's `t_coord` is `[-282, -282, -40, 90, 0, -45]` (mm, deg; flange→camera, SDK xyz Euler), applied on both the simulator and (the user's intent) the real robot. The user confirmed roll is ~0-0.8° at both the start and end keyframes when read back from the controller, i.e. tool 1 is correctly oriented (z = optical axis, x = image-right, y = image-down, per `pose.py`).
+
+### Why the middle keyframe exists
+A direct two-keyframe path from the start to the end position+orientation fails `check_ik`: at samples around t≈0.4-0.45 of the (then 2s) design, `GetInverseKinRef` returns error 112 (no solution near the seeded reference) with **J3 (elbow) pinned at 151-156°**, against a soft limit of **160°** (`GetJointSoftLimitDeg` on the real robot/sim: `[-175,175, -265,85, -160,160, -265,85, -175,175, -175,175]`, i.e. J3 ∈ [-160, 160]). This was confirmed by a fine-grained sweep (41 points) of the straight-line interpolated path seeded continuously from the previous solution: IK succeeds up to about t=0.40 (J3≈152°), fails for t∈[0.45,0.55] (no solution from either direction's seed), and succeeds again from about t=0.60 onward but having jumped to a visibly different configuration branch (J2 from ≈-140° to ≈-20°, J4 from ≈-92° to ≈-226°). **The straight path asks the elbow to bend past its physical limit; there is no continuous IK solution for it.**
+
+A middle keyframe at `[99.0, -580.0, 450.0]`, pan -90.8°, tilt -20.0° was found by scanning z and tilt at the gap's x,y and picking a point with comfortable J3 margin (J3≈97° there, found via `GetInverseKinRef` with seed `[89.718,-90.297,0.077,29.659,-88.781,45.769]`). Both resulting legs (start→mid, mid→end) were verified to be fully IK-reachable with a continuously seeded sweep (21 points each). With this keyframe in `design.yaml`, **`check_ik` now passes end to end** (confirmed via `motionctl validate camtest --ip 192.168.50.2`, real simulator, 2251 samples at 18s). The kinematic/reachability problem is solved.
+
+### The remaining problem: joint 2 acceleration
+With the IK-reachable 3-keyframe path, `check_joint_speed_acc` still fails on **joint 2 (shoulder)**, and stretching the total duration does not converge:
+
+| Total duration | J2 peak speed (deg/s) | J2 peak accel (deg/s²) | Limit |
+|---|---|---|---|
+| 2s (2 keyframes, pre-detour) | n/a (IK failed) | n/a | speed 120, accel 600 |
+| 2s (3 keyframes) | not reached (other checks failed first) | not reached | |
+| 4s | (not isolated) | | |
+| 5s | 280.8 (fails) | not reached (speed failed first) | |
+| 12s | passes (not re-measured exactly) | 1321.8 (fails) | accel 600 |
+| 18s | passes | 1085.9 (fails) | accel 600 |
+
+Going from 12s to 18s (a 1.5x stretch, which should cut acceleration by 1.5²≈2.25x under pure time-scaling) only cut peak acceleration from 1321.8 to 1085.9 (a 1.22x reduction) — **much less than the 1/T² relationship that holds for a smooth path**. This is the diagnostic signal: the acceleration peak is **not** simply "the path is too fast for its duration", it is a **velocity-direction discontinuity (a kink) at the middle keyframe**, which pure time-scaling cannot fully remove, because a kink's acceleration spike (ideally a Dirac-like impulse in the idealized zero-width limit) shrinks much more slowly than 1/T² as duration increases.
+
+### Why there is a kink: the mechanism in path.py
+From `sw/robot/path.py` (`Channel`, `keyframe_velocities`, `Trajectory.__init__`): each channel (x, y, z, pan, tilt here, since this design uses `orientation.mode: angles`) is built as a **piecewise quintic Hermite** spline, one polynomial per segment, continuous in position and velocity at each keyframe, with **acceleration forced to zero at every keyframe** (`_quintic_coeffs` enforces `p''(0)=0, p''(1)=0` in each segment's local parameter). Velocities at interior keyframes come from `keyframe_velocities`: for more than 2 keyframes, `scipy.interpolate.PchipInterpolator(times, values)(times, nu=1)` -- PCHIP's own derivative estimate, which is **shape-preserving**: if the channel is not monotonic through the middle keyframe (i.e. the channel reverses direction, flattens, or changes curvature sign there), PCHIP assigns **velocity ≈ 0** at that keyframe for that channel. The two straight-ish legs before and after the kept-at-rest middle point then each have to decelerate to ~0 and reaccelerate, producing a path that is numerically C1 (continuous velocity, by construction) but has a very sharp *curvature* change -- a velocity vector that swings through a large angle in a short arc length, which is what drives joint 2's acceleration up disproportionately as the two legs' direction change becomes sharper relative to their (otherwise generous) timing budget.
+
+**This has not been fully diagnosed per-channel.** It has not been checked which of x, y, z, pan, tilt is/are non-monotonic through the middle keyframe and therefore pinned to near-zero PCHIP velocity there (position channels are the most likely culprit, given the physical detour; check `path.Trajectory` directly, or reconstruct with `path.sample_path(design)` and inspect consecutive sample derivatives numerically). It has also not been checked whether joint 2's acceleration spike is a direct image of a Cartesian-space kink, or an IK-amplification of a smaller Cartesian kink (IK Jacobians can amplify velocity/acceleration non-linearly near where J3 is still close to its limit, which it still might be at the middle keyframe even with the chosen margin).
+
+### What has NOT been tried (candidate fixes, unevaluated)
+1. **A keyframe-level `vel` override at the middle keyframe** (`Keyframe.vel`, a dict `{channel: value}`, already supported by the schema -- see `schema.py`'s `_check_keyframes` and `ANGLE_VEL_CHANNELS = ("x","y","z","pan","tilt")`). Setting an explicit, non-zero "through velocity" for the channels that are currently pinned to ~0 by PCHIP (likely one or more of x, y, z) should let the quintic segments blend through the kink with continuous curvature-compatible velocity instead of nearly stopping and restarting. **The correct through-velocity has not been computed.** A principled choice would be a one-sided or central finite-difference estimate of the chord slope using the neighbouring keyframes and an assumed/target speed, or a value tangent to a smoothed (e.g. circular-arc) detour rather than the two straight chords.
+2. **Moving the detour point to reduce the kink angle directly**, e.g. placing it to make the start→mid and mid→end chords more nearly collinear (smaller turn angle), at the cost of less J3 margin (the current point was chosen purely to maximize J3 margin, with no consideration of path smoothness). A 2D/3D search over candidate detour points, jointly optimizing for (a) IK margin from J3's 160° limit and (b) the turn angle / implied curvature at the detour, has not been done.
+3. **A 4th (or more) keyframe scheme**: e.g. two closely-spaced interior keyframes that let the PCHIP/quintic machinery approximate a smooth arc rather than a single sharp corner, instead of fighting a single corner with velocity overrides.
+4. **Checking whether `allow_long_pan`-style per-channel speed/acc *limits* are actually the right ones for this path**, i.e. whether 120deg/s / 600deg/s² (`Limits.max_joint_speed_deg_s`, `max_joint_acc_deg_s2`, defaults in `schema.py`) are themselves appropriate for this real motion, or whether the user would accept raising them in `design.yaml`'s `limits:` block for this specific camera and payload (not yet asked).
+5. **Revisiting the IK seeding/branch choice at the detour itself**: the found middle-keyframe joint solution (`seed = [89.718,-90.297,0.077,29.659,-88.781,45.769]` was reused as the single seed for the detour-point search; a different configuration branch at the detour point might have a smaller J2 jump relative to both neighbours even if J3's margin is less generous.
+
+### Constraints that any fix must satisfy
+- **`check_ik` must keep passing** (do not reopen the elbow-limit problem; any new middle keyframe or additional keyframes must stay clear of J3 > ~155° along the whole path, checked by a dense IK sweep as above, not just at the keyframes themselves, since the failure was in the *interpolated path*, not at any single keyframe).
+- **Zero roll is exact by construction** in `angles` mode (pan/tilt-only orientation, per `pose.py`'s `level_rotation`) and must stay that way; do not introduce explicit rotation interpolation.
+- **D7: motions should stay ≤20s** (not a hard code-enforced limit currently, but a project guideline, now under pressure -- 18s is already at this ceiling and still fails). A fix that requires pushing well past 20s to pass `check_joint_speed_acc` should be treated as not solving the actual problem.
+- **Tool frame, workspace box, and the two user-specified endpoint keyframes (position and orientation) are fixed** -- they come from the user's physical jogging and tool-1 configuration and should not be altered. Only the middle keyframe (position, orientation, timing, and optionally its `vel` override) and/or the number/placement of interior keyframes are free to change.
+- **Validation must be run against real IK** (the simulator at `192.168.50.2` or the real robot), not just the offline `plan` command, because `check_ik`/`check_joint_limits`/`check_joint_speed_acc` all depend on the controller's actual inverse kinematics, which the project's own fakes only approximate (see `sw/tests/fakes/fake_kinematics.py`; it is NOT accurate enough to debug this specific elbow-limit problem, which is a real behaviour of the physical/simulated kinematic chain, and was only found by querying the real simulator directly).
+- **Default limits**: `max_tcp_speed_mm_s=800`, `max_joint_speed_deg_s=120`, `max_joint_acc_deg_s2=600`, `max_joint_step_deg=2.0`, all overridable per-design in `design.yaml`'s `limits:` block (`schema.py`'s `Limits` dataclass) but not yet discussed with the user as something to change.
+
+### Reproducing the problem
+```
+# from the repo root, simulator must be reachable at 192.168.50.2
+uv run python -m sw.robot.motionctl plan camtest        # offline peak-speed estimate, no robot
+uv run python -m sw.robot.motionctl validate camtest --ip 192.168.50.2   # full check, real IK calls
+```
+(`sw/robot/motions/camtest/design.yaml` must exist with the content above; `rm -f sw/robot/motions/camtest/validated.json` before re-running `validate` if iterating, since a stale file is otherwise just overwritten anyway -- not load-bearing, just a habit from earlier debugging in this session.)
+
+To inspect per-sample joint values/speeds directly against the real simulator (used throughout this investigation):
+```python
+from fairino import Robot
+from sw.robot import schema, path as path_module
+from sw.robot.path import to_sdk_pose
+
+design = schema.load_design("sw/robot/motions/camtest/design.yaml")
+samples = path_module.sample_path(design)
+r = Robot.RPC("192.168.50.2")
+ref = list(design.seed_joints)
+joints = []
+for s in samples:
+    err, j = r.GetInverseKinRef(0, to_sdk_pose(s), ref)
+    joints.append(j)       # None on failure; check err first in real use
+    ref = j
+r.CloseRPC()
+# then: import numpy as np; arr = np.array(joints); speeds = np.abs(np.diff(arr, axis=0)) / (design.sample_period_ms/1000)
+```
+
 ## History (facts, not instructions)
 Full earlier text of this document: `git show efdd2df:docs/design/feature/fairino-python-basic-control.md`.
 

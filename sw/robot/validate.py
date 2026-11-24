@@ -318,6 +318,15 @@ def check_joint_speed_acc(
     return CheckResult("check_joint_speed_acc", True)
 
 
+def _angle_diff_deg(a: float, b: float) -> float:
+    """Smallest difference between two angles in degrees, wrapped to [0, 180].
+
+    Plain subtraction is wrong here: Euler angles near +/-180deg represent
+    almost the same rotation but differ by ~360deg as raw numbers.
+    """
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
 def check_fk_roundtrip(
     samples: list[Sample], joints: list[list[float]], kin: Kinematics
 ) -> tuple[CheckResult, float, float]:
@@ -330,7 +339,9 @@ def check_fk_roundtrip(
         pose = kin.fk(joints[i])
         expected = to_sdk_pose(samples[i])
         pos_err = math.dist(pose[:3], expected[:3])
-        rot_err = max(abs(a - b) for a, b in zip(pose[3:], expected[3:], strict=True))
+        rot_err = max(
+            _angle_diff_deg(a, b) for a, b in zip(pose[3:], expected[3:], strict=True)
+        )
         max_pos_err = max(max_pos_err, pos_err)
         max_rot_err = max(max_rot_err, rot_err)
         if failure is None and (

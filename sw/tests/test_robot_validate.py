@@ -227,6 +227,16 @@ def test_fk_offset_fails_check_fk_roundtrip():
     assert not fk_check.passed
 
 
+def test_fk_roundtrip_angle_wraparound_is_not_a_false_failure():
+    """rz near +180deg vs -180deg is the same rotation, not a 360deg error."""
+    from sw.robot import validate as validate_module
+
+    assert validate_module._angle_diff_deg(179.999, -179.999) == pytest.approx(0.002)
+    assert validate_module._angle_diff_deg(180.0, -180.0) == 0.0
+    assert validate_module._angle_diff_deg(10.0, -10.0) == 20.0
+    assert validate_module._angle_diff_deg(0.0, 170.0) == 170.0
+
+
 def test_report_serialises_to_validated_json_schema():
     design = _design(ANGLES)
     samples = _samples(design)
