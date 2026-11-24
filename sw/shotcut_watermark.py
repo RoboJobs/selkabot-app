@@ -1,12 +1,14 @@
-"""Watermark and edit recordings with Shotcut's engine, as a script or from the livestream app.
+"""Watermark and edit recordings with Shotcut's engine.
+
+This module is used as a script or from the livestream app.
 
 Public API (used by sw/livestream.py and the command line):
     add_watermark(video, output, watermarks=None, settings=None) -> Path
     settings_for_recording(fadein_image, fadeout_image) -> EditSettings
     watermarks_for(image) -> list of (image, corners)
 
-Settings (EditSettings in sw/shotcut_pipeline.py) are read from sw/livestream_config.json and
-can be overridden per run: from the command line, or in the window (--gui).
+Settings (EditSettings in sw/shotcut_pipeline.py) are read from
+sw/livestream_config.json and can be overridden per run.
 
 Keys in livestream_config.json (all optional):
     "slowdowns":    "8-12, 14-16"   slow-motion windows, seconds from the clip start
@@ -15,12 +17,17 @@ Keys in livestream_config.json (all optional):
     "flash_max_gap": 0.18           maximum gap between flashes, seconds
     "speed":        0.3             speed inside a slowdown
     "clip_start":   0               where the clip starts in the recording, seconds
-    "clip_length":  ""              clip length in seconds; "" = the rest of the recording
-    "smoothing":    "high"          "high" (ffmpeg minterpolate) or "shotcut" (MLT timewarp)
+    "clip_length":  ""              clip length in seconds; "" = the rest
+    "smoothing":    "native"        "native", "high" (ffmpeg minterpolate), or "shotcut"
+    "output_fps":   30               output frame rate
+    "output_width": 1920             output width
+    "output_height":1080             output height
+    "flash_enabled": true            enable camera flash effect
+    "fades_enabled": true            enable image fade effects
     "fadein_image", "fadeout_image", "image": file names in the current directory
-    "exposure":     0               brightness of the recording, stops: -3..3 (negative = darker)
-    "soundtrack":   ""              audio file that replaces the recording's sound; "" = keep it
-    "soundtrack_start": 0           where in the soundtrack file the video starts, seconds
+    "exposure":     0               brightness, stops: -3..3 (negative = darker)
+    "soundtrack":   ""              replacement audio; "" = keep the recording audio
+    "soundtrack_start": 0           soundtrack offset in seconds
 
 Usage:
     uv run python -m sw.shotcut_watermark VIDEO [OUTPUT] [--slowdowns "8-12,14-16"] ...
@@ -40,7 +47,17 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from sw.shotcut_pipeline import DEFAULT_CHUNKS, SMOOTHING_MODES, EditSettings, ProgressFn, edit_clip, watermarks_for
+from sw.shotcut_pipeline import (
+    DEFAULT_CHUNKS,
+    DEFAULT_OUTPUT_FPS,
+    DEFAULT_OUTPUT_HEIGHT,
+    DEFAULT_OUTPUT_WIDTH,
+    SMOOTHING_MODES,
+    EditSettings,
+    ProgressFn,
+    edit_clip,
+    watermarks_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +68,7 @@ WATERMARKED_SUFFIX = "_watermarked.mp4"
 
 
 def parse_slowdowns(text: str) -> tuple[tuple[float, float], ...]:
-    """Parse "8-12, 14-16" into ((8.0, 12.0), (14.0, 16.0)). Empty text means no slowdowns."""
+    """Parse slowdown windows; empty text means no slowdowns."""
     windows = []
     for part in text.replace(";", ",").split(","):
         part = part.strip()
@@ -59,11 +76,15 @@ def parse_slowdowns(text: str) -> tuple[tuple[float, float], ...]:
             continue
         start_text, sep, end_text = part.partition("-")
         if not sep:
-            raise ValueError(f"slowdown {part!r} must look like START-END, for example 8-12")
+            raise ValueError(
+                f"slowdown {part!r} must look like START-END, for example 8-12"
+            )
         try:
             window = (float(start_text), float(end_text))
         except ValueError:
-            raise ValueError(f"slowdown {part!r} must look like START-END, for example 8-12") from None
+            raise ValueError(
+                f"slowdown {part!r} must look like START-END, for example 8-12"
+            ) from None
         if not 0 <= window[0] < window[1]:
             raise ValueError(f"slowdown {part!r} must have 0 <= START < END")
         windows.append(window)
@@ -95,29 +116,62 @@ def _optional_float(text: str | float | None, name: str) -> float | None:
         raise ValueError(f"{name} must be a number of seconds, not {text!r}") from None
 
 
+def _bool_value(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "default"}:
+            return default
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"expected a boolean, not {value!r}")
+
+
 def settings_from(values: dict[str, Any]) -> EditSettings:
-    """Build EditSettings from text or number values (as typed in the textboxes or stored in JSON).
+    """Build EditSettings from textbox or JSON values.
 
     Raises ValueError with a message naming the bad field.
     """
     speed = _optional_float(values.get("speed", 0.3), "speed")
     clip_start = _optional_float(values.get("clip_start", 0), "clip_start")
-    smoothing = str(values.get("smoothing", "high")).strip() or "high"
+    smoothing = str(values.get("smoothing", "native")).strip() or "native"
     if smoothing not in SMOOTHING_MODES:
-        raise ValueError(f"smoothing must be one of {', '.join(SMOOTHING_MODES)}, not {smoothing!r}")
+        raise ValueError(
+            f"smoothing must be one of {', '.join(SMOOTHING_MODES)}, not {smoothing!r}"
+        )
     chunks_text = _optional_float(values.get("chunks", DEFAULT_CHUNKS), "chunks")
     if chunks_text is None or chunks_text < 1 or chunks_text != int(chunks_text):
-        raise ValueError(f"chunks must be a whole number of at least 1, not {values.get('chunks')!r}")
+        raise ValueError(
+            f"chunks must be a whole number of at least 1, not {values.get('chunks')!r}"
+        )
     exposure = _optional_float(values.get("exposure", 0), "exposure") or 0.0
     soundtrack = str(values.get("soundtrack") or "").strip()
-    soundtrack_start = _optional_float(values.get("soundtrack_start", 0), "soundtrack_start") or 0.0
+    soundtrack_start = (
+        _optional_float(values.get("soundtrack_start", 0), "soundtrack_start") or 0.0
+    )
+    output_fps = _optional_float(
+        values.get("output_fps", DEFAULT_OUTPUT_FPS), "output_fps"
+    )
+    output_width = _optional_float(
+        values.get("output_width", DEFAULT_OUTPUT_WIDTH), "output_width"
+    )
+    output_height = _optional_float(
+        values.get("output_height", DEFAULT_OUTPUT_HEIGHT), "output_height"
+    )
     flash_min_gap = _optional_float(values.get("flash_min_gap", 0.045), "flash_min_gap")
     flash_max_gap = _optional_float(values.get("flash_max_gap", 0.18), "flash_max_gap")
     fadein = str(values.get("fadein_image") or "").strip()
     fadeout = str(values.get("fadeout_image") or "").strip()
     try:
         return EditSettings(
-            slowdowns=parse_slowdowns(str(values["slowdowns"])) if values.get("slowdowns") is not None else EditSettings().slowdowns,
+            slowdowns=parse_slowdowns(str(values["slowdowns"]))
+            if values.get("slowdowns") is not None
+            else EditSettings().slowdowns,
             flash_windows=parse_flash_windows(str(values.get("flash_windows") or "")),
             flash_min_gap=flash_min_gap if flash_min_gap is not None else 0.045,
             flash_max_gap=flash_max_gap if flash_max_gap is not None else 0.18,
@@ -131,6 +185,11 @@ def settings_from(values: dict[str, Any]) -> EditSettings:
             exposure=exposure,
             soundtrack=Path(soundtrack) if soundtrack else None,
             soundtrack_start=soundtrack_start,
+            output_fps=int(output_fps or DEFAULT_OUTPUT_FPS),
+            output_width=int(output_width or DEFAULT_OUTPUT_WIDTH),
+            output_height=int(output_height or DEFAULT_OUTPUT_HEIGHT),
+            flash_enabled=_bool_value(values.get("flash_enabled"), True),
+            fades_enabled=_bool_value(values.get("fades_enabled"), True),
         )
     except ValueError as e:
         raise ValueError(str(e)) from None
@@ -149,7 +208,7 @@ def load_config(config_file: Path = CONFIG_FILE) -> dict[str, Any]:
 
 
 def save_config(values: dict[str, Any], config_file: Path = CONFIG_FILE) -> None:
-    """Merge `values` into the config file, keeping keys this module does not own (such as folder)."""
+    """Merge values into config, preserving keys owned by other modules."""
     data = load_config(config_file)
     data.update(values)
     try:
@@ -158,13 +217,16 @@ def save_config(values: dict[str, Any], config_file: Path = CONFIG_FILE) -> None
         logger.exception("Could not save the config file %s", config_file)
 
 
-def settings_for_recording(fadein_image: Path | None, fadeout_image: Path | None) -> EditSettings:
-    """Settings for a live recording: the stored config (slowdowns, exposure, soundtrack, ...) plus
-    the fade stills of the livestream app. A config value that cannot be used falls back to defaults."""
+def settings_for_recording(
+    fadein_image: Path | None, fadeout_image: Path | None
+) -> EditSettings:
+    """Return stored edit settings plus the livestream fade stills."""
     try:
         settings = settings_from(load_config())
     except ValueError:
-        logger.exception("Ignoring the edit settings in %s; using the defaults", CONFIG_FILE)
+        logger.exception(
+            "Ignoring the edit settings in %s; using the defaults", CONFIG_FILE
+        )
         settings = EditSettings()
     return replace(settings, fadein_image=fadein_image, fadeout_image=fadeout_image)
 
@@ -182,23 +244,28 @@ def add_watermark(
         video: Input video file.
         output: Output video file. Must differ from `video`.
         watermarks: Pairs of (image, corners). Defaults to the always-used watermark.
-        settings: Clip, slowdown, smoothing and fade settings. Defaults to EditSettings().
+        settings: Clip, slowdown, smoothing and fade settings.
+            Defaults to EditSettings().
         progress: Called with each progress message (also logged).
 
     Returns:
         The output path.
     """
     if watermarks is None:
-        # The extra watermark image stored in the config (the always-used selkabot.png is added too).
-        watermarks = watermarks_for(str(load_config().get("image") or "").strip() or None)
+        # Add the optional configured image to the always-used watermark.
+        watermarks = watermarks_for(
+            str(load_config().get("image") or "").strip() or None
+        )
     return edit_clip(video, output, watermarks, settings=settings, progress=progress)
 
 
 def watermarked_name(original: Path) -> Path:
-    """`X_original.mp4` -> `X_watermarked.mp4`, next to it (the livestream app's naming)."""
+    """Return the livestream naming convention for an edited video."""
     if not original.name.endswith(ORIGINAL_SUFFIX):
         return original.with_name(original.stem + WATERMARKED_SUFFIX)
-    return original.with_name(original.name[: -len(ORIGINAL_SUFFIX)] + WATERMARKED_SUFFIX)
+    return original.with_name(
+        original.name[: -len(ORIGINAL_SUFFIX)] + WATERMARKED_SUFFIX
+    )
 
 
 def batch(
@@ -209,10 +276,10 @@ def batch(
     jobs: int = DEFAULT_JOBS,
     progress: ProgressFn | None = None,
 ) -> list[Path]:
-    """Edit every `*_original.mp4` in `folder` that has no watermarked version yet (or all, with redo).
+    """Edit each original recording without an existing output, unless redoing.
 
-    `jobs` videos are rendered at the same time. Smoothing is single-threaded per segment, so
-    a few parallel jobs use the machine much better than one at a time.
+    Jobs are rendered concurrently; this is useful for the legacy single-threaded
+    interpolation path.
     """
     todo = []
     for original in sorted(folder.glob(f"*{ORIGINAL_SUFFIX}")):
@@ -242,7 +309,9 @@ def _emit(progress: ProgressFn | None, message: str) -> None:
         progress(message)
 
 
-def _settings_values(args: argparse.Namespace, stored: dict[str, Any]) -> dict[str, Any]:
+def _settings_values(
+    args: argparse.Namespace, stored: dict[str, Any]
+) -> dict[str, Any]:
     """Stored config values, overridden by any flag given on the command line."""
     values = dict(stored)
     for name in (
@@ -258,6 +327,11 @@ def _settings_values(args: argparse.Namespace, stored: dict[str, Any]) -> dict[s
         "soundtrack",
         "soundtrack_start",
         "flash_windows",
+        "flash_enabled",
+        "fades_enabled",
+        "output_fps",
+        "output_width",
+        "output_height",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -266,7 +340,7 @@ def _settings_values(args: argparse.Namespace, stored: dict[str, Any]) -> dict[s
 
 
 def run_gui(stored: dict[str, Any]) -> None:
-    """A small window with one textbox per setting; Run uses the textboxes and saves them."""
+    """Show a small settings window and run the selected edit."""
     import tkinter as tk
     from tkinter import ttk
 
@@ -276,35 +350,86 @@ def run_gui(stored: dict[str, Any]) -> None:
     frame.grid()
 
     fields = [
-        ("Slowdowns (start-end, …)", "slowdowns", format_slowdowns(settings_from(stored).slowdowns)),
-        ("Camera flashes (start-end, …)", "flash_windows", format_flash_windows(settings_from(stored).flash_windows)),
+        (
+            "Slowdowns (start-end, …)",
+            "slowdowns",
+            format_slowdowns(settings_from(stored).slowdowns),
+        ),
+        (
+            "Camera flashes (start-end, …)",
+            "flash_windows",
+            format_flash_windows(settings_from(stored).flash_windows),
+        ),
         ("Speed in slowdowns", "speed", str(stored.get("speed", 0.3))),
         ("Clip start (s)", "clip_start", str(stored.get("clip_start", 0))),
-        ("Clip length (s, empty = rest)", "clip_length", "" if stored.get("clip_length") in (None, "") else str(stored["clip_length"])),
+        (
+            "Clip length (s, empty = rest)",
+            "clip_length",
+            ""
+            if stored.get("clip_length") in (None, "")
+            else str(stored["clip_length"]),
+        ),
         ("Fade-in image", "fadein_image", str(stored.get("fadein_image") or "")),
         ("Fade-out image", "fadeout_image", str(stored.get("fadeout_image") or "")),
         ("Soundtrack file", "soundtrack", str(stored.get("soundtrack") or "")),
-        ("Watermark image (top-left, bottom-right)", "image", str(stored.get("image") or "")),
-        ("Soundtrack start (s)", "soundtrack_start", str(stored.get("soundtrack_start", 0))),
+        (
+            "Watermark image (top-left, bottom-right)",
+            "image",
+            str(stored.get("image") or ""),
+        ),
+        (
+            "Soundtrack start (s)",
+            "soundtrack_start",
+            str(stored.get("soundtrack_start", 0)),
+        ),
         ("Video (single run)", "video", ""),
         ("Folder (batch run)", "folder", str(stored.get("folder") or "")),
+        ("Output fps", "output_fps", str(stored.get("output_fps", DEFAULT_OUTPUT_FPS))),
+        (
+            "Output width",
+            "output_width",
+            str(stored.get("output_width", DEFAULT_OUTPUT_WIDTH)),
+        ),
+        (
+            "Output height",
+            "output_height",
+            str(stored.get("output_height", DEFAULT_OUTPUT_HEIGHT)),
+        ),
     ]
     entries: dict[str, tk.StringVar] = {}
     for row, (label, key, initial) in enumerate(fields):
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
         var = tk.StringVar(value=initial)
-        ttk.Entry(frame, textvariable=var, width=40).grid(row=row, column=1, sticky="ew", pady=2)
+        ttk.Entry(frame, textvariable=var, width=40).grid(
+            row=row, column=1, sticky="ew", pady=2
+        )
         entries[key] = var
-    smoothing = tk.StringVar(value=str(stored.get("smoothing", "high")))
-    ttk.Label(frame, text="Smoothing").grid(row=len(fields), column=0, sticky="w", pady=2)
-    ttk.Combobox(frame, textvariable=smoothing, values=list(SMOOTHING_MODES), state="readonly").grid(
-        row=len(fields), column=1, sticky="w", pady=2
+    smoothing = tk.StringVar(value=str(stored.get("smoothing", "native")))
+    ttk.Label(frame, text="Smoothing").grid(
+        row=len(fields), column=0, sticky="w", pady=2
     )
+    ttk.Combobox(
+        frame, textvariable=smoothing, values=list(SMOOTHING_MODES), state="readonly"
+    ).grid(row=len(fields), column=1, sticky="w", pady=2)
+    flash_enabled = tk.BooleanVar(value=_bool_value(stored.get("flash_enabled"), True))
+    fades_enabled = tk.BooleanVar(value=_bool_value(stored.get("fades_enabled"), True))
+    ttk.Checkbutton(
+        frame, text="Enable camera flash effect", variable=flash_enabled
+    ).grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=2)
+    ttk.Checkbutton(
+        frame, text="Enable image fade effects", variable=fades_enabled
+    ).grid(row=len(fields) + 2, column=0, columnspan=2, sticky="w", pady=2)
     chunks = tk.StringVar(value=str(stored.get("chunks", DEFAULT_CHUNKS)))
-    ttk.Label(frame, text="Parallel chunks per slowdown").grid(row=len(fields) + 1, column=0, sticky="w", pady=2)
-    ttk.Entry(frame, textvariable=chunks, width=6).grid(row=len(fields) + 1, column=1, sticky="w", pady=2)
+    ttk.Label(frame, text="Parallel chunks per slowdown").grid(
+        row=len(fields) + 3, column=0, sticky="w", pady=2
+    )
+    ttk.Entry(frame, textvariable=chunks, width=6).grid(
+        row=len(fields) + 3, column=1, sticky="w", pady=2
+    )
     exposure = tk.DoubleVar(value=float(stored.get("exposure", 0) or 0))
-    ttk.Label(frame, text="Exposure (- darker, + brighter)").grid(row=len(fields) + 2, column=0, sticky="w", pady=2)
+    ttk.Label(frame, text="Exposure (- darker, + brighter)").grid(
+        row=len(fields) + 4, column=0, sticky="w", pady=2
+    )
     tk.Scale(
         frame,
         variable=exposure,
@@ -314,15 +439,19 @@ def run_gui(stored: dict[str, Any]) -> None:
         orient="horizontal",
         length=240,
         showvalue=True,
-    ).grid(row=len(fields) + 2, column=1, sticky="w", pady=2)
+    ).grid(row=len(fields) + 4, column=1, sticky="w", pady=2)
     status = tk.StringVar(value="Ready")
-    ttk.Label(frame, textvariable=status, wraplength=420).grid(row=len(fields) + 4, column=0, columnspan=2, sticky="w")
+    ttk.Label(frame, textvariable=status, wraplength=420).grid(
+        row=len(fields) + 6, column=0, columnspan=2, sticky="w"
+    )
 
     def values() -> dict[str, Any]:
         result: dict[str, Any] = {key: var.get() for key, var in entries.items()}
         result["smoothing"] = smoothing.get()
         result["chunks"] = chunks.get()
         result["exposure"] = round(exposure.get(), 2)
+        result["flash_enabled"] = flash_enabled.get()
+        result["fades_enabled"] = fades_enabled.get()
         return result
 
     updates: queue.Queue[str] = queue.Queue()
@@ -359,7 +488,10 @@ def run_gui(stored: dict[str, Any]) -> None:
         if video is None and folder is None:
             status.set("Give a video or a folder")
             return
-        save_config({k: v for k, v in vals.items() if k not in ("video", "folder")} | ({"folder": vals["folder"].strip()} if folder else {}))
+        save_config(
+            {k: v for k, v in vals.items() if k not in ("video", "folder")}
+            | ({"folder": vals["folder"].strip()} if folder else {})
+        )
         button.state(["disabled"])
         running.set()
         status.set("Starting…")
@@ -369,7 +501,9 @@ def run_gui(stored: dict[str, Any]) -> None:
             try:
                 if video:
                     output = watermarked_name(video)
-                    add_watermark(video, output, watermarks, settings, progress=updates.put)
+                    add_watermark(
+                        video, output, watermarks, settings, progress=updates.put
+                    )
                     message = f"Done: wrote {output}"
                 else:
                     done = batch(folder, settings, watermarks, progress=updates.put)
@@ -384,35 +518,142 @@ def run_gui(stored: dict[str, Any]) -> None:
         poll()
 
     button = ttk.Button(frame, text="Run", command=run)
-    button.grid(row=len(fields) + 3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    button.grid(row=len(fields) + 5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
     root.mainloop()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Watermark and edit recordings with Shotcut's engine.")
-    parser.add_argument("video", nargs="?", type=Path, help="A recording to edit (…_original.mp4)")
-    parser.add_argument("output", nargs="?", type=Path, help="Output file (default: …_watermarked.mp4)")
-    parser.add_argument("--folder", type=Path, help="Edit every …_original.mp4 in this folder")
-    parser.add_argument("--redo", action="store_true", help="With --folder, also redo videos already edited")
-    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"With --folder, videos rendered at once (default {DEFAULT_JOBS})")
-    parser.add_argument("--gui", action="store_true", help="Open the window with textboxes for the settings")
-    parser.add_argument("--slowdowns", help='Slow-motion windows, e.g. "8-12, 14-16" (seconds from clip start)')
-    parser.add_argument("--flash-windows", dest="flash_windows", help='Camera-flash burst windows, e.g. "3-5, 9-10" (empty disables)')
-    parser.add_argument("--speed", type=float, help="Speed inside slowdowns (default 0.3)")
-    parser.add_argument("--clip-start", dest="clip_start", type=float, help="Clip start in the recording (s)")
-    parser.add_argument("--clip-length", dest="clip_length", type=float, help="Clip length (s); default: the rest")
-    parser.add_argument("--smoothing", choices=SMOOTHING_MODES, help="high (ffmpeg, slow) or shotcut (instant)")
-    parser.add_argument("--exposure", type=float, help="Brightness of the recording in stops, -3 to 3 (negative = darker)")
-    parser.add_argument("--chunks", type=int, help=f"Parallel chunks per slowdown in high smoothing (default {DEFAULT_CHUNKS})")
-    parser.add_argument("--fadein-image", dest="fadein_image", help="Still for the opening fade (file name)")
-    parser.add_argument("--fadeout-image", dest="fadeout_image", help="Still for the closing fade (file name)")
-    parser.add_argument("--soundtrack", help="Audio file that replaces the recording's sound")
-    parser.add_argument("--soundtrack-start", dest="soundtrack_start", type=float, help="Where the video starts in the soundtrack (s)")
-    parser.add_argument("--image", help="Extra watermark image (file name), in addition to selkabot.png")
-    parser.add_argument("--save", action="store_true", help="Store these settings in the config file")
+    parser = argparse.ArgumentParser(
+        description="Watermark and edit recordings with Shotcut's engine."
+    )
+    parser.add_argument(
+        "video", nargs="?", type=Path, help="A recording to edit (…_original.mp4)"
+    )
+    parser.add_argument(
+        "output", nargs="?", type=Path, help="Output file (default: …_watermarked.mp4)"
+    )
+    parser.add_argument(
+        "--folder", type=Path, help="Edit every …_original.mp4 in this folder"
+    )
+    parser.add_argument(
+        "--redo",
+        action="store_true",
+        help="With --folder, also redo videos already edited",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=DEFAULT_JOBS,
+        help=f"With --folder, videos rendered at once (default {DEFAULT_JOBS})",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Open the window with textboxes for the settings",
+    )
+    parser.add_argument(
+        "--slowdowns",
+        help='Slow-motion windows, e.g. "8-12, 14-16" (seconds from clip start)',
+    )
+    parser.add_argument(
+        "--flash-windows",
+        dest="flash_windows",
+        help='Camera-flash burst windows, e.g. "3-5, 9-10" (empty disables)',
+    )
+    parser.add_argument(
+        "--speed", type=float, help="Speed inside slowdowns (default 0.3)"
+    )
+    parser.add_argument(
+        "--clip-start",
+        dest="clip_start",
+        type=float,
+        help="Clip start in the recording (s)",
+    )
+    parser.add_argument(
+        "--clip-length",
+        dest="clip_length",
+        type=float,
+        help="Clip length (s); default: the rest",
+    )
+    parser.add_argument(
+        "--smoothing",
+        choices=SMOOTHING_MODES,
+        help="native (fast), high (ffmpeg), or shotcut (MLT)",
+    )
+    parser.add_argument(
+        "--output-fps",
+        dest="output_fps",
+        type=int,
+        help="Output frame rate (default 30)",
+    )
+    parser.add_argument(
+        "--output-width",
+        dest="output_width",
+        type=int,
+        help="Output width (default 1920)",
+    )
+    parser.add_argument(
+        "--output-height",
+        dest="output_height",
+        type=int,
+        help="Output height (default 1080)",
+    )
+    parser.add_argument(
+        "--no-flash",
+        dest="flash_enabled",
+        action="store_false",
+        default=None,
+        help="Disable camera flash effect",
+    )
+    parser.add_argument(
+        "--no-fades",
+        dest="fades_enabled",
+        action="store_false",
+        default=None,
+        help="Disable image fade effects",
+    )
+    parser.add_argument(
+        "--exposure",
+        type=float,
+        help="Brightness of the recording in stops, -3 to 3 (negative = darker)",
+    )
+    parser.add_argument(
+        "--chunks",
+        type=int,
+        help=(
+            f"Parallel chunks per slowdown in high smoothing (default {DEFAULT_CHUNKS})"
+        ),
+    )
+    parser.add_argument(
+        "--fadein-image",
+        dest="fadein_image",
+        help="Still for the opening fade (file name)",
+    )
+    parser.add_argument(
+        "--fadeout-image",
+        dest="fadeout_image",
+        help="Still for the closing fade (file name)",
+    )
+    parser.add_argument(
+        "--soundtrack", help="Audio file that replaces the recording's sound"
+    )
+    parser.add_argument(
+        "--soundtrack-start",
+        dest="soundtrack_start",
+        type=float,
+        help="Where the video starts in the soundtrack (s)",
+    )
+    parser.add_argument(
+        "--image", help="Extra watermark image (file name), in addition to selkabot.png"
+    )
+    parser.add_argument(
+        "--save", action="store_true", help="Store these settings in the config file"
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
+    )
     stored = load_config()
     values = _settings_values(args, stored)
     if args.gui:
