@@ -96,6 +96,14 @@ class MotionRunner:
         )
         self._worker.start()
 
+    @classmethod
+    def for_robot(
+        cls, settings: RobotSettings, motions: dict[str, MotionConfig], **kwargs: Any
+    ) -> "MotionRunner":
+        """A runner that connects to `settings.ip` (lazily, in
+        connect_and_check). The app uses this so it never imports fr5."""
+        return cls(lambda: FR5.connect(settings.ip), settings, motions, **kwargs)
+
     # -- state ---------------------------------------------------------------
 
     @property

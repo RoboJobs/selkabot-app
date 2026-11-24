@@ -230,7 +230,16 @@ Cartesian mode is level by construction, and the Phase 1 tests prove it (roll < 
 - `stop()` never raises and is idempotent: `StopMotion()` up to 3 attempts 100 ms apart; returns `True` if one returned 0. A run ended by `stop()` fails its future with `MotionStopped` and leaves the runner `IDLE`; any other failure (did not start, robot error, timeout, bad start pose) leaves it `FAULT` until `clear_fault()`, and motion jobs are refused meanwhile. No confirmation polling (deferred).
 - `close()` is idempotent: `stop()`, state `CLOSED`, reject new jobs with `RunnerClosed`, join the worker for at most 2 s, `CloseRPC()` (best effort), reset speed (best effort).
 
-### UI state machine (Phase 6)
+### UI state machine (Phase 6, done)
+Implemented in `sw/robot/ui_state.py` (`UiState`, `Ev`, `Act`, `Event`, `Action`, `Context`, `transition`) and wired into `sw/livestream.py` (§ Robot motions section of `LivestreamApp`). Additions to the table below, made during implementation:
+- **One robot button** next to Start recording: **Move to Start** in `IDLE` (orange when not at the start), **Stop robot** in `MOVING_TO_START` (`stop_pressed` → `runner.stop()`, the state waits for `move_failed`/`MotionStopped` → `IDLE`), **Clear fault** in `FAULT`.
+- `LOADING`/`MOVING_TO_START` failures go to `FAULT` when the runner is in `FAULT` (the runner faults on any failed job except `MotionStopped`), else `IDLE`.
+- `close` from any state goes to a terminal `CLOSED` state; recording is stopped by `GoProController.shutdown`, which runs after the robot is stopped and the runner closed.
+- Robot messages go to their own status line in the motion row, so the camera's status line (downloads, uploads) does not overwrite them.
+- Startup check timeout: `ROBOT_CHECK_TIMEOUT_S` (20 s). If `connect_and_check` has not answered, every motion is disabled ("robot unreachable") and a late answer is ignored (stale `op_id`).
+- `--no-robot`, an invalid `"robot"` config block, or a missing runner: no motion row and no robot button; recording unchanged. A `motion.json` that does not load or fails `check_consistent()` shows as a disabled button with the reason.
+- `MotionRunner.for_robot(settings, motions)` builds the runner with `FR5.connect(settings.ip)`, so `livestream.py` never imports `fr5`.
+
 `sw/robot/ui_state.py` holds a pure `UiState` enum and `transition(state, event, context) -> (new_state, actions)`. The Tk app feeds events in and executes the returned actions.
 
 States: `UNAVAILABLE` (no robot: `--no-robot` or startup failure), `CHECKING`, `IDLE`, `LOADING`, `MOVING_TO_START`, `STARTING_RECORDING`, `PRE_ROLL`, `RUNNING`, `POST_ROLL`, `STOPPING`, `FAULT`.
@@ -490,7 +499,7 @@ Small, mechanical. Tasks:
 ## Verification
 1. Automated: the gate after every phase.
 2. Robot, Phase 4: `first_test` (8 ms) plays at `--ovl 25` in about 16 s; the flange rises without turning; the camera stays visually level.
-3. End to end in `livestream.py` (Phase 6): the startup check enables `first_test`; selecting it loads it without moving; Record before Move to Start is refused; Move to Start moves at 25%; Record starts the GoPro, the motion runs after the pre-roll, recording auto-stops; Stop mid-motion halts the robot and stops recording; closing the app during a motion halts the robot.
+3. End to end in `livestream.py` (Phase 6, operator): the startup check enables `up_down_horizontal`; selecting it loads it without moving; Record before Move to Start is refused; Move to Start moves at 25%; Record starts the GoPro, the motion runs after the pre-roll, recording auto-stops; Stop mid-motion halts the robot and stops recording; closing the app during a motion halts the robot.
 4. Failure handling: edit `motion.json`'s md5 → the motion is disabled with "md5 mismatch"; delete the controller file → "file missing on controller".
 
 ## Resolved: large swings fail in cartesian mode (camtest, now up_down_horizontal; 2026-11-24)
@@ -527,4 +536,5 @@ Full earlier text of this document: `git show efdd2df:docs/design/feature/fairin
 - **Controller smoothing on by default (2026-11-25).** `play --smooth` (MoveTPD blend = 1) made the motion noticeably smoother on the robot, so blend = 1 is now the default in `play` and `MotionRunner` (`fr5.TPD_BLEND_SMOOTH`). The joint-noise item in § Deferred stays open for the remaining suspects.
 - **2.5 s version on the real robot (2026-11-25), smoothing on.** Elapsed vs planned: `--ovl` 10: 25.17 vs 25.04 s; 30: 8.63 vs 8.35; 50: 5.38 vs 5.01; 75: 3.79 vs 3.34; 100: 3.03 vs 2.50. No overspeed fault at 1477 mm/s. The overrun grows with speed (smoothing, and possibly the controller limiting speed), so higher peak speeds give diminishing returns. Recomputed with `ramp_fraction: 0.2` and fitted exactly to the limits: **2.03 s**, peaks 1497 mm/s (limit 1500, now binding), 130 deg/s (limit 170), 502 deg/s² (limit 600).
 - **Phase 5 publish on the real robot (2026-11-25).** `motionctl publish up_down_horizontal --ovl 100` uploaded the 2.03 s file (MD5 verified), `LoadTPD` OK, start pose matched the file (diff 0.000005), and wrote `motion.json`; `list --check` reports the controller file OK. `MotionRunner` itself has not yet been driven against the robot (Phase 6 wires it into the app).
+- **Phase 6 implemented (2026-11-25).** `ui_state.py` plus the livestream integration, tests `test_robot_ui_state.py` (every state × event pair) and `test_livestream_robot.py` (real Tk window, fake GoPro and runner). Tried on the real robot by the operator (2026-11-25): working.
 - Phase 4 robot test results: *(to be filled in: played at 8 ms yes/no and fallback used, `move_tpd` return time, measured vs expected duration, visual level check)*.
