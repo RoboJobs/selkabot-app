@@ -16,10 +16,11 @@ Terminology: a **motion** is one named, validated trajectory, e.g. `sweep_left_f
 - **The SDK already gives what is needed; MoveIt2 is not used.** MoveIt2 needs ROS2 Humble on Ubuntu 22.04, which this host doesn't have, and it solves collision-free A-to-B planning, not choreographed camera paths.
 - **SDK functions used.** All are in `fairino/Robot.py`, class `RPC`:
   - Kinematics, with no motion: `GetInverseKinRef(type, desc_pos, joint_ref)`, `GetInverseKinHasSolution`, `GetForwardKin(joints)`.
-  - Trajectory files: `TrajectoryJUpLoad(local_path)` stores the file at `/fruser/traj/<file>`. Also `TrajectoryJDelete(file)`, `LoadTrajectoryJ(name, ovl, opt=1)`, `MoveTrajectoryJ()`, `GetTrajectoryStartPose(name)`, `GetTrajectoryPointNum()`, `ComputeFileMD5(path)`. Reference flow: `linux/example/TestUploadTrajectoryJ.py`.
+  - Trajectory files: **upload with our own `FR5.upload_file`, never with the SDK's `TrajectoryJUpLoad` or `LuaUpload`** (they race the controller and fail with -1; see § Controller file transfer). A type-20 upload lands at `/fruser/traj/<file>`. Also `TrajectoryJDelete(file)`, `LoadTrajectoryJ(name, ovl, opt=1)`, `MoveTrajectoryJ()`, `GetTrajectoryStartPose(name)`, `GetTrajectoryPointNum()`, `ComputeFileMD5(path)`. Reference flow: `linux/example/TestUploadTrajectoryJ.py` for the call order only; its upload step uses the failing SDK call.
   - Motion and state: `MoveJ(joint_pos, tool, user, vel=...)`, `SetSpeed(pct)`, `StopMotion()`, `PauseMotion()`, `GetActualJointPosDegree()`, `GetActualJointSpeedsDegree()`, `GetRobotMotionDone()`, and `robot_state_pkg` (`motion_done`, `main_code`, `sub_code`, `jt_cur_pos`, `tl_cur_pos`, `actual_qd`). The state getters read `robot_state_pkg`, a cache refreshed by the SDK's own state thread. They do not block on the XML-RPC socket.
   - Setup and limits: `SetToolCoord`, `SetLoadWeight`, `SetLoadCoord`, `GetTCPOffset` (active tool), `GetJointSoftLimitDeg`, `GetRobotInstallAngle`, `ResetAllError`, `RobotEnable`, `Mode`.
-  - Fallback store: `LuaUpload`, `ProgramLoad`, `ProgramRun`, `ProgramStop`, `GetProgramState`, `GetLuaList`, `LuaDelete`.
+  - TPD recordings: `LoadTPD(name)`, `GetTPDStartPose(name)`, `MoveTPD(name, blend, ovl)`. A file uploaded as type 20 is named `traj/<stem>` (no extension). Pendant recordings live in `/fruser/` and are named `<stem>`.
+  - Fallback store: `LuaUpload` (do not call it directly; same race, and the controller rejects large files with "LUA FILE SIZE IS TOO LARGE!"), `ProgramLoad`, `ProgramRun`, `ProgramStop`, `GetProgramState`, `GetLuaList`, `LuaDelete`.
 - **Not in the SDK** (checked by searching `Robot.py`): there is **no getter for the global speed** (only `SetSpeed`), and there is **no file rename** call for controller files. The design below works around both (§ Speed handling, § Atomic publish).
 - **Return values.** Most SDK calls return an `int` error code (0 = OK). Getters return `(code, value)`. Motion calls first return `GetSafetyCode()` when it is non-zero. Calls made while the connection is flagged down return `-4`.
 - **Blocking behaviour.** Most SDK calls wrap the XML-RPC call in `while flag: try ... except socket.error: flag = True`, i.e. they **retry socket errors forever**. A call can therefore block indefinitely when the network drops. The connection-up flag (`RPC.is_conect`) appears to be class-level, so a second `RPC` instance in the same process may share it (checked in Q5).
@@ -215,6 +216,26 @@ Two different hashes are involved and are never mixed up:
 | empty or non-32-hex-character hash | `controller returned an invalid hash` |
 | hashes differ (compared case-insensitively) | `md5 mismatch` (never retried) |
 
+### Controller file transfer (binding)
+Verified on the real robot on 2026-11-24 (§ Phase 0 update: uploading files and loading them as TPD). Every implementation that puts a file on the controller follows these rules.
+
+**Never call** `TrajectoryJUpLoad`, `LuaUpload`, `PointTableUpLoad` or any SDK method built on `__FileUpLoad`. They issue the `FileUpload` RPC and then make **one** immediate connect to port 20010. The controller opens 20010 about 50 ms after the RPC, so that connect is usually refused and the call returns -1 (`ERR_OTHER`), indistinguishable from the RPC failing or the transfer failing. Retrying the SDK call does not fix the race. It only adds new RPC requests.
+
+**The correct upload is `FR5.upload_file(local_path, file_type)`**, which performs the protocol itself (protocol manual §5.1.50; reference code `sw/robot/spike/file_port_probe.py`):
+1. `file_type` must be **20** (Trajectory J, stored at `/fruser/traj/<basename>`) or **0** (Lua). Any other value raises `ValueError` before anything is sent: the other types are firmware, OS and upgrade packages.
+2. Call the XML-RPC `FileUpload(file_type, basename)` on the SDK's proxy (`client.robot.FileUpload`). Non-zero → raise `FileTransferError(stage="request", code=rtn)`.
+3. Connect to `<ip>:20010`, retrying every 50 ms for up to 5 s. No connection → `FileTransferError(stage="connect")`.
+4. Once connected, **always send the whole file**. Connecting and closing without sending leaves an **empty file** at the target path (observed). Framing, as in the SDK: `"/f/b" + f"{len(data) + 50:10d}" + md5_hex`, then the bytes, then `"/b/f"`.
+5. Read the reply. It must start with `b"SUCCESS"`; otherwise `FileTransferError(stage="transfer")`.
+6. Verify with `ComputeFileMD5(<remote path>)`: code 0 and the local MD5 (case-insensitive). Otherwise `FileTransferError(stage="verify")`. A transfer is not "done" until this passes.
+
+Other rules:
+- Ports 20010 (upload) and 20011 (download) are **closed while idle by design**. A refused connection on them outside a transfer is not a fault, and no startup check may test them.
+- `FileUpload` type 0 stores the file outside `/fruser/` until `LuaUpLoadUpdate(name)` accepts it, and that call rejects files of about 1 MB and up. Do not use type 0 for trajectories or TPD files.
+- Deleting a file (`TrajectoryJDelete`) is a plain RPC (`FileDelete`), not a socket transfer, and is safe to call directly.
+- Names: `/fruser/traj/<basename>` for MD5 and `LoadTrajectoryJ`; `traj/<stem>` (no extension, no leading slash) for `LoadTPD`, `GetTPDStartPose` and `MoveTPD`. `LoadTPD` with an absolute path returns 8 ("tpd file does not exist").
+- Error codes from the controller come from the protocol manual, Table 10-1 (for example 4 = parameter value abnormal, 8 = tpd file does not exist). Negative codes come from the SDK's `RobotError` (for example -1 `ERR_OTHER`, -4 RPC down, -7 local upload file not found).
+
 ### Atomic publishing
 The SDK has no rename call, so the publish sequence verifies a temporary upload before it touches the live file and writes the metadata last, atomically:
 1. **Preconditions:** a fresh `validated.json` (design and camera-tool hashes current), `camera_tool.yaml` approved, rehearsal evidence at ≥ the requested ovl, and the configured backend.
@@ -385,7 +406,7 @@ Signatures are binding for the implementer. Private helpers are free.
   - `validate(design, camera_tool, samples, kin) -> ValidationReport`, holding `passed: bool`, `checks`, `peaks` and `joints`.
   - Checks, each a separate function so it can be tested alone: `check_camera_tool`, `check_install_angle`, `check_target_geometry` (target mode: distance, horizontal distance, tilt, pan rate), `check_pan_turn`, `check_path_overshoot`, `check_ik`, `check_config_consistency` (the configuration signature, from Q8, is the same at adjacent samples), `check_joint_steps`, `check_wrist` (J4–J6 step and speed), `check_joint_limits_and_winding` (soft limits from the controller, and the total travel of each joint ≤ 360°), `check_singularity` (J5 margin, elbow and shoulder margins, and a manipulability measure from FK finite differences on every 10th sample; thresholds from Q8), `check_joint_speed_acc` (finite differences), `check_tcp_speed`, `check_workspace` (in A), `check_roll` (samples and midpoints, SLERP and linear-Euler, heuristic), `check_pointing` (every design in target mode; samples and midpoints, ≤ `max_pointing_error_deg`), `check_fk_roundtrip` (< 0.1 mm, < 0.05°).
 - **`traj_file.py`**: `write(validated: Validated, path: Path, period_ms: int) -> None` and `read(path) -> list[list[float]]`, for round-trip tests. The format follows Q2.
-- **`backend.py`**: `class TrajectoryBackend(Protocol)` with `compile(validated, out_dir) -> Path`, `upload(fr5, local_path, remote_name)`, `remote_path(name) -> str`, `load(fr5, config)`, `start(fr5, config)`, `is_done(fr5, config) -> bool`, `stop(fr5)`; and `TrajectoryFileBackend`. A `LuaBackend` exists only if Phase 0 selects it.
+- **`backend.py`**: `class TrajectoryBackend(Protocol)` with `compile(validated, out_dir) -> Path`, `upload(fr5, local_path, remote_name)` (implemented with `FR5.upload_file`, never an SDK upload call), `remote_path(name) -> str`, `load(fr5, config)`, `start(fr5, config)`, `is_done(fr5, config) -> bool`, `stop(fr5)`; and `TrajectoryFileBackend`. A `LuaBackend` exists only if Phase 0 selects it.
 - **`schema.py`**: `Design`, `Keyframe`, `CameraTool`, `Validated`, `MotionConfig`, `RobotSettings`, plus `load_design(path)`, `load_camera_tool(path)`, `load_validated(path)`, `load_motion_configs(motions_dir) -> dict[str, MotionConfig]` (skips folders without `motion.json`), `sha256_file(path)`, `MotionConfig.check_consistent()`.
 - **`fr5.py`**
   - `class FairinoError(RuntimeError)`, carrying `code` and `call`.
@@ -396,7 +417,9 @@ Signatures are binding for the implementer. Private helpers are free.
     - `joints() -> list[6]`, `joint_speeds() -> list[6]`, `tcp_pose()`, `error_codes() -> (main, sub)`, `motion_done() -> bool`
     - `move_j(joints, tool, speed_pct)`
     - `speed(pct)`: context manager that sets the speed and restores `safe_default_speed_pct` in `finally`
-    - `upload_traj(local_path)`, `delete_traj(file)`, `file_md5(remote_path) -> str`
+    - `upload_file(local_path, file_type=20) -> str`: the protocol in § Controller file transfer; returns the verified remote path. Raises `FileTransferError(stage, code)` with stage `request`, `connect`, `transfer` or `verify`.
+    - `delete_traj(file)` (`TrajectoryJDelete`), `file_md5(remote_path) -> str`
+    - `load_tpd(name)`, `tpd_start_pose(name)`, `move_tpd(name, blend, ovl)`, where `name` is `traj/<stem>` for uploaded files
     - `load_traj(remote_path, ovl)`, `run_traj()`, `stop()`
     - `prepare()` (reset errors, enable, auto mode, safe default speed)
 - **`ui_state.py`**: `UiState`, `Event`, `Action` enums/dataclasses and `transition(state, event, context) -> (UiState, list[Action])` (the table above).
@@ -504,6 +527,15 @@ Signatures are binding for the implementer. Private helpers are free.
   - `move_j` runs inside `speed(pct)`;
   - **the `speed(pct)` context manager restores `safe_default_speed_pct` on normal exit and on an exception, and tolerates a failing restore;**
   - `file_md5` returns the controller MD5 string, and the empty-hash and error cases surface as distinct exceptions.
+  - **`upload_file`** (fake XML-RPC `FileUpload` plus a local TCP listener standing in for port 20010):
+    - the listener starts 100 ms after `FileUpload`; the upload still succeeds (proves the connect retry);
+    - the listener never starts: `FileTransferError(stage="connect")` after the retry limit, with no further RPC calls;
+    - `FileUpload` returns non-zero: `stage="request"` and no connect attempt;
+    - the reply is not `SUCCESS`: `stage="transfer"`; the MD5 differs: `stage="verify"`;
+    - the bytes received by the listener equal the SDK framing (`/f/b`, 10-digit size, MD5, data, `/b/f`);
+    - every successful connect is followed by a full send (never connect-then-close);
+    - `file_type` other than 0 or 20 raises `ValueError` before any call;
+    - **no code path calls `TrajectoryJUpLoad`, `LuaUpload` or `PointTableUpLoad`** (the fake raises if they are called).
 - **Done when:** the gate passes. The module imports `fairino` lazily, inside `connect`, so tests don't need the SDK's native library.
 
 ### Phase 4: Backend, trajectory file and CLI (`backend.py`, `traj_file.py`, `motionctl.py`); needs Phase 0 results
@@ -655,9 +687,9 @@ Controller identity: the probes ran against `192.168.58.2`, which the design cal
 | Q1 Euler convention | Unknown, to be measured | A 10° J1 move changed TCP rz by 9.98°. Fixed-axis XYZ (`'xyz'`) is consistent with that on the simulator. | Recorded as the value of `SDK_EULER` in `pose.py`. Not yet confirmed on the real robot. |
 | Q2 TPD recording | `SetTPDStart` in auto mode | Auto mode returned 133. `DragTeachSwitch(1)` returned -1 in auto mode. Recording then returned 0 but stored zero points because no hand motion occurred. | Switched to manual mode (`Mode(1)`) before drag teach. The probe is `sw/robot/spike/tpd_record_probe.py`. |
 | Q2 download path | `FileDownload` then the data socket works | `__FileDownLoad` requires the destination to exist (-6 client side). Then the controller reported no file (-7) because the recording was empty. A second attempt returned -1 with 0 bytes written. | Created the destination file first. The -1 transfer failure is **not diagnosed**. |
-| Q2 data ports | Reliable transfers | Ports 20010 and 20011 refuse connections when idle (observed). Their behaviour during a transfer is inferred, not observed. `TrajectoryJUpLoad` returned -1 on most attempts: 1 success in 3 in one run, and each layout needed 2 tries in another. | Retries are needed. `fr5.py` must retry upload with a bounded count and log each attempt. |
+| Q2 data ports | Reliable transfers | Ports 20010 and 20011 refuse connections when idle (observed). Their behaviour during a transfer is inferred, not observed. `TrajectoryJUpLoad` returned -1 on most attempts: 1 success in 3 in one run, and each layout needed 2 tries in another. | **Superseded:** the cause is a connect race in the SDK, not a flaky link. Retrying the SDK call is not the fix; see § Controller file transfer. |
 | Q7 `ComputeFileMD5` | Works for any path | My earlier report said the function did not exist. It does (`Robot.py:4104`). Error 4 means "not found". Existing file: `(0, md5)`. | Corrected in the summary. Still open: the error code for an unreadable file. |
-| Q2/Q3 `LoadTrajectoryJ` | Works on the file the controller created | Error codes resolved: **8 = file not found, 4 = file found but rejected**. Earlier "8 for every file" was all not-found paths. `tracktest1` at `/fruser/tracktest1.txt` returns 4. The file is at that path (MD5 `442c28842962b0e814d6ff9aa151a9f8`), not under `/fruser/traj/`. | Probe rewritten to use `/fruser/<name>.txt`. |
+| Q2/Q3 `LoadTrajectoryJ` | Works on the file the controller created | Error codes resolved: **8 = file not found, 4 = file found but rejected** (later checked against the protocol manual, Table 10-1: 4 = "parameter value abnormal", 8 = "tpd file does not exist"). Earlier "8 for every file" was all not-found paths. `tracktest1` at `/fruser/tracktest1.txt` returns 4. The file is at that path (MD5 `442c28842962b0e814d6ff9aa151a9f8`), not under `/fruser/traj/`. | Probe rewritten to use `/fruser/<name>.txt`. |
 | Q2 file format | Documented in the manual | The manual does not document the layout. `GetTrajectoryStartPose` on `tracktest1` returned `[11520, 0, 0, 0, 0, 0]`, which means the controller read the header line `11520,1,2,0,0,0` as the first pose. This is a hypothesis, not a confirmed cause. | Open. See the layout matrix below. |
 
 Layout matrix (all rejected with 4, for `opt` 0 and 1, `ovl` 100 and 10, paths `/fruser/traj/` and `/fruser/`):
@@ -711,31 +743,53 @@ Phase 2 (validator) has not started. It is hardware-free and does not depend on 
 - **Action.** `LoadTPD("tracktest1")` returned 0 and `GetTPDStartPose` returned the first row's TCP pose, so the file parses. No motion was sent. `MoveTPD` has not been run and needs operator confirmation.
 - **Consequence.** The `TrajectoryJ` file-format work (Q2/Q3 as written) applies only to control-point files. The backend decision should compare `MoveTPD` against `MoveTrajectoryJ` with a control-point file the robot has built, not with a converted TPD file.
 
-### Phase 0 update: TrajectoryJ upload blocked by closed file ports, 2026-11-24
+### Phase 0 update: uploading files and loading them as TPD, 2026-11-24
 
-Goal: upload `sw/tracktestpc.txt` (copy of `tracktest1`), load it with `LoadTrajectoryJ`, and check its start pose and point count against the file. No motion. Script: `sw/robot/spike/tpd_upload_check.py`.
+Goal: upload `sw/tracktestpc.txt` (a byte-identical copy of the pendant recording `tracktest1`) from Python, load it, and check it against the file. No motion was sent in any of these steps.
 
-**Status: not passed. Upload fails on the real robot before anything is sent.**
+**Status: solved for the TPD route, end to end on the real robot.** The file uploads, lands at `/fruser/traj/tracktestpc.txt`, loads with `LoadTPD("traj/tracktestpc")`, and its start pose matches the file. Playback confirmed by the operator: `sw/fairino_basic_query.py --play` with `NAME = "traj/tracktestpc"` (`MOVE_OVL` 50, `PLAY_OVL` 50, `BLEND` 0) moved to the start pose and `MoveTPD("traj/tracktestpc", 0, 50)` replayed the track.
 
-| Item | What happened | Evidence | Action |
-|---|---|---|---|
-| `TrajectoryJUpLoad` with `.txt` path | Returned -1 on all 3 attempts | Real robot, user run | -1 is `ERR_OTHER`. `__FileUpLoad` returns it when the socket connect to port 20010 fails (`Robot.py:7202-7206`), before any file data is sent. This explains every -1 in this project so far, including the simulator runs. |
-| `TrajectoryJUpLoad` without `.txt` | Returned -7 | Real robot, user run | Caused by the script, not the controller: a temporary edit stripped the extension from the local path, so the local file did not exist (`ERR_UPLOAD_FILE_NOT_FOUND`). Line 49 must be `os.path.abspath(sys.argv[1])`. |
-| Port 20010 | Connection refused | `nc -zv 192.168.58.2 20010` | Closed. |
-| Port 20011 | Closed | Port scan 20000–20030 and 8080 (bash `/dev/tcp`) | Closed. The SDK uses 20011 for a second file channel (`Robot.py:6942`, `7123`). |
-| Other ports | 20001, 20002, 20003, 20004 and 8080 open. 20003 is the XML-RPC command port, 20004 the state feed. 20001, 20002 and 8080 are not used by this SDK path. | Port scan | The network and RPC services are up. Only the file-transfer ports are down. |
-| Manual | No mention of ports 20010/20011, of file-transfer prerequisites, or of what could close them. | Full-text search of the SDK manual PDF (3.9.1) | Cannot confirm the cause from the manual. |
-| Pendant file import | Not tested yet | — | Open. |
+**Correction.** An earlier version of this section said the controller's file service was down, because ports 20010/20011 refused connections. That was wrong. The ports are closed while idle by design. The controller opens 20010 only after an upload request.
 
-Correction to the table above, "Q2/Q3 `LoadTrajectoryJ`" row: in the previous session the code `8` was recorded as "file not found". That is the positive `8` returned by `LoadTrajectoryJ`. It is **not** `ERROR_RECONN` (-8). An earlier analysis of the pasted run described `8` as a reconnect error, which was wrong. The pasted run also printed a `LoadTrajectoryJ` line after "Stop: upload failed", which the script on disk cannot produce; the script used for that run was not the one on disk.
+#### How file upload works
+- Every SDK transfer is a handshake. First an XML-RPC call on 20003, then a TCP socket. Upload is `FileUpload(type, name)` then port 20010 (`Robot.py:7193`, `7197`). Download is `FileDownload` then port 20011 (`Robot.py:7123`).
+- The protocol manual (`third_party/fairino_sdk/Collaborative Robot Controller Communication Command Protocol User Manual.pdf`) documents this. It is a separate PDF from the SDK manual. Its §5.1.50 `FileUpload()` (command 1285) says "Use port 20010 to upload files". Its file types include 0 = Lua file and 20 = Trajectory J file; the others are firmware and upgrade packages. Its §5.1.32 lists the always-open ports as 20002, 20004, 8083 and 8080.
+- Observed on the real robot: after `FileUpload(20, name)` returns 0, port 20010 accepts a connection about 50 ms later. A connect made immediately is refused.
 
-What is still open:
-1. Why ports 20010 and 20011 refuse connections while 20003 and 20004 accept them. The manual does not say.
-2. Whether `TrajectoryJUpLoad` stores files under `/fruser/traj/` or somewhere else. The earlier probe found `tracktest1` at `/fruser/tracktest1.txt`, not under `/fruser/traj/`, so the folder is unconfirmed on this controller.
-3. Whether the pendant's own file import still works, and the controller's firmware version (manual is for 3.9.1). Both would show whether the file service is down on the controller or blocked only for the SDK connection.
+#### Why `TrajectoryJUpLoad` returned -1
+- **Root cause: a race in the SDK.** `__FileUpLoad` makes exactly one connect attempt, immediately after `FileUpload` returns (`Robot.py:7202-7206`). A refused connect fails at once, so the 20 s socket timeout does not help, and the function returns `ERR_OTHER` (-1). This explains every -1 so far, and the occasional successes were runs where the listener happened to be up in time.
+- -1 from `__FileUpLoad` has three possible sources, and the SDK does not say which: the `FileUpload` RPC returning non-zero (`Robot.py:7194`), the connect failing, or the transfer finishing without a "SUCCESS" reply (`Robot.py:7230-7233`).
+- **Fix:** `sw/robot/spike/file_port_probe.py`. It calls `FileUpload`, retries the connect every 50 ms for up to 5 s, sends the file with the SDK's framing, and reports which step failed. The upload returned `SUCCESS`, and the controller's `ComputeFileMD5` matched the local MD5 (`442c28842962b0e814d6ff9aa151a9f8`).
+- **Side effect to avoid:** calling `FileUpload` and then connecting and closing without sending leaves an **empty file** at the target path (observed: MD5 of zero bytes, `d41d8cd98f00b204e9800998ecf8427e`). The probe now always sends once connected.
 
-Next steps, in order:
-1. Restore line 49 of `tpd_upload_check.py`.
-2. Check the pendant's file import and the firmware version (operator, at the controller).
-3. If the file service is down, contact Fairino support. Retrying the upload will not help until port 20010 accepts connections.
-4. When 20010 accepts connections: run the check, then `LoadTrajectoryJ` against the path the controller reports.
+#### Where files land
+| How it got there | Path | Evidence |
+|---|---|---|
+| Pendant TPD recording `tracktest1` | `/fruser/tracktest1.txt` | `ComputeFileMD5` matches the local copy. Not found under `/fruser/traj/`, `/fruser/tpd/` or `/fruser/TPD/`. |
+| `FileUpload` type 20 (Trajectory J) | `/fruser/traj/<name>` | `ComputeFileMD5` matches after upload. |
+| `FileUpload` type 0 (Lua) | not in `/fruser/` until `LuaUpLoadUpdate` | Upload returned `SUCCESS`, but `/fruser/tracktestpc.txt` is not found. `LuaUpLoadUpdate("tracktestpc.txt")` returned `[-1, 'LUA FILE SIZE IS TOO LARGE!']` for the 1.3 MB file. The Lua route cannot carry TPD recordings of this size. |
+
+#### Loading the uploaded file
+| Call | Result |
+|---|---|
+| `LoadTrajectoryJ("/fruser/traj/tracktestpc.txt", 100, opt)`, opt 1 and 0 | 4. `GetTrajectoryStartPose` returned `[11520, 0, 0, 0, 0, 0]` and `GetTrajectoryPointNum` 0: the controller reads the TPD header as a point. A TPD recording is not a TrajectoryJ file, as found earlier. |
+| `LoadTPD("tracktestpc")` | 8, "The tpd file does not exist" (protocol manual, Table 10-1). `LoadTPD` looks in `/fruser/`. |
+| `LoadTPD("/fruser/traj/tracktestpc")`, with or without `.txt` | 8 |
+| **`LoadTPD("traj/tracktestpc")`** | **0.** `GetTPDStartPose` returned `[135.9624, -268.4651, 361.4536, -179.6626, 0.0199, -178.7353]`, equal to columns 7-12 of the file's first row (float32 precision). Reference: `LoadTPD("tracktest1")` returns the same pose. |
+
+Error codes: the controller error table (protocol manual, Table 10-1) gives 4 = "The parameter value is abnormal" and 8 = "The tpd file does not exist". The earlier reading of `LoadTrajectoryJ`'s 4 as "found but rejected" is consistent with "parameter value abnormal", but the table is generic, so 4 does not prove the file was found.
+
+#### Other facts recorded
+- Controller: software `v3.9.1` (`FR5-V1-001(V5.0)`, `V3.9.5-QX`), control firmware `FR_CTRL_FV2.010.04`, SDK `V2.2.1`. Manual mode, no program running, no errors during these checks.
+- The web UI's trajectory import (SDK manual §1.3.9.5.15) also uploads `tracktestpc.txt` successfully. Its destination was not confirmed: the file found at `/fruser/traj/tracktestpc.txt` before the probe's fixed upload was empty, either because the probe truncated the web-uploaded copy or because the probe created it.
+- Ports open on the robot: 20001, 20002, 20003 (XML-RPC), 20004 (state), 8080, 8083. 20001 is in neither manual.
+
+#### Consequences for the plan
+- `fr5.py` must not use `TrajectoryJUpLoad`/`LuaUpload` directly. It needs its own upload, as in `file_port_probe.py`: `FileUpload` RPC, bounded connect retry, send, check `SUCCESS`, then verify with `ComputeFileMD5`. Allowed file types should be limited to 0 and 20.
+- For TPD recordings, upload as type 20 and refer to them as `traj/<name>` in `LoadTPD`, `GetTPDStartPose` and `MoveTPD` (all three confirmed). Recording names must leave room for the `traj/` prefix in the controller's name limit.
+- Generated motions written in the TPD layout (`N,1,period,0,0,0` plus 15 columns per row) could use the same route. This is an option for the backend decision, not yet tested with a generated file.
+
+Next steps:
+1. Done: playback of the uploaded file (see Status).
+2. Done: `sw/robot/spike/tpd_upload_check.py` now uploads with the retrying protocol (`upload_file` in `file_port_probe.py`), verifies the MD5, and checks `LoadTPD("traj/<stem>")` and its start pose.
+3. Try a small generated file in the TPD layout through the same route.

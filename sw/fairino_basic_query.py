@@ -1,8 +1,8 @@
 """Check and optionally play a TPD recording on the FR5.
 
 Usage:
-    python tpd_play_check.py                  # load + read only (no motion)
-    python tpd_play_check.py --play           # also move to start and play
+    uv run python -m sw.fairino_basic_query          # load + read only (no motion)
+    uv run python -m sw.fairino_basic_query --play   # also move to start and play
 """
 
 import sys
@@ -11,7 +11,7 @@ import time
 from fairino import Robot
 
 ROBOT_IP = "192.168.58.2"
-NAME = "tracktest1"  # TPD name, no extension and no path
+NAME = "traj/tracktestpc"  # TPD name, no extension; "traj/" = uploaded as type 20
 PLAY_OVL = 50  # speed scaling %, keep low for the first run
 BLEND = 0  # 0 = no smoothing, 1 = smooth
 MOVE_OVL = 50  # speed for the move to the start pose
