@@ -710,3 +710,32 @@ Phase 2 (validator) has not started. It is hardware-free and does not depend on 
 - **Manual.** TPD playback is `LoadTPD(name)` → `GetTPDStartPose(name)` → `MoveTPD(name, blend, ovl)`, where `name` has no extension. The manual reference is Chapter 2 §2.1.9.6–2.1.9.8 and the TPD recording example.
 - **Action.** `LoadTPD("tracktest1")` returned 0 and `GetTPDStartPose` returned the first row's TCP pose, so the file parses. No motion was sent. `MoveTPD` has not been run and needs operator confirmation.
 - **Consequence.** The `TrajectoryJ` file-format work (Q2/Q3 as written) applies only to control-point files. The backend decision should compare `MoveTPD` against `MoveTrajectoryJ` with a control-point file the robot has built, not with a converted TPD file.
+
+### Phase 0 update: TrajectoryJ upload blocked by closed file ports, 2026-11-24
+
+Goal: upload `sw/tracktestpc.txt` (copy of `tracktest1`), load it with `LoadTrajectoryJ`, and check its start pose and point count against the file. No motion. Script: `sw/robot/spike/tpd_upload_check.py`.
+
+**Status: not passed. Upload fails on the real robot before anything is sent.**
+
+| Item | What happened | Evidence | Action |
+|---|---|---|---|
+| `TrajectoryJUpLoad` with `.txt` path | Returned -1 on all 3 attempts | Real robot, user run | -1 is `ERR_OTHER`. `__FileUpLoad` returns it when the socket connect to port 20010 fails (`Robot.py:7202-7206`), before any file data is sent. This explains every -1 in this project so far, including the simulator runs. |
+| `TrajectoryJUpLoad` without `.txt` | Returned -7 | Real robot, user run | Caused by the script, not the controller: a temporary edit stripped the extension from the local path, so the local file did not exist (`ERR_UPLOAD_FILE_NOT_FOUND`). Line 49 must be `os.path.abspath(sys.argv[1])`. |
+| Port 20010 | Connection refused | `nc -zv 192.168.58.2 20010` | Closed. |
+| Port 20011 | Closed | Port scan 20000–20030 and 8080 (bash `/dev/tcp`) | Closed. The SDK uses 20011 for a second file channel (`Robot.py:6942`, `7123`). |
+| Other ports | 20001, 20002, 20003, 20004 and 8080 open. 20003 is the XML-RPC command port, 20004 the state feed. 20001, 20002 and 8080 are not used by this SDK path. | Port scan | The network and RPC services are up. Only the file-transfer ports are down. |
+| Manual | No mention of ports 20010/20011, of file-transfer prerequisites, or of what could close them. | Full-text search of the SDK manual PDF (3.9.1) | Cannot confirm the cause from the manual. |
+| Pendant file import | Not tested yet | — | Open. |
+
+Correction to the table above, "Q2/Q3 `LoadTrajectoryJ`" row: in the previous session the code `8` was recorded as "file not found". That is the positive `8` returned by `LoadTrajectoryJ`. It is **not** `ERROR_RECONN` (-8). An earlier analysis of the pasted run described `8` as a reconnect error, which was wrong. The pasted run also printed a `LoadTrajectoryJ` line after "Stop: upload failed", which the script on disk cannot produce; the script used for that run was not the one on disk.
+
+What is still open:
+1. Why ports 20010 and 20011 refuse connections while 20003 and 20004 accept them. The manual does not say.
+2. Whether `TrajectoryJUpLoad` stores files under `/fruser/traj/` or somewhere else. The earlier probe found `tracktest1` at `/fruser/tracktest1.txt`, not under `/fruser/traj/`, so the folder is unconfirmed on this controller.
+3. Whether the pendant's own file import still works, and the controller's firmware version (manual is for 3.9.1). Both would show whether the file service is down on the controller or blocked only for the SDK connection.
+
+Next steps, in order:
+1. Restore line 49 of `tpd_upload_check.py`.
+2. Check the pendant's file import and the firmware version (operator, at the controller).
+3. If the file service is down, contact Fairino support. Retrying the upload will not help until port 20010 accepts connections.
+4. When 20010 accepts connections: run the check, then `LoadTrajectoryJ` against the path the controller reports.
