@@ -1,0 +1,31 @@
+{
+  "name": "up_down_horizontal",
+  "backend": "tpd",
+  "controller_file": "/fruser/traj/motion_up_down_horizontal.txt",
+  "tpd_name": "traj/motion_up_down_horizontal",
+  "md5": "5343bc1cd7e4ca50436c11459d230010",
+  "num_points": 255,
+  "sample_period_ms": 8,
+  "duration_s": 2.032,
+  "design_duration_s": 2.03,
+  "start_joints": [
+    89.71810913085938,
+    -90.33719635009766,
+    0.16054536402225497,
+    29.626134404293353,
+    -89.56583585853711,
+    45.76890969191907
+  ],
+  "start_pose": [
+    122.9729919433593,
+    -403.5740356445312,
+    675.1069946289062,
+    -119.4524002075195,
+    2.110977561642358e-07,
+    178.8350982666015
+  ],
+  "tool_id": 1,
+  "approved_ovl": 100,
+  "design_sha256": "4b9013fc446dc4a7782424aa58d5f72f727ff3675a6f37b16e0ddd92f6ea9ea6",
+  "published_at": "2026-11-25T02:35:30"
+}

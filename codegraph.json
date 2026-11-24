@@ -1,0 +1,10 @@
+{
+  "include": [
+    "third_party/fairino_sdk/linux/fairino/",
+    "third_party/fairino_sdk/linux/example/"
+  ],
+  "exclude": [
+    "third_party/fairino_sdk/**/*.log",
+    "third_party/fairino_sdk/**/__pycache__/"
+  ]
+}
