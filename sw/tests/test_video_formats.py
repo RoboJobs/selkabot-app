@@ -60,6 +60,27 @@ def test_chunk_count_depends_on_duration_not_frame_rate():
     assert len(set(counts.values())) == 1, counts
 
 
+def test_portrait_output_profile_swaps_social_dimensions():
+    portrait = p.Probe(2160, 3840, 120, 1, 1200)
+    landscape = p.Probe(3840, 2160, 120, 1, 1200)
+    assert portrait.portrait
+    assert p.output_dimensions(portrait, 1920, 1080) == (1080, 1920)
+    assert p.output_dimensions(landscape, 1920, 1080) == (1920, 1080)
+
+
+def test_probe_video_applies_container_rotation(monkeypatch, tmp_path):
+    class Result:
+        stdout = (
+            '{"streams":[{"width":3840,"height":2160,'
+            '"r_frame_rate":"120/1","tags":{"rotate":"90"}}],'
+            '"format":{"duration":"1.0"}}'
+        )
+
+    monkeypatch.setattr(p.subprocess, "run", lambda *args, **kwargs: Result())
+    probe = p.probe_video(tmp_path / "portrait.mp4")
+    assert (probe.width, probe.height, probe.rotation) == (2160, 3840, 90)
+
+
 @pytest.mark.parametrize("name, probe", FORMATS, ids=IDS)
 def test_project_profile_matches_the_source_format(name, probe, tmp_path, monkeypatch):
     monkeypatch.setattr(p, "_video_frames", lambda _: probe.total_frames)

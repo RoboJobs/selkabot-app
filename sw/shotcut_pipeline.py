@@ -120,7 +120,10 @@ WATERMARK_SIZE_PCT = 10  # Each watermark's bounding box, as a percentage of the
 # upload
 # sync uploads every .mp4 it finds in a recording folder).
 SMOOTH_CACHE_DIR = ROOT / "videos" / "shotcut" / "smoothed"
-SMOOTHING_MODES = ("high", "shotcut")
+SMOOTHING_MODES = ("native", "high", "shotcut")
+DEFAULT_OUTPUT_FPS = 30
+DEFAULT_OUTPUT_WIDTH = 1920
+DEFAULT_OUTPUT_HEIGHT = 1080
 # ffmpeg minterpolate is single-threaded, so each slowdown is split into this many
 # chunks that
 # are rendered in parallel. Chunks overlap by CHUNK_CONTEXT_FRAMES source
@@ -201,7 +204,12 @@ class EditSettings:
     speed: float = 0.3
     clip_start: float = 0.0
     clip_length: float | None = None
-    smoothing: str = "high"
+    smoothing: str = "native"
+    output_fps: int = DEFAULT_OUTPUT_FPS
+    output_width: int = DEFAULT_OUTPUT_WIDTH
+    output_height: int = DEFAULT_OUTPUT_HEIGHT
+    flash_enabled: bool = True
+    fades_enabled: bool = True
     exposure: float = (
         # Stops: negative is darker, positive brighter. Applied to the recording only.
         0.0
@@ -228,6 +236,10 @@ class EditSettings:
             raise ValueError(
                 f"smoothing must be one of {SMOOTHING_MODES}, not {self.smoothing!r}"
             )
+        if self.output_fps <= 0:
+            raise ValueError("output_fps must be positive")
+        if self.output_width <= 0 or self.output_height <= 0:
+            raise ValueError("output dimensions must be positive")
         if not 0 < self.speed <= 1:
             raise ValueError(f"speed must be in (0, 1], not {self.speed}")
         if self.chunks < 1:
@@ -261,6 +273,11 @@ class Probe:
     fps_num: int
     fps_den: int
     total_frames: int  # Number of frames in the source clip
+    rotation: int = 0  # Container rotation in degrees, before display-orientation swap
+
+    @property
+    def portrait(self) -> bool:
+        return self.height > self.width
 
 
 def probe_video(path: Path) -> Probe:
@@ -272,10 +289,8 @@ def probe_video(path: Path) -> Probe:
             "error",
             "-select_streams",
             "v:0",
-            "-show_entries",
-            "stream=width,height,r_frame_rate",
-            "-show_entries",
-            "format=duration",
+            "-show_streams",
+            "-show_format",
             "-of",
             "json",
             str(path),
@@ -287,6 +302,19 @@ def probe_video(path: Path) -> Probe:
     data = json.loads(out)
     stream = data["streams"][0]
     width, height = int(stream["width"]), int(stream["height"])
+    tags = stream.get("tags") or {}
+    rotation_value = tags.get("rotate", 0)
+    side_data = stream.get("side_data_list") or []
+    for item in side_data:
+        if "rotation" in item:
+            rotation_value = item["rotation"]
+            break
+    try:
+        rotation = round(float(rotation_value))
+    except (TypeError, ValueError):
+        rotation = 0
+    if abs(rotation) % 180 == 90:
+        width, height = height, width
     fps_num, fps_den = (int(x) for x in stream["r_frame_rate"].split("/"))
     duration = float(data["format"]["duration"])
     total_frames = round(duration * fps_num / fps_den)
@@ -296,7 +324,17 @@ def probe_video(path: Path) -> Probe:
         fps_num=fps_num,
         fps_den=fps_den,
         total_frames=total_frames,
+        rotation=rotation,
     )
+
+
+def output_dimensions(probe: Probe, width: int, height: int) -> tuple[int, int]:
+    """Return the configured output profile in the source's display orientation."""
+    if probe.portrait and width > height:
+        return height, width
+    if not probe.portrait and height > width:
+        return height, width
+    return width, height
 
 
 def _prop(name: str, value: object) -> str:
@@ -382,6 +420,84 @@ def _effective_chunks(frames: int, fps: float, chunks: int) -> int:
     return max(1, min(chunks, int(frames / fps / MIN_CHUNK_SECONDS)))
 
 
+def native_speed_limit(source_fps: float, output_fps: float) -> float:
+    """Slowest motion that can be produced without inventing frames."""
+    return output_fps / source_fps
+
+
+def effective_speed(speed: float, source_fps: float, output_fps: float) -> float:
+    """Clamp native retiming to the source/output frame-rate limit."""
+    return max(speed, native_speed_limit(source_fps, output_fps))
+
+
+def normalize_source(
+    source: Path,
+    probe: Probe,
+    output_fps: int,
+    output_width: int,
+    output_height: int,
+    cache_dir: Path = SMOOTH_CACHE_DIR,
+    progress: ProgressFn | None = None,
+) -> tuple[Path, Probe]:
+    """Create a cached social-output proxy for normal-speed composition."""
+    stat = source.stat()
+    key_parts = [
+        "normalize-v1",
+        str(source.resolve()),
+        str(stat.st_size),
+        str(stat.st_mtime_ns),
+        str(output_fps),
+        str(output_width),
+        str(output_height),
+    ]
+    key = hashlib.sha1("|".join(key_parts).encode()).hexdigest()[:16]
+    output = cache_dir / f"normalized_{source.stem}_{key}.mp4"
+    if output.exists():
+        _report(progress, f"reusing cached {output.name}")
+        return output, probe_video(output)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    temp = output.with_suffix(".tmp.mp4")
+    _report(progress, f"normalizing to {output_width}x{output_height}@{output_fps}fps")
+    vf = (
+        f"fps={output_fps},scale={output_width}:{output_height}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={output_width}:{output_height}"
+    )
+    cmd = [
+        FFMPEG,
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "fast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-metadata:s:v:0",
+        "rotate=0",
+        "-movflags",
+        "+faststart",
+        str(temp),
+    ]
+    try:
+        _run_ffmpeg(cmd, probe.total_frames / (probe.fps_num / probe.fps_den), progress)
+        os.replace(temp, output)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+    return output, probe_video(output)
+
+
 def smooth_segment(
     source: Path,
     probe: Probe,
@@ -391,6 +507,10 @@ def smooth_segment(
     cache_dir: Path = SMOOTH_CACHE_DIR,
     progress: ProgressFn | None = None,
     chunks: int = DEFAULT_CHUNKS,
+    mode: str = "high",
+    output_fps: float | None = None,
+    output_width: int | None = None,
+    output_height: int | None = None,
 ) -> Path:
     """Return a file holding source frames [start_frame, end_frame) slowed to `speed`,
     smoothed.
@@ -405,17 +525,43 @@ def smooth_segment(
     is slowed in one pass with atempo (pitch kept). Results are cached by their inputs.
     """
     fps = probe.fps_num / probe.fps_den
+    requested_output_fps = output_fps
+    output_fps = output_fps or fps
+    effective = effective_speed(speed, fps, output_fps) if mode == "native" else speed
+    if mode == "native" and effective != speed:
+        _report(progress, f"clamped native speed from {speed:g}x to {effective:g}x")
+    speed = effective
     stat = source.stat()
-    video_filter = (
-        "minterpolate="
-        f"fps={round(fps / speed)}:mi_mode=mci:mc_mode=aobmc:"
-        "me_mode=bidir:vsbmc=1,"
-        f"setpts=PTS/{speed},fps={probe.fps_num}/{probe.fps_den}"
-    )
+    if mode == "native":
+        required_fps = min(fps, output_fps / speed)
+        video_filter = (
+            f"fps={required_fps:.9f},setpts=N/({output_fps:.9f}*TB),"
+            f"fps={output_fps:.9f}"
+        )
+    else:
+        video_filter = (
+            "minterpolate="
+            f"fps={round(fps / speed)}:mi_mode=mci:mc_mode=aobmc:"
+            "me_mode=bidir:vsbmc=1,"
+            f"setpts=PTS/{speed},fps={
+                f'{probe.fps_num}/{probe.fps_den}'
+                if requested_output_fps is None
+                else f'{output_fps:.9f}'
+            }"
+        )
+    if output_width and output_height:
+        video_filter += (
+            f",scale={output_width}:{output_height}:force_original_aspect_ratio=increase,"
+            f"crop={output_width}:{output_height}"
+        )
+    if mode == "native":
+        cache_version = "native-v1"
+    else:
+        cache_version = "v3"
     chunks = _effective_chunks(end_frame - start_frame, fps, chunks)
     # "v3": chunked rendering. The key covers everything that changes the output.
     key_parts = [
-        "v3",
+        cache_version,
         str(source.resolve()),
         str(stat.st_size),
         str(stat.st_mtime_ns),
@@ -441,19 +587,52 @@ def smooth_segment(
     started = time.monotonic()
     try:
         work.mkdir(parents=True, exist_ok=True)
-        parts = _render_chunks(
-            source,
-            probe,
-            start_frame,
-            end_frame,
-            speed,
-            video_filter,
-            chunks,
-            work,
-            progress,
-        )
-        joined = work / "video.mp4"
-        _concat_parts(parts, joined, work)
+        if mode == "native":
+            _run_ffmpeg(
+                [
+                    FFMPEG,
+                    "-v",
+                    "error",
+                    "-y",
+                    "-ss",
+                    f"{start_frame / fps:.6f}",
+                    "-t",
+                    f"{(end_frame - start_frame) / fps:.6f}",
+                    "-i",
+                    str(source),
+                    "-an",
+                    "-vf",
+                    video_filter,
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    "18",
+                    "-preset",
+                    "fast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(work / "video.mp4"),
+                ],
+                expected_out,
+                progress,
+            )
+            parts = [work / "video.mp4"]
+            joined = parts[0]
+        else:
+            parts = _render_chunks(
+                source,
+                probe,
+                start_frame,
+                end_frame,
+                speed,
+                video_filter,
+                chunks,
+                work,
+                progress,
+                output_fps=output_fps,
+            )
+            joined = work / "video.mp4"
+            _concat_parts(parts, joined, work)
         if _has_audio(source):
             audio = work / "audio.m4a"
             _render_audio(source, probe, start_frame, end_frame, speed, audio)
@@ -465,7 +644,7 @@ def smooth_segment(
         shutil.rmtree(work, ignore_errors=True)
         raise
     shutil.rmtree(work, ignore_errors=True)
-    expected = round((end_frame - start_frame) / speed)
+    expected = round((end_frame - start_frame) / fps / speed * output_fps)
     actual = _video_frames(temp)
     if abs(actual - expected) > 2:
         temp.unlink(missing_ok=True)
@@ -487,6 +666,7 @@ def _render_chunks(
     chunks: int,
     work: Path,
     progress: ProgressFn | None,
+    output_fps: float | None = None,
 ) -> list[Path]:
     """Interpolate the window in `chunks` parallel pieces; returns them in order,
     trimmed exactly.
@@ -497,16 +677,19 @@ def _render_chunks(
     speed)), so the pieces add up to exactly the length of the whole window.
     """
     fps = probe.fps_num / probe.fps_den
+    output_fps = output_fps or fps
     length = end_frame - start_frame
     bounds = [start_frame + round(i * length / chunks) for i in range(chunks + 1)]
     jobs = []
     for i, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
         a = max(start_frame, lo - CHUNK_CONTEXT_FRAMES)
         b = min(end_frame, hi + CHUNK_CONTEXT_FRAMES)
-        trim_start = round((lo - start_frame) / speed) - round(
-            (a - start_frame) / speed
+        trim_start = round((lo - start_frame) / fps / speed * output_fps) - round(
+            (a - start_frame) / fps / speed * output_fps
         )
-        trim_end = round((hi - start_frame) / speed) - round((a - start_frame) / speed)
+        trim_end = round((hi - start_frame) / fps / speed * output_fps) - round(
+            (a - start_frame) / fps / speed * output_fps
+        )
         jobs.append((i, a, b, trim_start, trim_end))
 
     def render(job: tuple[int, int, int, int, int]) -> Path:
@@ -516,7 +699,7 @@ def _render_chunks(
             f"{video_filter},trim=start_frame={trim_start}:"
             f"end_frame={trim_end},setpts=PTS-STARTPTS"
         )
-        chunk_seconds = (trim_end - trim_start) / fps
+        chunk_seconds = (trim_end - trim_start) / output_fps
         _run_ffmpeg(
             [
                 FFMPEG,
@@ -768,6 +951,10 @@ def build_project_xml(
     flash_windows: tuple[tuple[float, float], ...] = (),
     flash_min_gap: float = FLASH_MIN_GAP_SECONDS,
     flash_max_gap: float = FLASH_MAX_GAP_SECONDS,
+    flash_enabled: bool = True,
+    output_fps: int | None = None,
+    output_width: int | None = None,
+    output_height: int | None = None,
 ) -> tuple[str, int]:
     """Build the MLT project XML for one edited, watermarked clip; also returns its
     length in frames.
@@ -782,7 +969,14 @@ def build_project_xml(
     with the     pre-rendered smoothed file for it, or None to use MLT's timewarp
     instead.
     """
-    fps_num, fps_den = probe.fps_num, probe.fps_den
+    fps_num, fps_den = (
+        (output_fps or probe.fps_num),
+        (1 if output_fps else probe.fps_den),
+    )
+    frame_width, frame_height = (
+        output_width or probe.width,
+        output_height or probe.height,
+    )
     fps = fps_num / fps_den
     still_frames = round(FADE_STILL_SECONDS * fps)
     trans_frames = round(FADE_TRANSITION_SECONDS * fps)
@@ -973,7 +1167,7 @@ def build_project_xml(
     total_final = cursor
     flash_xml = _flash_filter(
         flash_events(
-            flash_windows,
+            flash_windows if flash_enabled else (),
             fps,
             total_final,
             visible_start=fade_in_end,
@@ -1061,8 +1255,8 @@ def build_project_xml(
     )
 
     profile = (
-        f'<profile description="{probe.width}x{probe.height}" '
-        f'width="{probe.width}" height="{probe.height}" '
+        f'<profile description="{frame_width}x{frame_height}" '
+        f'width="{frame_width}" height="{frame_height}" '
         f'progressive="1" sample_aspect_num="1" sample_aspect_den="1" '
         f'display_aspect_num="{probe.width}" display_aspect_den="{probe.height}" '
         f'frame_rate_num="{fps_num}" frame_rate_den="{fps_den}" colorspace="709" />'
@@ -1105,8 +1299,14 @@ def plan_windows(
     fps = probe.fps_num / probe.fps_den
     clip_lo, clip_n = clip
     trans = round(FADE_TRANSITION_SECONDS * fps)
-    body_lo = clip_lo + (trans if settings.fadein_image else 0)
-    body_hi = clip_lo + clip_n - (trans if settings.fadeout_image else 0)
+    body_lo = clip_lo + (
+        trans if settings.fades_enabled and settings.fadein_image else 0
+    )
+    body_hi = (
+        clip_lo
+        + clip_n
+        - (trans if settings.fades_enabled and settings.fadeout_image else 0)
+    )
     windows = []
     for start_s, end_s in settings.slowdowns:
         window = _clip_window(clip_lo, clip_lo + clip_n, fps, start_s, end_s)
@@ -1158,6 +1358,8 @@ def edit_clip(
         watermarks = [(ALWAYS_WATERMARK, ALWAYS_CORNERS)]
     fadein_image = fadein_image or settings.fadein_image
     fadeout_image = fadeout_image or settings.fadeout_image
+    if not settings.fades_enabled:
+        fadein_image = fadeout_image = None
     # melt resolves relative resource paths against the project file's own
     # directory, not the
     # caller's cwd, so every path written into the XML must be absolute.
@@ -1176,22 +1378,46 @@ def edit_clip(
         _emit(progress, f"{name}: {message}")
 
     say("probing")
-    probe = probe_video(original)
-    fps = probe.fps_num / probe.fps_den
-    clip = clip_range(probe, settings)
-    windows = plan_windows(probe, settings, clip)
+    source_probe = probe_video(original)
+    source_fps = source_probe.fps_num / source_probe.fps_den
+    clip = clip_range(source_probe, settings)
+    windows = plan_windows(source_probe, settings, clip)
     clip_first, clip_frames = clip
+    output_fps = settings.output_fps
+    output_width, output_height = output_dimensions(
+        source_probe, settings.output_width, settings.output_height
+    )
+    output_source, probe = normalize_source(
+        original,
+        source_probe,
+        output_fps,
+        output_width,
+        output_height,
+        progress=lambda m: say(m),
+    )
+    output_clip = (
+        round(clip_first / source_fps * output_fps),
+        round(clip_frames / source_fps * output_fps),
+    )
+    output_windows = [
+        (
+            round(start / source_fps * output_fps),
+            round(end / source_fps * output_fps),
+        )
+        for start, end in windows
+    ]
     say(
-        f"recording is {probe.total_frames / fps:.2f}s; clip is {
-            clip_frames / fps:.2f}s "
-        f"long, starting at {clip_first / fps:.2f}s ({probe.width}x{probe.height}, {
-            fps:.3f} fps)"
+        f"recording is {source_probe.total_frames / source_fps:.2f}s; clip is {
+            clip_frames / source_fps:.2f}s "
+        f"long, starting at {clip_first / source_fps:.2f}s ({source_probe.width}x{
+            source_probe.height
+        }, {source_fps:.3f} fps) -> {output_width}x{output_height}@{output_fps}"
     )
     for k, (start, end) in enumerate(windows, start=1):
         say(
             f"slowdown {k}/{len(windows)}: clip "
-            f"{(start - clip_first) / fps:.2f}-"
-            f"{(end - clip_first) / fps:.2f}s "
+            f"{(start - clip_first) / source_fps:.2f}-"
+            f"{(end - clip_first) / source_fps:.2f}s "
             f"at {settings.speed}x"
         )
     if settings.slowdowns and not windows:
@@ -1203,23 +1429,24 @@ def edit_clip(
     )
 
     smoothed: list[Path | None] = [None] * len(windows)
-    if settings.smoothing == "high" and windows:
-        say(
-            f"smoothing {len(windows)} slowdown(s) with ffmpeg in parallel "
-            "(high quality, slow)"
-        )
+    if settings.smoothing in ("native", "high") and windows:
+        say(f"retiming {len(windows)} slowdown(s) with ffmpeg ({settings.smoothing})")
 
         def smooth_one(item: tuple[int, tuple[int, int]]) -> Path:
             k, (start, end) = item
             label = f"slowdown {k}/{len(windows)}"
             return smooth_segment(
                 original,
-                probe,
+                source_probe,
                 start,
                 end,
                 settings.speed,
                 progress=lambda m: _emit(progress, f"{name}: {label}: {m}"),
                 chunks=settings.chunks,
+                mode=settings.smoothing,
+                output_fps=output_fps,
+                output_width=output_width,
+                output_height=output_height,
             )
 
         # The windows are rendered in parallel: each ffmpeg process is single-threaded.
@@ -1235,23 +1462,27 @@ def edit_clip(
             raise FileNotFoundError(f"soundtrack not found: {soundtrack}")
         music = (
             soundtrack,
-            round(settings.soundtrack_start * fps),
-            round(_duration_seconds(soundtrack) * fps),
+            round(settings.soundtrack_start * output_fps),
+            round(_duration_seconds(soundtrack) * output_fps),
         )
     xml, total_frames = build_project_xml(
-        original,
+        output_source,
         probe,
         watermarks,
         fadein_image,
         fadeout_image,
-        clip,
-        [(s, e, path) for (s, e), path in zip(windows, smoothed)],
+        output_clip,
+        [(s, e, path) for (s, e), path in zip(output_windows, smoothed)],
         settings.speed,
         music,
         exposure=settings.exposure,
         flash_windows=settings.flash_windows,
         flash_min_gap=settings.flash_min_gap,
         flash_max_gap=settings.flash_max_gap,
+        flash_enabled=settings.flash_enabled,
+        output_fps=output_fps,
+        output_width=output_width,
+        output_height=output_height,
     )
     if settings.exposure:
         say(f"exposure {settings.exposure:+g} stops on the recording")
@@ -1260,7 +1491,7 @@ def edit_clip(
         if music_in + total_frames > music_len:
             say(
                 f"warning: soundtrack {soundtrack.name} ends after "
-                f"{(music_len - music_in) / fps:.1f}s from the start point; "
+                f"{(music_len - music_in) / output_fps:.1f}s from the start point; "
                 "the rest of the video is silent"
             )
         say(f"soundtrack {soundtrack.name} from {settings.soundtrack_start:g}s")

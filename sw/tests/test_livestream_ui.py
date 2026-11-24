@@ -6,6 +6,7 @@ they need a display. They are skipped when Tk cannot open one.
 
 import concurrent.futures
 import gc
+import json
 import tkinter as tk
 from tkinter import ttk
 from types import SimpleNamespace
@@ -199,6 +200,15 @@ def test_full_window_locks_the_selector_until_connected_then_enables_it(
         fadeout_image="",
         config_file=tmp_path / "config.json",
     )
+    assert (
+        ui.postprocessor._jobs.qsize() == 0
+    )  # --no-upload must not require R2 credentials
+    assert ui._flash_checkbutton.cget("text") == "Enable camera flash effect"
+    assert ui._fades_checkbutton.cget("text") == "Enable image fade effects"
+    ui.flash_enabled_var.set(False)
+    ui._on_config_commit()
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["flash_enabled"] is False and saved["fades_enabled"] is True
     assert ui.picker.mode.label == "16:9 2.7K 60fps Wide"
     # Connecting: every option is locked until the camera answers.
     assert all(

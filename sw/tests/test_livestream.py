@@ -28,26 +28,54 @@ def test_validation_helpers_and_config(tmp_path):
     assert l.load_config(cfg) == ("default", "", "", "")
 
 
+def test_effect_toggles_round_trip_in_shared_config(tmp_path):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"flash_enabled": False, "fades_enabled": True}))
+    assert l.load_effects(cfg) == (False, True)
+    l.save_config(cfg, "clips", "", "", "", False, False)
+    data = json.loads(cfg.read_text())
+    assert data["flash_enabled"] is False
+    assert data["fades_enabled"] is False
+
+
 def test_check_and_postprocessor(monkeypatch):
-    class Response: ok = False; identifier = "x"; status = "bad"
-    with pytest.raises(RuntimeError, match="x failed"): l._check(Response())
-    events = queue.Queue(); done = []; errors = []
+    class Response:
+        ok = False
+        identifier = "x"
+        status = "bad"
+
+    with pytest.raises(RuntimeError, match="x failed"):
+        l._check(Response())
+    events = queue.Queue()
+    done = []
+    errors = []
     monkeypatch.setattr(l.shotcut_watermark, "add_watermark", lambda *a, **k: None)
     monkeypatch.setattr(l.shotcut_watermark, "settings_for_recording", lambda *a: None)
     pp = l.PostProcessor(False, events, done.append, lambda c, e: errors.append(e))
     clip = l.Clip(Path("a"), Path("b"), Path("q"), "k", [], None, None)
-    pp.submit(clip); pp.stop(); pp._thread.join(2)
-    callback = events.get(timeout=1); callback()
+    pp.submit(clip)
+    pp.stop()
+    pp._thread.join(2)
+    callback = events.get(timeout=1)
+    callback()
     assert done[0].video == clip.watermarked and not errors
 
 
 def test_postprocessor_error_and_upload(monkeypatch):
-    events = queue.Queue(); done = []; errors = []
+    events = queue.Queue()
+    done = []
+    errors = []
     monkeypatch.setattr(l.shotcut_watermark, "settings_for_recording", lambda *a: None)
-    monkeypatch.setattr(l.shotcut_watermark, "add_watermark", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad edit")))
+    monkeypatch.setattr(
+        l.shotcut_watermark,
+        "add_watermark",
+        lambda *a, **k: (_ for _ in ()).throw(ValueError("bad edit")),
+    )
     pp = l.PostProcessor(False, events, done.append, lambda c, e: errors.append((c, e)))
     clip = l.Clip(Path("a"), Path("b"), Path("q"), "k", [], None, None)
-    pp.submit(clip); pp.stop(); pp._thread.join(2)
+    pp.submit(clip)
+    pp.stop()
+    pp._thread.join(2)
     events.get(timeout=1)()
     assert isinstance(errors[0][1], ValueError)
 
@@ -58,7 +86,8 @@ def test_controller_property_and_check_success(tmp_path):
     controller._gopro = "camera"
     assert controller.gopro == "camera"
     controller._gopro = None
-    with pytest.raises(AssertionError): controller.gopro
+    with pytest.raises(AssertionError):
+        controller.gopro
 
 
 def test_preview_reader_latest_frame(monkeypatch):
