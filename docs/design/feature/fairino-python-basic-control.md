@@ -1,256 +1,194 @@
 # Plan: Camera-level robot motions (Fairino FR5) for livestream.py
 
-## Context
-A GoPro is mounted on the FR5 flange. The goal is cinematic camera moves in the style of the "glambot": fast horizontal and vertical sweeps, crane moves and push-ins. Through all of them the camera **never rolls about its optical axis**, so the horizon stays level, while pan and tilt either follow keyframes or track a target point.
+## Read this first (rules for whoever implements this)
+1. **Motions are played with `MoveTPD`.** We generate a TPD file (the same format the teach pendant records), upload it, load it with `LoadTPD`, and play it with `MoveTPD`. This route is verified end to end on the real robot (§ History). **Do not use `LoadTrajectoryJ`/`MoveTrajectoryJ`, Lua programs, or `ServoJ` streaming.** Questions about the TrajectoryJ file format are closed: they do not matter.
+2. **Upload files only with `FR5.upload_file`** (§ Controller file transfer). Never call `TrajectoryJUpLoad`, `LuaUpload` or `PointTableUpLoad`: they fail with -1 because of a race in the SDK.
+3. **Work the phases in order** (§ Phases). Each phase lists its tasks, its tests and when it is done. The first goal is Phase 4's milestone: **a motion generated from a `design.yaml` plays on the real robot.**
+4. **Do not work on anything in § Deferred**, even if it looks related: camera calibration, roll measurement on the robot, stop latency, tracking/timing accuracy, singularity analysis, an independent stop channel, rehearsal ramps, atomic publishing. The user will ask for those later.
+5. If a hardware fact you need is not in this document, **stop and ask the operator**. Do not start an investigation. Never move the robot without the operator's explicit YES (the scripts prompt for it).
+6. **All automated/manual testing against hardware runs on the simulator, `192.168.50.2`, by default** (§ Simulator vs real robot). Use `--ip 192.168.50.2` (the `motionctl` default) for `pose`, `plan`, `validate` (IK/FK), and for exercising `move_j`/motion calls where the sim accepts them. **File upload and `MoveTPD` playback do not work on the sim** (confirmed; § History) — `upload`, `play` and `publish` need the real robot at `192.168.58.2`, run by the operator with YES confirmation. If an automated step needs a file on the controller and the upload call fails, **stop and tell the operator the local file path**; the operator uploads it manually through the pendant/web UI and confirms before you continue. Never silently retry a failing upload against the real robot without being asked.
+7. Known-good reference code: `sw/fairino_basic_query.py` (load + play a TPD), `sw/robot/spike/file_port_probe.py` (`upload_file`), `sw/robot/spike/tpd_upload_check.py` (upload + MD5 + `LoadTPD` + start pose check). Copy their call sequences.
 
-Motions are designed as keyframe files, validated offline against the robot's own kinematics, rehearsed on the robot, and then uploaded to the controller under a name. The operator app `sw/livestream.py` selects a published motion with a button, moves the robot to the motion's start pose on request, and runs the motion when recording starts. **The app never generates or modifies a trajectory.** It only loads and runs files that were validated beforehand.
+## Context
+A GoPro is mounted on the FR5 flange. The goal is cinematic camera moves in the style of the "glambot": horizontal and vertical sweeps, crane moves and push-ins. Through all of them the camera **never rolls about its optical axis**, so the horizon stays level, while pan and tilt either follow keyframes or track a target point.
+
+Motions are designed as keyframe files (`design.yaml`), sampled in Python, converted to joints with the controller's own inverse kinematics, written as a TPD file, uploaded to the controller and played there. The operator app `sw/livestream.py` selects a published motion with a button, moves the robot to the motion's start on request, and plays the motion when recording starts. **The app never generates or modifies a trajectory.** It only loads and plays files that were published beforehand.
 
 Starting point:
-- The Fairino Python SDK is installed from `third_party/fairino_sdk/linux` (see `pyproject.toml`, `[tool.uv.sources]`). That folder is git-ignored. `codegraph.json` in the repo root re-includes `linux/fairino/` and `linux/example/` in the CodeGraph index, so `codegraph_explore` can read the SDK.
-- The SDK connection works (`sw/fairino_basic_query.py`). The robot is at `192.168.58.2` over a USB network adapter.
-- The SDK manual is `third_party/fairino_sdk/fairino-doc-en-readthedocs-io-en-3.9.1.pdf`. `pdftotext -layout` makes it searchable.
+- The Fairino Python SDK is installed from `third_party/fairino_sdk/linux` (see `pyproject.toml`, `[tool.uv.sources]`). That folder is git-ignored. `codegraph.json` re-includes `linux/fairino/` and `linux/example/` in the CodeGraph index.
+- Robot: `192.168.58.2` over a USB network adapter. Simulator: `192.168.50.2` (§ Simulator vs real robot — the default target for development and tests; it does **not** store uploaded files or play `MoveTPD` trajectories).
+- Controller software v3.9.1, SDK V2.2.1.
+- Manuals: SDK manual `third_party/fairino_sdk/fairino-doc-en-readthedocs-io-en-3.9.1.pdf`; protocol manual `third_party/fairino_sdk/Collaborative Robot Controller Communication Command Protocol User Manual.pdf` (file transfer, controller error codes in Table 10-1). `pdftotext -layout` makes them searchable.
 
-Terminology: a **motion** is one named, validated trajectory, e.g. `sweep_left_fast`. Avoid the word "shot".
+Terminology: a **motion** is one named trajectory, e.g. `sweep_left_fast`. Avoid the word "shot".
 
-## Findings
-- **The SDK already gives what is needed; MoveIt2 is not used.** MoveIt2 needs ROS2 Humble on Ubuntu 22.04, which this host doesn't have, and it solves collision-free A-to-B planning, not choreographed camera paths.
-- **SDK functions used.** All are in `fairino/Robot.py`, class `RPC`:
-  - Kinematics, with no motion: `GetInverseKinRef(type, desc_pos, joint_ref)`, `GetInverseKinHasSolution`, `GetForwardKin(joints)`.
-  - Trajectory files: **upload with our own `FR5.upload_file`, never with the SDK's `TrajectoryJUpLoad` or `LuaUpload`** (they race the controller and fail with -1; see § Controller file transfer). A type-20 upload lands at `/fruser/traj/<file>`. Also `TrajectoryJDelete(file)`, `LoadTrajectoryJ(name, ovl, opt=1)`, `MoveTrajectoryJ()`, `GetTrajectoryStartPose(name)`, `GetTrajectoryPointNum()`, `ComputeFileMD5(path)`. Reference flow: `linux/example/TestUploadTrajectoryJ.py` for the call order only; its upload step uses the failing SDK call.
-  - Motion and state: `MoveJ(joint_pos, tool, user, vel=...)`, `SetSpeed(pct)`, `StopMotion()`, `PauseMotion()`, `GetActualJointPosDegree()`, `GetActualJointSpeedsDegree()`, `GetRobotMotionDone()`, and `robot_state_pkg` (`motion_done`, `main_code`, `sub_code`, `jt_cur_pos`, `tl_cur_pos`, `actual_qd`). The state getters read `robot_state_pkg`, a cache refreshed by the SDK's own state thread. They do not block on the XML-RPC socket.
-  - Setup and limits: `SetToolCoord`, `SetLoadWeight`, `SetLoadCoord`, `GetTCPOffset` (active tool), `GetJointSoftLimitDeg`, `GetRobotInstallAngle`, `ResetAllError`, `RobotEnable`, `Mode`.
-  - TPD recordings: `LoadTPD(name)`, `GetTPDStartPose(name)`, `MoveTPD(name, blend, ovl)`. A file uploaded as type 20 is named `traj/<stem>` (no extension). Pendant recordings live in `/fruser/` and are named `<stem>`.
-  - Fallback store: `LuaUpload` (do not call it directly; same race, and the controller rejects large files with "LUA FILE SIZE IS TOO LARGE!"), `ProgramLoad`, `ProgramRun`, `ProgramStop`, `GetProgramState`, `GetLuaList`, `LuaDelete`.
-- **Not in the SDK** (checked by searching `Robot.py`): there is **no getter for the global speed** (only `SetSpeed`), and there is **no file rename** call for controller files. The design below works around both (§ Speed handling, § Atomic publish).
-- **Return values.** Most SDK calls return an `int` error code (0 = OK). Getters return `(code, value)`. Motion calls first return `GetSafetyCode()` when it is non-zero. Calls made while the connection is flagged down return `-4`.
-- **Blocking behaviour.** Most SDK calls wrap the XML-RPC call in `while flag: try ... except socket.error: flag = True`, i.e. they **retry socket errors forever**. A call can therefore block indefinitely when the network drops. The connection-up flag (`RPC.is_conect`) appears to be class-level, so a second `RPC` instance in the same process may share it (checked in Q5).
-- **SDK pose** is `[x, y, z, rx, ry, rz]` in mm and degrees, for the active tool frame relative to the active user frame. The Euler convention is believed to be fixed-axis XYZ (`R = Rz·Ry·Rx`), but this is **not confirmed** (Q1).
-- **Rotation blending.** When the controller is given Cartesian points (`MoveL`, `NewSpline*`), it blends the full rotation between consecutive points, and with `blendR` or the arc-transition spline type it also blends across neighbouring points. This was observed on the real robot during spline testing. The interpolation method is undocumented. Between two level orientations that differ in both pan and tilt, a rotation blend passes through orientations with roll. Feeding the controller only the keyframes is therefore not enough to keep the camera level (§ Architecture, "Level constraint").
-- **Limits.** FR5 joint speed is about 180°/s at 100%, and TCP speed roughly 1 m/s. That is slower than a commercial glambot arm, so motions should be designed for "brisk", not "whip".
+## Simulator vs real robot
+**Default target for all development, scripts and manual test runs: the simulator, `192.168.50.2`.** Only the operator, with an explicit YES, runs anything against the real robot, `192.168.58.2`.
 
-## Open questions resolved by Phase 0 (hardware spike)
-| # | Question | Blocks |
+| Call family | On the simulator | On the real robot |
 |---|---|---|
-| Q1 | Euler convention of `rx, ry, rz`. How to read tool N's coordinates (`GetTCPOffset` reports the active tool). | `pose.py` constants (the code can be written first, with the convention as a parameter); the tool check |
-| Q2 | Trajectory file format: joints or poses, columns, header, whether it has timestamps or only a fixed period, allowed periods (TPD supports 2/4/8 ms). Does `TrajectoryJUpLoad` keep the local file's basename as the remote name? | `traj_file.py`, temp-name publishing |
-| Q3 | Does `LoadTrajectoryJ(..., opt=1)` hold, linearly interpolate, or spline between samples? Does it preserve the sample timing, or re-time with its own profile? What does `ovl` do (uniform time scaling)? How does it interact with the global `SetSpeed`? Tracking and timing error. | the validity of the timing contract (§ Backend and timing contract) |
-| Q4 | Does a `MoveJ` after `LoadTrajectoryJ` keep the loaded trajectory? Does `MoveTrajectoryJ` block? Is `motion_done` reliable at the end of a trajectory? | `MotionRunner.load/run`, completion criterion |
-| Q5 | Can a second `Robot.RPC` connection in the same process send `StopMotion()` while the first is blocked in `MoveTrajectoryJ`, without disturbing the first (shared `is_conect`)? Stop latency. | `MotionRunner.stop` |
-| Q6 | Measured roll: dense 8 ms pan+tilt trajectory vs a sparse two-keyframe version | confirms the "Level constraint" design |
-| Q7 | What does `ComputeFileMD5` return for a missing file, an unreadable path, and a good file? Does it accept `/fruser/traj/<file>`? | remote verification rules |
-| Q8 | FR5 kinematics data: soft limits (`GetJointSoftLimitDeg`), wrist/elbow/shoulder singular regions, and the configuration signature to use. | singularity and configuration checks |
+| `GetInverseKinRef`, `GetForwardKin`, `GetJointSoftLimitDeg`, `GetRobotInstallAngle`, `GetActualTCPNum` | Works; use for `pose`, `plan`, `validate` | Works |
+| `MoveJ` and other motion commands | Accepted, but a second connection's `StopMotion` did not reliably interrupt a running `MoveJ` (§ History) — treat stop as unverified on the sim | Works; needs operator YES |
+| `FR5.upload_file` (`FileUpload` + port 20010) | **Fails.** The sim does not open the data port the same way; every attempt returned -1 even with the retrying protocol (§ History) | Works (verified end to end) |
+| `LoadTPD`, `GetTPDStartPose`, `MoveTPD` | **Does not play trajectories.** `LoadTPD` may return 0 but the controller does not store or run files the same way | Works (verified end to end) |
 
-## Backend and timing contract
-The design depends on the controller replaying our samples with our timing. That is not known until Q2/Q3 are answered, so it is stated here as a contract plus a decision procedure instead of an assumption.
+Consequences for implementation and testing:
+- Every `motionctl` command defaults to `--ip 192.168.50.2`. Only `upload`, `play` and `publish` (and the Phase 4/5 robot acceptance steps) require `--ip 192.168.58.2`, and those three commands are run **only by the operator**, never unattended.
+- When `upload` fails against the real robot (any `FileTransferError`), **do not retry automatically and do not debug the controller.** Print the local build file's path (`sw/robot/build/motion_<name>.txt`) and ask the operator to upload it manually (teach pendant or web UI trajectory import, which is known to work — § History), then continue once they confirm it's on the controller.
+- Unit tests never touch either IP; they use `FakeRobotClient` (§ Phase 2). "Manual test on the sim" means a human or the implementer running a `motionctl` command by hand against `192.168.50.2`, not an automated test.
 
-**Contract (target behaviour, tested in Phase 0).** The backend replays the stored samples in order, one per `sample_period_ms`, and the tool follows the planned path:
+## Decisions (binding)
+| # | Decision | Why |
+|---|---|---|
+| D1 | Backend = **TPD**: `LoadTPD` → `GetTPDStartPose` → move to start → `MoveTPD`. Config value `backend: "tpd"`. | Verified on the real robot. TrajectoryJ rejected every file and has undocumented format questions. |
+| D2 | Upload with `FR5.upload_file(local, file_type=20)`. The file lands at `/fruser/traj/<basename>`. Verify with `ComputeFileMD5`. | The SDK upload calls race the controller. Type 20 accepts large files; type 0 (Lua) rejects files of ~1 MB. |
+| D3 | Controller file `/fruser/traj/motion_<name>.txt`; TPD name **`traj/motion_<name>`** (no extension, no leading slash) for `LoadTPD`, `GetTPDStartPose`, `MoveTPD`. | `LoadTPD` looks in `/fruser/`; `traj/<stem>` is verified. An absolute path returns 8. |
+| D4 | `sample_period_ms` = **8** for every motion (the default). | High accuracy is not needed, and 8 ms files are 4× smaller and need 4× fewer IK calls. The pendant's recording was 2 ms; 8 ms is confirmed by the Phase 4 robot test, with a fallback procedure in § TPD file format. |
+| D5 | `tool_id` = **0** (flange) for every motion until a camera tool is configured. The camera frame is treated as the flange frame. | Camera calibration is deferred. Tool 0 needs no setup. |
+| D6 | Joint values in the file come from the controller's IK (`GetInverseKinRef`, seeded with the previous sample). The pose columns are the planned pose. | File joints and poses must agree. We don't know which of the two `MoveTPD` uses, so both must be right. |
+| D7 | Keep motions **≤ 20 s** for now. | The verified recording is 23 s (11520 points at 2 ms, 1.3 MB). |
+| D8 | Safety minimum: operator YES prompt before any motion; move to start at 10% speed; `StopMotion` on Ctrl-C, Stop, close or error; controller collision detection stays on. **The physical e-stop is the primary safety device.** | — |
 
-| Quantity | Initial acceptance (confirmed or tightened in Phase 0) |
-|---|---|
-| Tracking: planned vs logged pose, resampled at the planned sample times | position ≤ 3 mm; orientation ≤ 0.3° |
-| Roll of the logged tool pose | ≤ 0.2° (§ Level constraint) |
-| Timing: motion start (first joint moves > 0.05°) to settled, vs `duration_s / (ovl/100)` | within max(2%, 40 ms) |
-| Stop: `stop()` call to all joint speeds < 0.5°/s | ≤ 150 ms |
-| Repeatability: 5 runs, end-pose spread | ≤ 1 mm |
+## TPD file format (binding)
+Verified by playing `sw/tracktestpc.txt` (a copy of a pendant recording) from Python. Generated files must match it exactly, field for field.
 
-**How timing is represented.** The `TrajectoryBackend` writer takes `period_ms` and emits whatever Q2 shows the controller needs: a per-row time column if it has one, otherwise a fixed-period file whose period is a header value or implicit. `sample_period_ms` in `design.yaml` must be one of the periods the controller supports (default 8; allowed set confirmed by Q2, `{2, 4, 8}` expected).
+```
+<N>,1,<period_ms>,<tool_id>,0,0
+<j1>,<j2>,<j3>,<j4>,<j5>,<j6>,<x>,<y>,<z>,<rx>,<ry>,<rz>,<period_ms>,0,17
+... N data rows in total ...
+```
+- Line 1 (header): `N` = number of data rows (must equal the row count); then `1`; then the sample period in ms; then the tool number; then `0,0`. With D4 and D5 this is **`N,1,8,0,0,0`**. (The pendant's 2 ms recording has `N,1,2,0,0,0`.)
+- Each data row has 15 comma-separated values: 6 joint angles (deg), the TCP pose `x, y, z` (mm) and `rx, ry, rz` (deg, the SDK's Euler convention), then three values. Write **`<period_ms>,0,17`**, i.e. `8,0,17` at 8 ms. The 2 ms recording has `2,0,17` on every row, and a third-party generator wrote `5,0,17` together with a 5 ms period in its header, so the 13th value is taken to be the period.
+- Numbers: fixed point with 4 decimals (`f"{v:.4f}"`), as in the recording. No spaces. Lines end with `\n`. No trailing blank line is required.
+- Rows are uniformly spaced in time, one per `period_ms`. The first row is the start pose, the last row is the end pose (at rest).
+- **8 ms is not yet verified on the robot.** The Phase 4 test measures the playback time. If an 8 ms file is rejected by `LoadTPD`, or plays at the wrong speed (for example 4× too fast, which would mean the controller assumes 2 ms per row), try in this order and record the result in § History: (a) keep the 8 ms header but write `2,0,17` in every row; (b) generate at 2 ms (`sample_period_ms: 2`), which is the verified format. Do not investigate further than that; tell the operator.
+- Example, first two lines of the verified (2 ms) recording:
+  ```
+  11520,1,2,0,0,0
+  91.2883,-121.5264,129.4355,-98.2465,-89.9802,0.0237,135.9624,-268.4651,361.4536,-179.6626,0.0199,-178.7353,2,0,17
+  ```
 
-**Decision after Phase 0** (the outcome is recorded in "Phase 0 results" and in the `robot.backend` config key):
-- **A. `trajectory_file` backend meets the contract.** Use it. This is the expected case.
-- **B. Path preserved, timing re-planned by the controller** (it follows the points but applies its own speed profile). Use the file backend in `timing_mode: controller`. Offline speed and acceleration checks become estimates, the rehearsal measures the real peaks, and `approved_ovl` is chosen so the *measured* peaks stay under the limits. Design durations become advisory. This is accepted only if the contract's tracking and roll rows still pass.
-- **C. Neither meets the contract.** Use the `lua` backend, which must pass the same table. Streaming joint targets from Python (`ServoJ` at 8 ms) is **not** an acceptable fallback, because host-side timing breaks the requirement that the controller replays a stored, validated file.
+## Robot call reference
+All are methods of `fairino.Robot.RPC`. Only `sw/robot/fr5.py` may call them (§ Package map).
 
-**The Lua backend is a different backend, not a drop-in replacement.** It differs in timing and interpolation (the controller owns both between points), in stop semantics (`ProgramStop` + `StopMotion`), and in completion detection (`GetProgramState`). Its samples can't be 8 ms apart, because Lua program size and spline blending limit point density. The spacing is decided in Phase 0 (for example every 20–40 ms). With it, the validator's midpoint roll checks matter more, and the rehearsal limits stay the authority. Only the selected backend is implemented; the other is not built unless chosen. Both implement the `TrajectoryBackend` Protocol (§ Module interfaces).
+| Job | Call | Notes |
+|---|---|---|
+| Connect / disconnect | `Robot.RPC(ip)`, `CloseRPC()` | `RPC()` prints the proxy; harmless. |
+| IK (no motion) | `GetInverseKinRef(0, pose6, ref_joints6)` → `(err, joints6)` | Type 0 = absolute pose in the base frame. Uses the **active tool**. |
+| FK (no motion) | `GetForwardKin(joints6)` → `(err, pose6)` | Uses the active tool. |
+| Active tool | `GetActualTCPNum()` → `(err, tool_id)` or `robot_state_pkg.tool` | Must equal the design's `tool_id` during validate. |
+| Soft limits | `GetJointSoftLimitDeg()` → `(err, [j1min, j1max, …, j6min, j6max])` | Real robot: J1 ±175, J2 −265…85, J3 ±160, J4 −265…85, J5 ±175, J6 ±175. |
+| Install angle | `GetRobotInstallAngle()` → `(err, [yangle, zangle])` | Must be (0, 0). |
+| Upload | `FR5.upload_file` (our protocol, § Controller file transfer) | Never the SDK upload calls. |
+| Remote MD5 | `ComputeFileMD5("/fruser/traj/<file>")` → `(0, md5)`; `(4, None)` = not found | |
+| Delete | `TrajectoryJDelete("<file>")` | A plain RPC; safe. |
+| Load TPD | `LoadTPD("traj/motion_<name>")` → 0 | 8 = "tpd file does not exist". |
+| Start pose | `GetTPDStartPose("traj/motion_<name>")` → `(0, pose6)` | Float32 precision: compare with tolerance 0.01. |
+| Auto mode | `Mode(0)`, then **sleep 1 s**, then check `robot_state_pkg.robot_mode == 0` | `MoveTPD` does nothing in manual mode. The state cache is stale right after `Mode`. |
+| Speed | `SetSpeed(pct)` | Global and persistent; there is no getter. |
+| Move to start | `MoveJ(start_joints, tool_id, 0, vel=pct)` | Blocking by default (`blendT=-1`). |
+| Play | `MoveTPD("traj/motion_<name>", 0, ovl)` | blend 0 = no smoothing; `ovl` = speed scale 0–100. |
+| Stop | `StopMotion()` | |
+| State (cache, never blocks) | `robot_state_pkg`: `jt_cur_pos`, `tl_cur_pos`, `motion_done`, `mc_queue_len`, `robot_mode`, `main_code`, `sub_code`, `tool` | Refreshed by the SDK's state thread (port 20004). |
 
-## Caveats and risks
-- **Thread safety of the SDK.** The SDK's XML-RPC proxy is not assumed to be thread-safe. All commands go through one worker thread, and `stop()` uses a dedicated second connection (§ Stop and shutdown behaviour).
-- **Controller filename length.** The C API uses `char name[30]`. Names used: `motion_<name>.txt` and `tmp_<name>.txt`, so motion names are `^[a-z0-9_]{1,19}$` (the longest, `motion_<19>.txt`, is 30 characters).
-- **Safety** is enforced in layers: controller collision detection with the correct payload; soft joint limits; offline validation; rehearsal ramp (10 → 100%); Move to Start at 10% global speed; the start-pose check before Record; independent stop channel; `StopMotion` on Stop, close, or any error. The physical e-stop remains the primary safety device. Operating rules (nobody in the cell during rehearsal; the app must not be running while publishing) belong in the README section added in Phase 6.
-- **Calibration risk.** A mathematically level path can still give a tilted horizon if the camera tool frame is wrong. § Camera tool calibration makes calibration a gated, recorded step.
+SDK behaviour to remember:
+- Most calls return an `int` (0 = OK); getters return `(code, value)`. Calls made while the connection is down return -4.
+- Most calls **retry socket errors forever** (`while flag: try … except socket.error`), so a call can block indefinitely if the network drops.
+- Positive codes come from the controller (protocol manual Table 10-1: 3 = wrong parameter count, 4 = parameter value abnormal, 8 = tpd file does not exist, 14 = instruction failed). Negative codes come from the SDK (`RobotError`: -1 other, -4 RPC down, -7 local upload file not found).
+
+## Controller file transfer (binding)
+**Never call** `TrajectoryJUpLoad`, `LuaUpload`, `PointTableUpLoad` or any SDK method built on `__FileUpLoad`. They send the `FileUpload` request and then make **one** immediate connect to port 20010. The controller opens 20010 about 50 ms after the request, so that connect is refused and the call returns -1. Retrying the SDK call does not help.
+
+**`FR5.upload_file(local_path, file_type=20) -> str`** does the protocol itself (protocol manual §5.1.50; reference: `upload_file` in `sw/robot/spike/file_port_probe.py`):
+1. `file_type` must be **20** (stored at `/fruser/traj/<basename>`) or 0. Anything else raises `ValueError` before any call: the other types are firmware and upgrade packages.
+2. XML-RPC `FileUpload(file_type, basename)` on the SDK's proxy (`rpc.robot.FileUpload`). Non-zero → `FileTransferError(stage="request", code=rtn)`.
+3. Connect to `<ip>:20010`, retrying every 50 ms for up to 5 s. No connection → `FileTransferError(stage="connect")`.
+4. Once connected, **always send the whole file.** Connecting and closing without sending leaves an **empty file** on the controller. Framing: `"/f/b" + f"{len(data) + 50:10d}" + md5_hex`, then the bytes, then `"/b/f"`.
+5. Sleep 0.5 s, read the reply. It must start with `b"SUCCESS"`; otherwise `FileTransferError(stage="transfer")`.
+6. `ComputeFileMD5("/fruser/traj/<basename>")` must return code 0 and the local MD5 (case-insensitive); otherwise `FileTransferError(stage="verify")`. Return the remote path.
+
+Ports 20010/20011 are **closed while idle by design**. Never probe them as a health check.
 
 ## Architecture
 
 ### Package map and dependency rules
-New package `sw/robot/`. Arrows mean "may import".
-
+Package `sw/robot/`. Arrows mean "may import".
 ```
-            pure (no SDK, no Tk, no I/O beyond files)          hardware boundary
- ┌────────────────────────────────────────────────────┐   ┌──────────────────────┐
- │ pose.py  ← path.py ← validate.py                   │   │ fr5.py               │
- │    ↑                     ↑                         │   │  RobotClient Protocol│
- │ schema.py (design / validated / motion / camera)   │   │  FR5 (wraps RPC)     │
- │    ↑                                               │   │  FairinoError        │
- │ traj_file.py (writer/reader for the file backend)  │   └──────────▲───────────┘
- │ ui_state.py (pure UI state machine)                │              │
- └───────────────▲────────────────────────────────────┘              │
-                 │                                                   │
-      backend.py (TrajectoryBackend Protocol + file backend) ────────┤
-      motionctl.py (CLI: plan/validate/compile/rehearse/publish) ────┤
-      motion_runner.py (MotionRunner, used by livestream) ───────────┘
+            pure (no SDK, no Tk; file I/O only)                hardware boundary
+ ┌──────────────────────────────────────────────────┐   ┌──────────────────────┐
+ │ pose.py ← path.py ← validate.py                  │   │ fr5.py               │
+ │   ↑                    ↑                         │   │  RobotClient Protocol│
+ │ schema.py   frames.py  tpd_file.py               │   │  FR5, FairinoError,  │
+ │ ui_state.py                                      │   │  FileTransferError   │
+ └───────────────▲──────────────────────────────────┘   └──────────▲───────────┘
+                 │                                                 │
+      motionctl.py (CLI: new/pose/plan/validate/compile/upload/play/publish/list)
+      motion_runner.py (MotionRunner, used by livestream)
       sw/livestream.py → motion_runner.py, ui_state.py, schema.py (never fr5 directly)
 ```
-
 Rules:
-- Only `fr5.py` imports `fairino`.
-- `pose`, `path`, `validate`, `schema`, `traj_file` and `ui_state` never import `fr5` or `fairino`. They are unit-testable without hardware.
-- `validate.py` gets an IK/FK provider through a small Protocol (`Kinematics`). The real one is backed by `FR5`, and tests use a fake.
-- `livestream.py` talks only to `MotionRunner`, `ui_state` and the configuration dataclasses.
+- Only `fr5.py` imports `fairino`, and it imports it lazily inside `FR5.connect`, so tests never need the SDK.
+- `pose`, `path`, `frames`, `schema`, `validate`, `tpd_file`, `ui_state` never import `fr5` or `fairino`.
+- `validate.py` gets IK/FK through the `Kinematics` Protocol. `FR5` satisfies it; tests use a fake.
+- There is no backend abstraction. TPD is the only backend.
 
-### Data flow (offline → controller → app)
+### Data flow
 ```
-design.yaml ──plan──▶ samples (t, base-frame pose, pan, tilt)       [frames, pose, path]
-            ──validate──▶ validated.json (joints via controller IK, checks)  [validate, fr5 IK/FK]
-            ──compile──▶ build/motion_<name>.txt                    [backend / traj_file]
-            ──rehearse──▶ temp upload run at increasing ovl, evidence summary
-            ──publish──▶ controller file + motion.json (md5, start_joints, rehearsal summary, …)
-livestream.py start ─▶ MotionRunner.connect_and_check(all motion.json)  (once)
+design.yaml ──plan──▶ samples (t, pose in base frame, pan, tilt)        [frames, path, pose]
+            ──validate──▶ validated.json (joints from controller IK, checks) [validate + FR5 IK]
+            ──compile──▶ sw/robot/build/motion_<name>.txt (TPD file)       [tpd_file]
+            ──upload──▶ /fruser/traj/motion_<name>.txt, MD5 ok, LoadTPD ok   [FR5]
+            ──play──▶ operator test on the robot (YES prompt)              [FR5]
+            ──publish──▶ motion.json (md5, start joints, approved ovl)     [schema]
+livestream start ─▶ MotionRunner.connect_and_check(all motion.json)  (MD5 of each file)
 button+confirm ─▶ load(name) │ Move to Start ─▶ move_to_start(name) @10%
 Record ─▶ at_start(name)? ─▶ GoPro start ─▶ pre_roll ─▶ run(name) ─▶ done ─▶ post_roll ─▶ GoPro stop
 ```
 
-### Frames and transforms
-- **B, robot base frame.** Its z axis is assumed vertical (up). `validate` reads `GetRobotInstallAngle` and fails unless it is (0, 0) within 0.1°, and records the value. All planning, validation and the trajectory file work in B.
-- **T, camera tool frame** (`tool_id`). Origin at the optical centre; **z = optical axis (forward), x = image right, y = image down.** A pose `[x, y, z, rx, ry, rz]` sent to the controller is the pose of T in B (work-object frame 0). The controller's work-object (user) frames are **not used**.
-- **A, authoring frame.** Keyframe positions, `look_at`/`target` points and the workspace box are written in A, defined by the optional `anchor: {pos: [x, y, z], yaw_deg}`: A has its z axis parallel to B's z, translated by `pos` and rotated by `yaw_deg` about z. The default is identity (A = B). This lets a motion be authored relative to the subject's mark.
-- **One conversion, then everything in B.** `design_to_base` converts once: `p_B = Rz(yaw)·p_A + pos` for every keyframe position and every target; `pan_B = pan_A + yaw` in angles mode. All later maths (sampling, `look_at` directions, IK, validation) runs in B, so the camera position and the target are always in the same frame before any direction is computed. The workspace box stays axis-aligned in A: the check transforms each sample position B→A and compares it with the box.
-- The level constraint is invariant under this transform (a translation plus a rotation about the vertical), so authoring in A cannot break it.
+### Frames and transforms (implemented in Phase 1)
+- **B, robot base frame.** z up. All planning, validation and the TPD file work in B. `validate` checks that the install angle is (0, 0).
+- **T, camera tool frame** = the controller tool `tool_id` (D5: tool 0, the flange). **z = optical axis (forward), x = image right, y = image down.** A pose `[x, y, z, rx, ry, rz]` is the pose of T in B. Work-object (user) frames are not used (user 0).
+- **A, authoring frame**, defined by the optional `anchor: {pos: [x, y, z], yaw_deg}`: z parallel to B's z, translated by `pos` and rotated by `yaw_deg`. Default identity. Lets a motion be authored relative to the subject's mark.
+- `design_to_base` converts once: `p_B = Rz(yaw)·p_A + pos` for positions and targets; `pan_B = pan_A + yaw`. Everything after runs in B. The workspace box stays axis-aligned in A.
 
-### Orientation model
-Orientation is **never stored or interpolated as a rotation.** It is built from two angles per sample, `(pan, tilt)`:
-- **pan** (deg): heading of the optical axis about +Z, 0 = looking along +X, positive counter-clockwise seen from above.
-- **tilt** (deg): elevation of the optical axis, positive = looking up.
-- `R(pan, tilt) = Rz(pan) · R_level0 · Rx(tilt)`, with `R_level0` columns `x_cam = (0,−1,0)`, `y_cam = (0,0,−1)`, `z_cam = (1,0,0)`, and `Rx(tilt)` a rotation about the camera's own x axis. Because it rotates about x_cam, the image-right axis stays `Rz(pan)·(0,−1,0)`, which is horizontal, so the constraint `x_cam · ẑ_B = 0` (a zero **dot** product; a zero cross product would mean parallel axes) holds **exactly** for every (pan, tilt).
+### Orientation model (implemented in Phase 1)
+Orientation is **never stored or interpolated as a rotation.** It is built from two angles per sample:
+- **pan** (deg): heading of the optical axis about +Z, 0 = looking along +X, positive counter-clockwise from above.
+- **tilt** (deg): elevation of the optical axis, positive = up.
+- `R(pan, tilt) = Rz(pan) · R_level0 · Rx(tilt)`, with `R_level0` columns `x_cam = (0,−1,0)`, `y_cam = (0,0,−1)`, `z_cam = (1,0,0)`. The image-right axis stays horizontal for every (pan, tilt), so roll is exactly zero by construction.
 
-The design chooses one `orientation.mode`:
-1. **`angles`:** every keyframe gives `pan` and `tilt`, and both are interpolated over time like any other channel (§ Path and timing). Explicit `pan` values are taken **literally**: 170 → −170 is a −340° turn, and a designer wanting a 20° turn writes 170 → 190. `check_pan_turn` rejects a step above 180° between adjacent keyframes unless `allow_long_pan: true`, and limits the cumulative pan to `max_cumulative_pan_deg` (default 360).
-2. **`target`:** orientation is **derived at every sample** from the target and the sampled camera position, both in B: `d = target_B − p_cam_B`, `pan = atan2(d_y, d_x)`, `tilt = atan2(d_z, hypot(d_x, d_y))`, so the optical axis points at the target. Pan is unwrapped continuously along the samples (the first sample is wrapped to (−180°, 180°]), so a path that circles the target gives a smooth, multi-turn pan. The target comes from exactly one of:
-   - **fixed target:** a design-level `orientation.target`, one point for the whole motion;
-   - **target trajectory:** a `target` on **every** keyframe, interpolated over time with the same scheme as the position (§ Path and timing), so a target can move (e.g. follow a subject walking along a line).
+`orientation.mode`:
+1. **`angles`:** every keyframe has `pan` and `tilt`, interpolated like any channel. Pan values are literal: 170 → −170 is a −340° turn.
+2. **`target`:** orientation derived at every sample: `d = target − p_cam`, `pan = atan2(d_y, d_x)`, `tilt = atan2(d_z, hypot(d_x, d_y))`, pan unwrapped continuously. The target is either a design-level fixed `orientation.target`, or a `target` on every keyframe (a moving target, interpolated like the position).
 
-   `pan`/`tilt` are not keyframed in target mode, and mixing modes within a design is rejected in v1.
+Target-mode geometry limits (checked at every sample): `|d| ≥ min_target_distance_mm` (100), `hypot(d_x, d_y) ≥ min_horizontal_mm` (50), `|tilt| ≤ max_tilt_deg` (80, hard max 85), pan rate ≤ `max_pan_rate_deg_s` (120).
 
-**Degenerate and singular `look_at` cases** (target mode; `check_target_geometry` runs at every sample and every midpoint, and a failure names the sample index and time):
-- `|d| ≥ min_target_distance_mm` (default 100). A zero-length or tiny vector is rejected.
-- `hypot(d_x, d_y) ≥ min_horizontal_mm` (default 50). Near-vertical targets, where pan is undefined or unstable, are rejected.
-- `|tilt| ≤ max_tilt_deg` (default 80, hard maximum 85). The same limit applies in angles mode.
-- `|Δpan|` between adjacent samples ≤ `max_pan_rate_deg_s · period` (default 120°/s, 0.96° per 8 ms sample). This catches pan discontinuities (consecutive targets or a path passing close to the vertical through the target) as well as fast pans.
+### Path and timing (implemented in Phase 1)
+- Each channel (`x, y, z` plus `pan, tilt`, or plus the target's `x, y, z`) is a **piecewise quintic Hermite** in time, one polynomial per keyframe segment. Acceleration is 0 at every keyframe. First and last keyframes are at rest. Interior velocities are PCHIP-style; a keyframe may override them with `vel: {x: …, pan: …}` or set `stop: true`. Two or more keyframes. Segments ≥ `min_segment_s` (0.05 s).
+- **Sampling rule:** `p = sample_period_ms`, `T` = last keyframe time, `N = ceil(round(T·1000/p, 6))`. Samples at `t_i = i·p/1000` for `i = 0..N` (**N + 1 samples**). A sample past `T` is clamped to the final keyframe. `duration_s = N·p/1000`. Example at 8 ms: T = 4.0 s → 501 samples.
+- `to_sdk_pose(sample)` gives `[x, y, z, rx, ry, rz]` for the TPD file and for IK.
 
-### Path and timing
-Each channel is a **piecewise quintic Hermite** function of time, one polynomial per keyframe segment. The channels are `x, y, z` plus `pan, tilt` in angles mode, or `x, y, z` plus the target's `x, y, z` in target mode.
-- At each keyframe a channel has a value, a velocity and an acceleration. **Acceleration is 0 at every keyframe**, so acceleration is continuous (jerk is not).
-- **Velocity.** The first and last keyframes are at rest (velocity 0). Interior keyframes get a PCHIP-style velocity from the neighbouring segment slopes (zero if the slopes change sign, otherwise a weighted harmonic mean), computed with `scipy.interpolate.PchipInterpolator`'s derivative at the knots. A keyframe can override it with `vel: {x: .., pan: ..}` (mm/s or deg/s, any subset of channels), or set `stop: true` to bring all channels to rest there.
-- **Why local, not a global spline.** A global interpolating spline rings and overshoots between keyframes, and editing one keyframe changes the whole path. The piecewise form is local (a keyframe only affects its two adjacent segments), has continuous velocity and acceleration, and works with **two or more keyframes** (two keyframes give a single minimum-jerk quintic). There is no six-point minimum.
-- Segments must be at least `min_segment_s` long (default 0.05 s).
+### Level constraint: what is checked now
+The plan is level by construction, and the Phase 1 tests prove it (roll < 1e-9° at every sample). On the robot, the operator checks the horizon visually during the Phase 4 test. Measuring roll on the robot and calibrating the camera frame are deferred.
 
-**Sampling rule** (exact). `p = sample_period_ms`, `T` = last keyframe time. Let `N = ceil(round(T·1000/p, 6))`, so an exact multiple of the period (including floating-point noise such as 1.2/0.008 = 150.00000000000003) does not gain an extra sample. Sample times are `t_i = i·p/1000` for `i = 0..N`: **`N + 1` samples, uniformly spaced.** For `t_i > T` (only the last sample, and only when T is not a multiple of p) the path is **clamped to the final keyframe**; because the last keyframe is at rest, holding it is exact, and the file keeps its uniform period. The last sample always equals the final keyframe pose. `duration_s = N·p/1000` (executed, ≥ T); `design_duration_s = T` is kept too. Example: T = 2.0, p = 8 → 251 samples; T = 2.003 → N = 251, 252 samples, the last at 2.008 s held.
+### Motion runner (Phase 5)
+- **Worker.** `MotionRunner` owns one daemon `threading.Thread` that runs jobs from a `queue.Queue`; each public method (except `stop`, `at_start`, `close`) enqueues a job and returns a `concurrent.futures.Future`. Daemon on purpose: SDK calls can block forever and must not keep the app alive.
+- **One connection, one lock.** All RPC calls go through one `FR5` and a `threading.Lock` held only for the duration of each RPC call. Polling reads `robot_state_pkg` (the cache) without the lock. `stop()` takes the lock briefly and calls `StopMotion()`. (If the Phase 4 test shows that `MoveTPD` blocks until the motion ends, `stop()` uses a second `FR5` connection instead. Record which one in § History.)
+- **State:** `IDLE`, `BUSY`, `FAULT(reason)`, `CLOSED`.
+- **Completion of `run`:** after `MoveTPD` returns 0, wait up to 2 s for `motion_done == 0` (the motion started; the cache is stale at first), then wait for `motion_done == 1`. Never started → `MotionError("motion did not start")`. A non-zero `main_code` while waiting → `FairinoError`.
+- **Watchdog:** a `threading.Timer` with `deadline = 1.5 · duration_s · 100 / ovl + 3 s`. On expiry: `stop()` and fail the future with `MotionTimeout`.
+- **Speed:** set before every motion (`move_to_start`: `move_to_start_speed_pct`, default 10) and reset to `safe_default_speed_pct` (default 10) in a `finally`. `MoveTPD`'s own `ovl` sets the playback speed.
+- **Auto mode:** before any motion, `FR5.ensure_auto()` (`Mode(0)`, sleep 1 s, check `robot_mode == 0`, else `FairinoError`).
+- **UI hand-off:** `LivestreamApp._run_robot(future, status, on_done, on_error)` mirrors the existing `_run`: the done-callback posts onto `self._events`, which `_poll` drains on the Tk thread. Tk widgets are never touched from the worker. Each robot operation carries an increasing `op_id`; stale callbacks are ignored.
 
-**Spline behaviour checks** (in addition to the speed and acceleration limits applied to finite differences of every sample):
-- `check_path_overshoot`: in every segment, each channel's sampled range must stay within the segment's endpoint values extended by `max(0.5 mm or 0.1°, overshoot_pct% of the segment span)` (default 2%). This catches overshoot that is still inside the workspace box.
-- Velocity and acceleration peaks come from the finite differences of the 8 ms samples (dense enough that they bound the real peaks), and are reported per channel.
-- Keyframe `vel` overrides are the designer's tool for fixing overshoot or shaping speed.
+### Stop and shutdown (Phase 5)
+- `stop()` never raises and is idempotent: `StopMotion()` up to 3 attempts 100 ms apart; returns `True` if one returned 0. State → `IDLE`, or `FAULT` if the stop followed an error. No confirmation polling (deferred).
+- `close()` is idempotent: `stop()`, state `CLOSED`, reject new jobs with `RunnerClosed`, join the worker for at most 2 s, `CloseRPC()` (best effort), reset speed (best effort).
 
-### Level constraint and what is verified
-By construction every planned orientation has zero roll. Verification has three tiers that do different jobs:
-1. **Offline validator (heuristic for the controller).** `check_roll` verifies `x_cam · ẑ_B` at every sample (from FK of the solved joints) and at every interval midpoint, under both SLERP and linear-Euler interpolation of the orientation (and linear interpolation of the position, which `check_pointing` also uses). **These midpoint checks are heuristics.** The controller's interpolation is undocumented, so two assumed methods can't bound its real behaviour. Limit: 0.05°.
-2. **Rehearsal (authoritative for the robot).** `rehearse` logs the controller-reported tool pose (`tl_cur_pos`) at each state update and measures the roll of the real motion. Limit: ±0.2°. This is the acceptance criterion; the offline check can't replace it.
-3. **Calibration (authoritative for the camera).** `tl_cur_pos` comes from the controller's own kinematics, so it cannot see a wrongly measured camera tool frame or mount. § Camera tool calibration covers that with a physical horizon test.
+### UI state machine (Phase 6)
+`sw/robot/ui_state.py` holds a pure `UiState` enum and `transition(state, event, context) -> (new_state, actions)`. The Tk app feeds events in and executes the returned actions.
 
-**Why 0.05° offline and ±0.2° at rehearsal.** The plan is exact, so the offline number only has to absorb numerical error (IK/FK round trip, Euler conversion, rounding). Anything above 0.05° means a bug or sampling that is too coarse, so the limit is tight. The rehearsal limit has to absorb real hardware effects: controller blending, servo lag, joint encoder quantization and kinematic calibration error. The two limits answer different questions on purpose.
-
-### Camera tool calibration
-The level constraint holds in the camera tool frame T. If T is wrong, a mathematically level motion can still give a tilted horizon or a camera that points off-target. The calibration lives in `sw/robot/camera_tool.yaml` (committed, edited by hand after calibrating):
-```yaml
-tool_id: 1
-t_coord: [x, y, z, rx, ry, rz]    # flange → optical centre (mm, deg); z fwd, x image right, y image down
-payload: {mass_kg: 0.25, cog_mm: [x, y, z]}   # SetLoadWeight / SetLoadCoord
-calibration:
-  approved: false                 # set true only after the procedure below passes
-  date: null
-  horizon_residual_deg: null      # ≤ 0.2 required
-  pointing_residual_deg: null     # ≤ 0.5 required
-  optical_centre_error_mm: null   # ≤ 3 required
-  notes: ""
-```
-Procedure (`sw/robot/spike/calibrate_camera.py` guides the operator; thresholds are initial values, confirmed in Phase 0):
-1. **Initial values.** `t_coord` from CAD or caliper measurements (lens centre relative to the flange centre, mounting rotation); payload from a scale and a centre-of-gravity estimate. Apply with `SetToolCoord`, `SetLoadWeight`, `SetLoadCoord`.
-2. **Axis check.** Jog in the tool frame: +z must move the camera along its viewing direction (the image zooms into a target), +x must move the image content left (the camera moves right), and +y must move it up (the camera moves down).
-3. **Optical axis and optical centre.** Put a crosshair marker at a known point in B. From at least three camera positions (≥ 0.5 m away, different pan/tilt), command `look_at` the marker, record a frame, and measure the marker's offset from the image centre (pixels × field of view per pixel). Pointing error ≤ 0.5°. A consistent offset that varies with distance indicates an optical-centre offset error, to be corrected in `t_coord` (≤ 3 mm).
-4. **Image axes and horizon.** Film a physical horizontal reference (a laser line level or a levelled string) with the commanded orientation level at pans {−45°, 0°, 45°} and tilts {−20°, 0°, 20°}. Fit the line in each frame: its slope is the roll residual, ≤ 0.2°. Correct the roll component (`rx` of `t_coord`, about the optical axis) and repeat.
-5. **Approval.** Record the residuals and date, and set `approved: true`.
-
-Enforcement: `validate` refuses unless `approved` is true, compares the controller's tool coordinate with `camera_tool.yaml` (within 0.1 mm / 0.05°), and records `camera_tool_sha256` in `validated.json`. `publish` refuses an unapproved file. The startup check compares the controller's tool with `camera_tool.yaml` again. Recalibrating changes the hash, so every validation and publication made with the old calibration becomes stale and is flagged until it is re-validated and re-rehearsed.
-
-### Threading and the motion runner
-- **Worker.** `MotionRunner` owns **one daemon `threading.Thread`** that consumes a `queue.Queue` of jobs; each public method (except `stop()`/`close()`) enqueues a job and returns a `concurrent.futures.Future`. A daemon thread is used on purpose, not a `ThreadPoolExecutor`: SDK calls retry socket errors forever (§ Findings), so a call can block indefinitely, and such a thread must not keep the application from exiting.
-- **State.** `RunnerState` is one of `IDLE`, `BUSY`, `STOPPING`, `FAULT(reason)` (the robot reported an error or a timeout and was confirmed stationary), `UNKNOWN(reason)` (a stop could not be confirmed, or the worker is unresponsive), `CLOSED`.
-- **Polling uses cached state.** Completion and position polling read `robot_state_pkg` (non-blocking cache), never an RPC call, so the polling loop can't block on the socket.
-- **Completion criterion** (decided by Q4): `motion_done` when it proves reliable; otherwise, the joints within 0.5° of the final sample's joints and `actual_qd` below 0.5°/s for 100 ms.
-- **Watchdog.** `run()` starts a `threading.Timer` (separate from the worker, which may be blocked) with `deadline = duration_s / (ovl/100) + max(2 s, 25% of that)`. On expiry it calls `stop()` and fails the run's future with `MotionTimeout`.
-- **Speed handling.** `SetSpeed` is global and persistent, and the SDK has **no getter**, so the previous value can't be saved and restored. Instead: the runner sets the speed explicitly before every motion command (`move_to_start`: `move_to_start_speed_pct`, 10; `run`: the motion's `approved_ovl`; `rehearse`: the rehearsal step) and restores **`safe_default_speed_pct`** (config, default 10) in a `finally` after completion, error, stop, timeout and at `close()`. It also sets it in `prepare()` at startup, which covers a previous process that was killed. This is implemented as `FR5.speed(pct)`, a context manager. Restoring is best-effort and logged. How `ovl` in `LoadTrajectoryJ` interacts with the global speed is measured in Q3.
-- **UI hand-off.** `LivestreamApp` gets `_run_robot(future, status, on_done, on_error)` that mirrors the existing `_run`: its done-callback posts the finish closure onto the existing `self._events` queue, which `_poll` drains on the Tk thread. **Tk widgets are never touched from the robot worker.** Each robot operation carries an increasing `op_id`; a callback whose `op_id` is stale is ignored.
-
-### Stop and shutdown behaviour
-- **Independent stop channel.** `connect_and_check` opens a second `FR5` connection used only for `stop()`. **If it can't be opened, every motion is disabled** with the reason "no independent stop channel" (fail closed; plain recording still works). Q5 verifies that a second connection works in the same process and does not disturb the first.
-- **`stop()` never raises, is idempotent, and returns a `StopResult(confirmed, detail)`.** Sequence:
-  1. `StopMotion()` on the stop channel, up to 3 attempts 100 ms apart.
-  2. If all attempts return errors, one `PauseMotion()`.
-  3. Confirm: poll `actual_qd` until every joint is below 0.5°/s for 200 ms, within `stop_confirm_timeout_s` (default 2.0).
-  4. Confirmed → the runner enters `FAULT(reason)` if the stop followed an error, or `IDLE` otherwise. **Not confirmed** (all calls failed, or the timeout expired) → `UNKNOWN(reason)`, logged.
-  A second `stop()` while `STOPPING` returns the pending result.
-- **UNKNOWN outcome.** All motion controls (motion buttons, Move to Start, motion runs) are disabled and the status bar shows "Robot state unknown: use the e-stop or teach pendant, then restart the app". Plain recording (no motion) remains available. There is no automatic recovery from `UNKNOWN`; the app restarts.
-- **Worker blocked inside an SDK call.** The watchdog (above) calls `stop()` through the stop channel regardless of the worker. If the run's future doesn't resolve after the stop, the state becomes `UNKNOWN`, the blocked daemon thread is abandoned and further jobs are rejected.
-- **`close()`** is idempotent: `stop()`; state → `CLOSED` (new jobs rejected with `RunnerClosed`); signal the worker and join it for at most 2 s; call `CloseRPC` on both connections (best effort); fail the pending futures with `RunnerClosed`; restore the safe default speed (best effort). If the worker is still blocked it is abandoned and logged.
-- **`motion_done` never changes.** Covered by the watchdog: the run times out, `stop()` runs, and the outcome is `FAULT("motion timeout")` or `UNKNOWN` depending on whether the stop was confirmed.
-
-### Controller-file verification
-Two different hashes are involved and are never mixed up:
-- **local MD5:** `hashlib.md5` over the bytes of the generated file on disk, computed at `compile`.
-- **remote MD5:** `ComputeFileMD5("/fruser/traj/<file>")`, computed **by the controller** on the file it stores.
-
-`motion.json.md5` holds the local MD5 of the file as published, and `publish` stores it only after the remote MD5 has matched it. The startup check compares the live remote MD5 with it. Every outcome other than a match **disables the motion (fail closed)**, with a distinct reason:
-
-| Outcome | Reason shown |
-|---|---|
-| the controller has no such file (SDK error or empty result; exact form from Q7) | `file missing on controller` |
-| the SDK returns an error code for the hash call | `hash query failed (code N)`; retried twice before giving up (transport errors only) |
-| empty or non-32-hex-character hash | `controller returned an invalid hash` |
-| hashes differ (compared case-insensitively) | `md5 mismatch` (never retried) |
-
-### Controller file transfer (binding)
-Verified on the real robot on 2026-11-24 (§ Phase 0 update: uploading files and loading them as TPD). Every implementation that puts a file on the controller follows these rules.
-
-**Never call** `TrajectoryJUpLoad`, `LuaUpload`, `PointTableUpLoad` or any SDK method built on `__FileUpLoad`. They issue the `FileUpload` RPC and then make **one** immediate connect to port 20010. The controller opens 20010 about 50 ms after the RPC, so that connect is usually refused and the call returns -1 (`ERR_OTHER`), indistinguishable from the RPC failing or the transfer failing. Retrying the SDK call does not fix the race. It only adds new RPC requests.
-
-**The correct upload is `FR5.upload_file(local_path, file_type)`**, which performs the protocol itself (protocol manual §5.1.50; reference code `sw/robot/spike/file_port_probe.py`):
-1. `file_type` must be **20** (Trajectory J, stored at `/fruser/traj/<basename>`) or **0** (Lua). Any other value raises `ValueError` before anything is sent: the other types are firmware, OS and upgrade packages.
-2. Call the XML-RPC `FileUpload(file_type, basename)` on the SDK's proxy (`client.robot.FileUpload`). Non-zero → raise `FileTransferError(stage="request", code=rtn)`.
-3. Connect to `<ip>:20010`, retrying every 50 ms for up to 5 s. No connection → `FileTransferError(stage="connect")`.
-4. Once connected, **always send the whole file**. Connecting and closing without sending leaves an **empty file** at the target path (observed). Framing, as in the SDK: `"/f/b" + f"{len(data) + 50:10d}" + md5_hex`, then the bytes, then `"/b/f"`.
-5. Read the reply. It must start with `b"SUCCESS"`; otherwise `FileTransferError(stage="transfer")`.
-6. Verify with `ComputeFileMD5(<remote path>)`: code 0 and the local MD5 (case-insensitive). Otherwise `FileTransferError(stage="verify")`. A transfer is not "done" until this passes.
-
-Other rules:
-- Ports 20010 (upload) and 20011 (download) are **closed while idle by design**. A refused connection on them outside a transfer is not a fault, and no startup check may test them.
-- `FileUpload` type 0 stores the file outside `/fruser/` until `LuaUpLoadUpdate(name)` accepts it, and that call rejects files of about 1 MB and up. Do not use type 0 for trajectories or TPD files.
-- Deleting a file (`TrajectoryJDelete`) is a plain RPC (`FileDelete`), not a socket transfer, and is safe to call directly.
-- Names: `/fruser/traj/<basename>` for MD5 and `LoadTrajectoryJ`; `traj/<stem>` (no extension, no leading slash) for `LoadTPD`, `GetTPDStartPose` and `MoveTPD`. `LoadTPD` with an absolute path returns 8 ("tpd file does not exist").
-- Error codes from the controller come from the protocol manual, Table 10-1 (for example 4 = parameter value abnormal, 8 = tpd file does not exist). Negative codes come from the SDK's `RobotError` (for example -1 `ERR_OTHER`, -4 RPC down, -7 local upload file not found).
-
-### Atomic publishing
-The SDK has no rename call, so the publish sequence verifies a temporary upload before it touches the live file and writes the metadata last, atomically:
-1. **Preconditions:** a fresh `validated.json` (design and camera-tool hashes current), `camera_tool.yaml` approved, rehearsal evidence at ≥ the requested ovl, and the configured backend.
-2. **Temporary upload:** upload the build file as `tmp_<name>.txt`. Its remote MD5 must equal the local MD5; otherwise delete the temporary file and abort. Nothing live has changed.
-3. **Set aside old metadata:** rename `motion.json` → `motion.json.prev` (skipped if there is none).
-4. **Final upload:** upload `motion_<name>.txt` and verify the remote MD5. On failure delete the file and abort, leaving `.prev` in place.
-5. **Write metadata:** write `motion.json.tmp`, then `os.replace` it onto `motion.json` (atomic).
-6. **Clean up:** delete the temporary controller file and `.prev`.
-
-Failure semantics: before step 4 nothing visible changed. Between steps 3 and 5 the app's startup check fails closed (no metadata or an md5 mismatch means the motion is disabled), so an interrupted publish can't produce a runnable half-published motion. **Recovery = re-run `publish`** (it is idempotent). `list` reports orphans: `tmp_*` files and controller files without `motion.json`. Step 4 does overwrite the previously published file, so a motion is briefly unavailable during publishing; the app must not be running then (README rule).
-
-### UI state machine
-`sw/robot/ui_state.py` holds a pure `UiState` enum and `transition(state, event) -> (new_state, actions)`. The Tk app feeds events in and executes the returned actions, so the logic is testable without Tk.
-
-States: `UNAVAILABLE` (no robot: `--no-robot` or startup failure), `CHECKING`, `IDLE`, `LOADING`, `MOVING_TO_START`, `STARTING_RECORDING`, `PRE_ROLL`, `RUNNING`, `POST_ROLL`, `STOPPING`, `FAULT`, `UNKNOWN`.
+States: `UNAVAILABLE` (no robot: `--no-robot` or startup failure), `CHECKING`, `IDLE`, `LOADING`, `MOVING_TO_START`, `STARTING_RECORDING`, `PRE_ROLL`, `RUNNING`, `POST_ROLL`, `STOPPING`, `FAULT`.
 
 | From | Event | To | Actions |
 |---|---|---|---|
@@ -269,94 +207,65 @@ States: `UNAVAILABLE` (no robot: `--no-robot` or startup failure), `CHECKING`, `
 | `RUNNING` | `motion_failed` | `STOPPING` | `runner.stop()`, stop recording, show the error |
 | `POST_ROLL` | `post_roll_elapsed` | `STOPPING` | stop recording |
 | `PRE_ROLL`, `RUNNING`, `POST_ROLL` | `stop_pressed` | `STOPPING` | cancel pending `after` handles, `runner.stop()`, stop recording (once) |
-| any non-`IDLE` state | `close` | (closing) | cancel `after` handles, `runner.stop()`, stop recording if recording, then `runner.close()` and destroy |
-| `STOPPING` | `stop_confirmed` + `recording_stopped` | `IDLE` or `FAULT` | existing download flow |
-| `STOPPING` | `stop_unconfirmed` | `UNKNOWN` | banner |
+| any non-`IDLE` state | `close` | (closing) | cancel `after` handles, `runner.stop()`, stop recording if recording, `runner.close()`, destroy |
+| `STOPPING` | `recording_stopped` | `IDLE`, or `FAULT` if the runner is in `FAULT` | existing download flow |
+| `FAULT` | `fault_cleared` (operator button) | `IDLE` | `runner.clear_fault()` |
 | any | events not listed for that state | unchanged | ignored, logged |
 
-Races:
-- **Close during pre-roll:** the `after` handle is cancelled, so `run()` never starts; `runner.stop()` and the recording stop still run.
-- **Motion finishes as Stop is pressed:** `STOPPING` ignores `motion_done`/`motion_failed`, and a `_stop_requested` guard makes the recording stop exactly once.
-- **Recording starts but the motion fails, or the GoPro starts and the robot's `run()` fails:** both go to `STOPPING` (stop the robot, stop the recording, show the error). The clip is kept and processed as usual.
-- **GoPro start fails:** the robot never starts, because `run()` is only requested after `recording_started`.
-- **Selection changes while an operation is pending:** the motion buttons and Move to Start are enabled only in `IDLE`, and events in any other state are ignored by the table. `askyesno` runs a nested event loop, so after "Yes" the handler re-checks that the state is still `IDLE` and the motion is still enabled; otherwise it discards the choice with a status message.
-- **Late results:** stale `op_id` callbacks are ignored.
+Races: close during pre-roll cancels the `after` handle so `run()` never starts; `STOPPING` ignores late `motion_done`/`motion_failed`; a `_stop_requested` guard stops the recording exactly once; a failed GoPro start never starts the robot; after `askyesno` returns, re-check that the state is still `IDLE` before acting; stale `op_id` results are ignored.
 
-### Disabled-motion behaviour
-- All motion buttons stay **visible**. A motion that failed the startup check is **disabled**, drawn in a distinct style, and shows its reason in the status bar on mouse-over.
-- If the saved `"motion"` is invalid or missing, the selection resets to "No motion" **in memory** with a status message. The config file keeps the saved value until the user picks another, so a transient outage doesn't lose it.
-- If the robot (or its stop channel) is unreachable, every motion is disabled with "robot unreachable" and plain recording works.
-- **No MD5 re-check after startup** (the hash is verified once, as required). Cheap load-time guards remain: after `LoadTrajectoryJ`, `load()` checks `GetTrajectoryPointNum() == num_points` (and the start pose, if Q2 shows that comparison is meaningful). A `load()` or `run()` failure marks the motion **invalid for the rest of the session**: its button is disabled with "invalid at load/run: …" and the runner state is checked.
+Disabled motions: buttons stay visible; a motion that failed the startup check is disabled and shows its reason on mouse-over. An invalid saved `"motion"` resets to "No motion" in memory only. Robot unreachable → all motions disabled, plain recording works.
 
 ### Error handling contract
-- `FR5._call(name, *args)` invokes the SDK method. A non-zero error code raises `FairinoError(code, name)`. For `(code, value)` returns it returns `value`.
-- `FairinoError.__str__` includes the call name and the code.
-- `MotionRunner` turns exceptions into Future exceptions. The UI shows `f"Robot error: {e}"` in the status bar.
-- `motionctl` exits with code 1 and a one-line message on any `FairinoError` or validation failure, and prints the full report for validation failures.
+- `FR5._call(name, *args)` invokes the SDK method. A non-zero code raises `FairinoError(code, call)`. For `(code, value)` returns it returns `value`.
+- `FileTransferError(stage, code)` for uploads (stages `request`, `connect`, `transfer`, `verify`).
+- `MotionRunner` turns exceptions into Future exceptions. The UI shows `f"Robot error: {e}"`.
+- `motionctl` exits with code 1 and a one-line message on any error, and prints the full report for validation failures.
 
 ## Data schemas
-All files are UTF-8. Units are mm and degrees unless stated otherwise. Every schema has a matching frozen dataclass in `schema.py` with `from_dict`/`to_dict`. Loaders raise `SchemaError(path, field, reason)` on missing or wrong fields.
+UTF-8. Units mm and degrees. Each schema has a frozen dataclass in `schema.py`. Loaders raise `SchemaError(path, field, reason)`.
 
 ### `sw/robot/motions/<name>/design.yaml` (hand-written, committed)
-Angles mode:
 ```yaml
 name: sweep_left_fast          # must equal folder name; ^[a-z0-9_]{1,19}$
-tool_id: 1                     # camera tool frame on the controller
-sample_period_ms: 8            # one of the controller's supported periods (Q2)
-anchor: {pos: [0, 0, 0], yaw_deg: 0}     # optional authoring frame A; default = base frame
-seed_joints: [0, -90, 90, -90, -90, 0]   # IK seed for the first sample
+tool_id: 0                     # D5: flange
+sample_period_ms: 8            # D4
+anchor: {pos: [0, 0, 0], yaw_deg: 0}     # optional authoring frame A
+seed_joints: [0, -90, 90, -90, -90, 0]   # IK seed for the first sample: use the joints
+                                         # `motionctl pose` prints at the start position
 orientation: {mode: angles}
 limits:                        # all optional; defaults shown
   max_tcp_speed_mm_s: 800
   max_joint_speed_deg_s: 120   # scalar or list of 6
   max_joint_acc_deg_s2: 600
-  max_joint_step_deg: 2.0      # per-sample jump => wrist flip / singularity
-  max_wrist_step_deg: 1.0      # J4-J6 per sample
+  max_joint_step_deg: 2.0      # per-sample jump => IK branch flip
   max_cumulative_pan_deg: 360
   allow_long_pan: false
   overshoot_pct: 2
-  min_wrist_margin_deg: 15     # |J5| from its singular position
-  max_roll_deg: 0.05
-  max_pointing_error_deg: 0.1
 workspace:                     # box in the authoring frame A
   min: [200, -700, 150]
   max: [900,  700, 1100]
 keyframes:                     # t strictly increasing, first t == 0, at least 2
   - {t: 0.0, pos: [600, -400, 450], pan: 20,  tilt: -5}
-  - {t: 1.2, pos: [600,  400, 450], pan: -20, tilt: -5, vel: {y: 400}}   # optional velocity override
+  - {t: 1.2, pos: [600,  400, 450], pan: -20, tilt: -5, vel: {y: 400}}
   - {t: 2.0, pos: [650,  400, 700], pan: -20, tilt: 5}
 ```
-Target mode, fixed target (or a `target` on every keyframe instead, for a target trajectory):
-```yaml
-orientation:
-  mode: target
-  target: [0, 0, 300]          # fixed point, authoring frame A
-  min_target_distance_mm: 100
-  min_horizontal_mm: 50
-  max_tilt_deg: 80
-  max_pan_rate_deg_s: 120
-keyframes:
-  - {t: 0.0, pos: [600, -400, 450]}
-  - {t: 2.0, pos: [600,  400, 450]}
-```
-Schema rules: at least 2 keyframes; the first and last are at rest (no non-zero `vel`, `stop` allowed there); in `angles` mode every keyframe has `pan` **and** `tilt` and none has `target`; in `target` mode exactly one of the design-level `target` or a `target` on every keyframe, and no keyframe has `pan`/`tilt`; `|tilt| ≤ 85`; `sample_period_ms` is in the allowed set; segments ≥ `min_segment_s`; `vel` keys are valid channels for the mode.
+Target mode: `orientation: {mode: target, target: [0, 0, 300]}` (plus the optional geometry limits) and keyframes with `pos` only, or a `target` on every keyframe. Schema rules (already enforced by `schema.py`): ≥ 2 keyframes; first and last at rest; angles mode needs `pan` and `tilt` on every keyframe and no `target`; target mode has exactly one target source and no `pan`/`tilt`; `|tilt| ≤ 85`; `sample_period_ms ∈ {2, 4, 8}`; segments ≥ `min_segment_s`; `vel` keys valid for the mode. Limits keys that still exist in `schema.py` but are not listed above (`max_wrist_step_deg`, `min_wrist_margin_deg`, `max_roll_deg`, `max_pointing_error_deg`) are accepted and ignored for now.
 
-### `sw/robot/camera_tool.yaml` (hand-edited, committed)
-See § Camera tool calibration.
+### `sw/robot/motions/<name>/validated.json` (written by `validate`; git-ignored)
+- `name`, `design_sha256`, `created` (ISO 8601), `sample_period_ms`, `tool_id`, `install_angle`.
+- `num_points` (N + 1), `duration_s`, `design_duration_s`.
+- `samples`: `{t: [...], pose: [[6]...], pan: [...], tilt: [...], joints: [[6]...]}`.
+- `peaks`: `{tcp_speed_mm_s, joint_speed_deg_s[6], joint_acc_deg_s2[6], max_joint_step_deg, max_fk_pos_err_mm, max_fk_rot_err_deg}`.
+- `checks`: list of `{name, passed, detail}`. Written only when every check passes.
 
-### `sw/robot/motions/<name>/validated.json` (generated by `validate`; **git-ignored**)
-- `name`, `design_sha256`, `camera_tool_sha256`, `created` (ISO 8601), `backend`, `sample_period_ms`, `tool_id`, `install_angle`, `tcp_offset[6]` (read from the controller).
-- `num_points` (= `N + 1`), `duration_s`, `design_duration_s`.
-- `samples`: `{t: [N+1], pose: [N+1][6], pan: [N+1], tilt: [N+1], joints: [N+1][6]}` (pose in B).
-- `peaks`: `{tcp_speed_mm_s, joint_speed_deg_s[6], joint_acc_deg_s2[6], max_joint_step_deg, max_roll_deg, max_pointing_error_deg, max_fk_pos_err_mm, max_fk_rot_err_deg, min_wrist_margin_deg}`.
-- `checks`: a list of `{name, passed, detail}`. The file is written only when every check passes. Otherwise the report is printed and nothing is written.
-
-### `sw/robot/motions/<name>/motion.json` (generated by `publish`; read by the app; **committed**)
+### `sw/robot/motions/<name>/motion.json` (written by `publish`; read by the app; committed)
 ```json
 {
   "name": "sweep_left_fast",
-  "backend": "trajectory_file",
+  "backend": "tpd",
   "controller_file": "/fruser/traj/motion_sweep_left_fast.txt",
+  "tpd_name": "traj/motion_sweep_left_fast",
   "md5": "…",
   "num_points": 251,
   "sample_period_ms": 8,
@@ -364,432 +273,160 @@ See § Camera tool calibration.
   "design_duration_s": 2.0,
   "start_joints": [..6..],
   "start_pose": [..6..],
-  "tool_id": 1,
-  "tcp_offset": [..6..],
-  "approved_ovl": 100,
-  "design_sha256": "…", "camera_tool_sha256": "…", "validated_sha256": "…",
-  "rehearsal": {"ovl": 100, "max_roll_deg": 0.12, "max_pos_err_mm": 1.8, "date": "2026-11-24"},
+  "tool_id": 0,
+  "approved_ovl": 50,
+  "design_sha256": "…",
   "published_at": "2026-11-24T10:00:00"
 }
 ```
-Cross-field rules, enforced by `MotionConfig.check_consistent()`: `controller_file == "/fruser/traj/motion_<name>.txt"`; `duration_s == (num_points − 1) · sample_period_ms / 1000`; `1 ≤ approved_ovl ≤ rehearsal.ovl ≤ 100`; `len(start_joints) == len(tcp_offset) == 6`; `backend` is a known backend.
+`MotionConfig.check_consistent()`: `backend == "tpd"`; `controller_file == "/fruser/traj/motion_<name>.txt"`; `tpd_name == "traj/motion_<name>"`; `num_points ≥ 2`; `duration_s == (num_points − 1) · sample_period_ms / 1000`; `1 ≤ approved_ovl ≤ 100`; `start_joints` and `start_pose` have 6 values.
 
 ### Which files are committed
-- **Committed:** `design.yaml` (authored), `motion.json` (small published metadata; carries the rehearsal summary so the approval evidence travels with it), `camera_tool.yaml`, `codegraph.json`.
-- **Git-ignored (reproducible or machine-local):** `validated.json`, `sw/robot/build/`, rehearsal logs under `sw/robot/logs/` and `motions/*/rehearsal*.{csv,json}`, `motions/*/*.prev`, `motions/*/*.tmp`.
-- `motionctl verify NAME` regenerates the trajectory from `design.yaml` and `camera_tool.yaml` and compares its MD5 with `motion.json`. Joint solutions come from the controller's IK, so a mismatch with an unchanged design hash is reported as a **warning** (controller kinematics or SDK changed), not as an error.
+- Committed: `design.yaml`, `motion.json`.
+- Git-ignored: `validated.json`, `sw/robot/build/`, `sw/robot/logs/`.
 
-### `sw/livestream_config.json` (new keys, merged by the existing `save_config` pattern)
-- `"motion"`: the selected motion name, or `""` for no motion.
-- `"robot"`: `{"ip": "192.168.58.2", "backend": "trajectory_file", "start_tolerance_deg": 0.5, "move_to_start_speed_pct": 10, "safe_default_speed_pct": 10, "stop_confirm_timeout_s": 2.0, "pre_roll_s": 0.5, "post_roll_s": 1.0, "auto_stop_after_motion": true}`.
+### `sw/livestream_config.json` (new keys)
+- `"motion"`: selected motion name, or `""`.
+- `"robot"`: `{"ip": "192.168.58.2", "backend": "tpd", "start_tolerance_deg": 0.5, "move_to_start_speed_pct": 10, "safe_default_speed_pct": 10, "pre_roll_s": 0.5, "post_roll_s": 1.0, "auto_stop_after_motion": true}`.
 
 ## Module interfaces
-Signatures are binding for the implementer. Private helpers are free.
+Signatures are binding. Private helpers are free.
 
-- **`frames.py`**: `design_to_base(design) -> Design` (applies `anchor` to positions, targets, `pan`), `base_to_authoring(points, anchor) -> ndarray` (used by the workspace check).
-- **`pose.py`**
-  - `level_rotation(pan_deg, tilt_deg) -> np.ndarray(3,3)`
-  - `look_at_angles(pos, target) -> tuple[pan, tilt]` (raises `DegenerateTarget` for a zero vector; the validator reports the geometry limits)
-  - `rotation_to_sdk_euler(R) -> (rx, ry, rz)` and `sdk_euler_to_rotation(rx, ry, rz) -> R`. The convention is the module constant `SDK_EULER = "xyz"`, set by Q1.
-  - `roll_error_deg(R) -> float`: roll about the optical axis relative to the level reference u = normalise(z_cam × z_base), which equals x_cam when the camera is level, measured about z_cam. Not "x_cam out of the horizontal plane": that metric scales a true roll by cos(tilt), which underestimates it for a tilted camera (found while implementing Phase 1).
-  - `pointing_error_deg(R, pos, target) -> float`
-  - `unwrap_deg(seq) -> list` (continuous unwrap used in target mode)
-- **`path.py`**
-  - `Sample(t, pos, pan, tilt, target)` (all in B; `target` is `None` in angles mode)
-  - `hermite_quintic(...)` and `keyframe_velocities(times, values, overrides) -> list` (PCHIP defaults, zero ends)
-  - `build_path(design: Design) -> Callable[[float], Sample]`
-  - `sample_count(T, period_ms) -> int`, the rule `N + 1` above
-  - `sample_path(design) -> list[Sample]`, uniform spacing, last sample clamped to the final keyframe
-  - `to_sdk_pose(sample) -> list[6]`
-- **`validate.py`**
-  - `class Kinematics(Protocol)`: `ik(pose6, seed6) -> list[6] | None`, `fk(joints6) -> list[6]`, `install_angle() -> tuple`, `joint_soft_limits() -> list[(lo, hi)]`, `tool_offset(tool_id) -> list[6]`.
-  - `validate(design, camera_tool, samples, kin) -> ValidationReport`, holding `passed: bool`, `checks`, `peaks` and `joints`.
-  - Checks, each a separate function so it can be tested alone: `check_camera_tool`, `check_install_angle`, `check_target_geometry` (target mode: distance, horizontal distance, tilt, pan rate), `check_pan_turn`, `check_path_overshoot`, `check_ik`, `check_config_consistency` (the configuration signature, from Q8, is the same at adjacent samples), `check_joint_steps`, `check_wrist` (J4–J6 step and speed), `check_joint_limits_and_winding` (soft limits from the controller, and the total travel of each joint ≤ 360°), `check_singularity` (J5 margin, elbow and shoulder margins, and a manipulability measure from FK finite differences on every 10th sample; thresholds from Q8), `check_joint_speed_acc` (finite differences), `check_tcp_speed`, `check_workspace` (in A), `check_roll` (samples and midpoints, SLERP and linear-Euler, heuristic), `check_pointing` (every design in target mode; samples and midpoints, ≤ `max_pointing_error_deg`), `check_fk_roundtrip` (< 0.1 mm, < 0.05°).
-- **`traj_file.py`**: `write(validated: Validated, path: Path, period_ms: int) -> None` and `read(path) -> list[list[float]]`, for round-trip tests. The format follows Q2.
-- **`backend.py`**: `class TrajectoryBackend(Protocol)` with `compile(validated, out_dir) -> Path`, `upload(fr5, local_path, remote_name)` (implemented with `FR5.upload_file`, never an SDK upload call), `remote_path(name) -> str`, `load(fr5, config)`, `start(fr5, config)`, `is_done(fr5, config) -> bool`, `stop(fr5)`; and `TrajectoryFileBackend`. A `LuaBackend` exists only if Phase 0 selects it.
-- **`schema.py`**: `Design`, `Keyframe`, `CameraTool`, `Validated`, `MotionConfig`, `RobotSettings`, plus `load_design(path)`, `load_camera_tool(path)`, `load_validated(path)`, `load_motion_configs(motions_dir) -> dict[str, MotionConfig]` (skips folders without `motion.json`), `sha256_file(path)`, `MotionConfig.check_consistent()`.
-- **`fr5.py`**
-  - `class FairinoError(RuntimeError)`, carrying `code` and `call`.
-  - `class RobotClient(Protocol)`: the exact SDK methods listed in Findings, used by `FR5`, so fakes can implement it.
-  - `class FR5`, which takes `client: RobotClient`:
-    - `connect(ip) -> FR5` (classmethod)
-    - `ik`, `fk`, `install_angle`, `joint_soft_limits`, `tool_offset` (satisfying `Kinematics`)
-    - `joints() -> list[6]`, `joint_speeds() -> list[6]`, `tcp_pose()`, `error_codes() -> (main, sub)`, `motion_done() -> bool`
-    - `move_j(joints, tool, speed_pct)`
-    - `speed(pct)`: context manager that sets the speed and restores `safe_default_speed_pct` in `finally`
-    - `upload_file(local_path, file_type=20) -> str`: the protocol in § Controller file transfer; returns the verified remote path. Raises `FileTransferError(stage, code)` with stage `request`, `connect`, `transfer` or `verify`.
-    - `delete_traj(file)` (`TrajectoryJDelete`), `file_md5(remote_path) -> str`
-    - `load_tpd(name)`, `tpd_start_pose(name)`, `move_tpd(name, blend, ovl)`, where `name` is `traj/<stem>` for uploaded files
-    - `load_traj(remote_path, ovl)`, `run_traj()`, `stop()`
-    - `prepare()` (reset errors, enable, auto mode, safe default speed)
-- **`ui_state.py`**: `UiState`, `Event`, `Action` enums/dataclasses and `transition(state, event, context) -> (UiState, list[Action])` (the table above).
-- **`motion_runner.py`**
-  - `class MotionRunner`, which takes `connect: Callable[[], FR5]` (so tests can inject fakes), `backend: TrajectoryBackend` and `settings: RobotSettings`. Methods:
-    - `connect_and_check(configs) -> Future[dict[str, str | None]]`: maps each name to None if OK, or to the reason it is disabled.
-    - `load(name) -> Future[None]`
-    - `move_to_start(name) -> Future[None]`
-    - `at_start(name) -> tuple[bool, float]`: synchronous, reads the state cache, and returns (ok, max_err_deg).
-    - `run(name) -> Future[None]`
-    - `stop() -> StopResult`
-    - `close() -> None`
-    - `state -> RunnerState`
-- **`motionctl.py`**: run as `python -m sw.robot.motionctl <cmd> NAME [--ip IP]`, with these commands:
-  - `plan NAME [--preview]`
-  - `validate NAME`
-  - `compile NAME`
-  - `rehearse NAME --ovl 10,25,50,100`
-  - `publish NAME --ovl N`
-  - `verify NAME`
-  - `list`
-  - `remove NAME`
-  - `new NAME --template sweep|crane|orbit|push_in`, which writes a starter `design.yaml` from `templates.py`.
+- **`frames.py`, `pose.py`, `path.py`**: done in Phase 1 (`design_to_base`, `base_to_authoring`, `within_workspace`; `level_rotation`, `look_at_angles`, `roll_error_deg`, `pointing_error_deg`, `rotation_to_sdk_euler`, `sdk_euler_to_rotation`, `unwrap_deg`, `SDK_EULER = "xyz"`; `Sample`, `sample_count`, `sample_times`, `build_trajectory`, `sample_path`, `to_sdk_pose`).
+- **`schema.py`**: `Design`, `Keyframe`, `MotionConfig`, `RobotSettings`, `load_design`, `load_motion_config`, `load_motion_configs`, `sha256_file`, `motion_config_to_dict`. (`CameraTool` stays but is unused until calibration.)
+- **`tpd_file.py`** (Phase 4):
+  - `write(path, joints: list[list[float]], poses: list[list[float]], period_ms: int, tool_id: int) -> None` (format above; raises `ValueError` on length mismatch or rows ≠ 6 values).
+  - `read(path) -> TpdFile` with `header: tuple`, `joints`, `poses` (for tests and checks).
+  - `md5(path) -> str`.
+- **`validate.py`** (Phase 3):
+  - `class Kinematics(Protocol)`: `ik(pose6, ref6) -> list[float] | None`, `fk(joints6) -> list[float]`, `active_tool() -> int`, `install_angle() -> tuple[float, float]`, `joint_soft_limits() -> list[tuple[float, float]]`.
+  - `validate(design, samples, kin) -> ValidationReport` (`passed`, `checks`, `peaks`, `joints`).
+  - Checks, each its own function: `check_active_tool`, `check_install_angle`, `check_target_geometry`, `check_pan_turn`, `check_path_overshoot`, `check_workspace`, `check_tcp_speed`, `check_ik`, `check_joint_steps`, `check_joint_limits`, `check_joint_speed_acc`, `check_fk_roundtrip` (every 10th sample: < 0.1 mm, < 0.05°).
+  - `report_to_validated(report, design, samples) -> dict` (the `validated.json` content).
+- **`fr5.py`** (Phase 2):
+  - `class FairinoError(RuntimeError)` (`code`, `call`); `class FileTransferError(RuntimeError)` (`stage`, `code`).
+  - `class RobotClient(Protocol)`: the SDK methods in § Robot call reference plus `robot` (the XML-RPC proxy) and `robot_state_pkg`.
+  - `class FR5(client, ip)`:
+    - `connect(ip) -> FR5` (classmethod; lazy `from fairino import Robot`), `close()`
+    - `ik`, `fk`, `active_tool`, `install_angle`, `joint_soft_limits` (satisfies `Kinematics`)
+    - `joints()`, `tcp_pose()`, `motion_done() -> bool`, `error_codes() -> (main, sub)`, `robot_mode() -> int` (all from the cache)
+    - `ensure_auto()`, `set_speed(pct)`, `speed(pct)` (context manager restoring `safe_default_pct` in `finally`)
+    - `move_j(joints, tool_id, vel_pct)` (blocking)
+    - `upload_file(local_path, file_type=20) -> str`, `file_md5(remote_path) -> str | None` (None = not found), `delete_traj(filename)`
+    - `load_tpd(name)`, `tpd_start_pose(name) -> list[float]`, `move_tpd(name, blend, ovl)`, `stop()`
+- **`motionctl.py`** (Phase 4, `publish`/`list` in Phase 5): `uv run python -m sw.robot.motionctl <cmd> …`:
+  - `new NAME --template sweep|crane|orbit|push_in|first_test`
+  - All commands take `--ip IP`, default `192.168.50.2` (the simulator; § Simulator vs real robot). `upload`, `play` and `publish` need `--ip 192.168.58.2` and operator confirmation; they refuse to run against the default sim IP since they need the real file/motion services.
+  - `pose [--ip IP]` (default sim): print current joints, tool, TCP pose, and the pan/tilt/roll of that pose (no motion). Used to author keyframes and seed joints.
+  - `plan NAME`: sample count, duration, peak TCP speed (no robot).
+  - `validate NAME [--ip IP]` (default sim): IK on the controller (no motion), writes `validated.json`.
+  - `compile NAME`: writes `sw/robot/build/motion_<name>.txt`; refuses if `validated.json` is missing or its `design_sha256` is stale.
+  - `upload NAME --ip 192.168.58.2`: `upload_file`, `LoadTPD`, `GetTPDStartPose` equals the first row's pose (tolerance 0.01). No motion. **Real robot only; refuses the sim IP.** On `FileTransferError`, print the local build path and stop — do not retry; ask the operator to upload manually.
+  - `play NAME --ovl N --ip 192.168.58.2`: the robot test (see Phase 4). **Real robot only; refuses the sim IP** (it does not play TPD trajectories). Requires operator YES.
+  - `publish NAME --ovl N --ip 192.168.58.2`: **real robot only**, operator-run. `list` (no `--ip`, reads only local `motion.json` files).
+- **`motion_runner.py`** (Phase 5): `MotionRunner(connect: Callable[[], FR5], settings: RobotSettings, motions: dict[str, MotionConfig])` with `connect_and_check() -> Future[dict[str, str | None]]`, `load(name)`, `move_to_start(name)`, `at_start(name) -> tuple[bool, float]`, `run(name)`, `stop() -> bool`, `clear_fault()`, `close()`, `state`.
+- **`ui_state.py`** (Phase 6): `UiState`, `Event`, `Action`, `transition(state, event, context)`.
 
 ## Phases
-**Gate rule for every phase:** run `uv run pytest sw/tests/ -q` (the full suite). Every test passes, with no new skips or failures, and `uv run ruff check sw/ && uv run ruff format --check sw/` is clean (line length 88, rules E/F/I). Each phase ends in its own commit on `feature/fairino-python-basic-control`. **No unit test may require the robot, the GoPro, or the network.** Hardware-only scripts live outside `sw/tests/` or are marked `@pytest.mark.hardware` and skipped by default (register the marker in `pyproject.toml`).
+**Gate rule for every phase:** `uv run pytest sw/tests/ -q` passes with no new failures or skips, and the files you changed pass `uv run ruff check <files>` and `uv run ruff format --check <files>` (the repo has old ruff errors elsewhere; do not fix those). The pre-commit hook runs the same checks on staged files. Each phase ends in its own commit on `feature/fairino-python-basic-control`, made only when the user asks. **No unit test may need the robot, the GoPro or the network.** Hardware steps are run by the operator from `motionctl`, never from `pytest`.
 
-### Phase 0: Hardware spike and calibration (needs the operator at the robot)
-- **Work:** write `sw/robot/spike/` scripts. Each prints its findings and doesn't need tests.
-  - Q1 `euler_probe.py`: jog to 3–4 poses and print `GetActualTCPPose` next to the scipy conversion of `GetForwardKin`, for each Euler candidate; find how to read tool N's coordinates.
-  - Q2/Q3 `traj_probe.py`: record an 8 ms TPD trajectory, download it, write a small file in the same format, upload (including the basename check), `LoadTrajectoryJ`/`MoveTrajectoryJ` at 10%, and log tracking, timing, and `ovl` behaviour against the contract table.
-  - Q4/Q5: the same script tests a `MoveJ` after the load, whether `MoveTrajectoryJ` blocks, `motion_done` at the end, and `StopMotion` from a second connection (with stop latency and the shared `is_conect` check).
-  - Q6 `roll_probe.py`: a dense pan+tilt trajectory vs a sparse two-point `MoveL`, logging roll from `tl_cur_pos`.
-  - Q7 `md5_probe.py`: `ComputeFileMD5` on a good, a missing and an unreadable path.
-  - Q8 `kinematics_probe.py`: soft limits, the singular regions of the FR5, the configuration signature, and manipulability values along sample paths, to set the thresholds.
-  - `calibrate_camera.py`: the procedure in § Camera tool calibration; produces the approved `camera_tool.yaml`.
-- **Done when:** the answers to Q1–Q8, the backend decision (A, B or C), the confirmed acceptance numbers and an approved `camera_tool.yaml` are written into a "Phase 0 results" section appended to this doc, including a sample trajectory file excerpt.
-- Phases 1–3 can be developed in parallel with Phase 0, because they don't depend on its answers beyond constants.
+### Phase 0: hardware spike — closed for the core features
+Answered and binding: the TPD route (D1–D3), the file transfer protocol, the TPD file format, the IK/FK, soft limits and install angle calls, the auto-mode rule, the Euler convention constant `SDK_EULER = "xyz"` (simulator-verified; the Phase 4 robot test checks it visually). Everything else that Phase 0 originally listed is in § Deferred.
 
-### Phase 1: Pure geometry and schemas (`frames.py`, `pose.py`, `path.py`, `schema.py`, `templates.py`)
-- **Work:** as specified in Module interfaces. Add `scipy` and `pyyaml` to `pyproject.toml` dependencies.
-- **Tests:**
-  - `sw/tests/test_robot_pose.py`:
-    - for 1,000 random (pan, tilt) with |tilt| ≤ 80: `R` is orthonormal with det = 1, `|x_cam · ẑ| < 1e-12`, the optical axis heading equals pan and its elevation equals tilt;
-    - `look_at_angles` for known targets (ahead, left, above-left, below) and `DegenerateTarget` for a zero vector;
-    - `pointing_error_deg` is 0 for `R(look_at_angles(...))`;
-    - SDK Euler round-trip for random rotations;
-    - `roll_error_deg` equals the injected roll for a rotated frame;
-    - `unwrap_deg` across ±180 and across multiple turns.
-  - `sw/tests/test_robot_frames.py`: `design_to_base` with a yaw anchor: positions, targets and `pan` convert correctly (`pan_B = pan_A + yaw`); the level property holds in B for any yaw; the workspace box check in A (a rotated design inside its box passes, a sample just outside fails); identity anchor is a no-op.
-  - `sw/tests/test_robot_path.py`:
-    - the path passes through every keyframe (pos ±1e-6 mm, pan/tilt ±1e-6°);
-    - 2 keyframes and 3 keyframes both build (a single minimum-jerk segment for 2);
-    - velocity and acceleration are zero at t = 0 and t = T; acceleration is 0 at every keyframe;
-    - **locality:** changing one keyframe changes the path only in its two adjacent segments;
-    - PCHIP default velocities: zero at a local extremum; no overshoot for monotone keyframes;
-    - `vel` override is honoured at the keyframe; `stop: true` gives zero velocity there;
-    - **sampling rule:** T = 2.0, p = 8 → 251 samples; T = 1.2, p = 8 → 151 (no float-noise extra sample); T = 2.003, p = 8 → 252 samples, last at 2.008 equal to the final keyframe pose; spacing is uniform; the first sample is at t = 0;
-    - explicit pan values are literal (170 → −170 is a −340° turn);
-    - target mode: a fixed target gives `optical axis ∥ (target − position)` at every sample (pointing error < 1e-9°); a per-keyframe target trajectory interpolates the target over time; pan is continuous around a target the path circles (multi-turn unwrap);
-    - every sample has `roll_error_deg < 1e-9` in both modes.
-  - `sw/tests/test_robot_schema.py`:
-    - a valid angles design and a valid target design load;
-    - each invalid case raises `SchemaError` with the field name: bad name regex, name ≠ folder, non-increasing t, first t ≠ 0, fewer than 2 keyframes, `pan`/`tilt` missing in angles mode, `pan` present in target mode, mixed modes, both design-level and keyframe targets, |tilt| > 85, non-zero velocity at the first or last keyframe, `sample_period_ms` not in the allowed set, segment shorter than `min_segment_s`, wrong vector length, an unknown `vel` channel;
-    - `MotionConfig` round-trips and `check_consistent()` rejects each cross-field violation (controller filename, duration vs points × period, `approved_ovl` out of range or above the rehearsal ovl, vector lengths, unknown backend);
-    - `load_motion_configs` skips folders without `motion.json`;
-    - `CameraTool` loading and the `approved` flag.
-  - `templates`: each template produces a design that loads and samples.
-- **Done when:** the gate passes.
+### Phase 1: pure geometry and schemas — done (commit `36d0914`)
 
-### Phase 2: Validator (`validate.py`)
-- **Work:** as specified. Peaks are computed with finite differences on the sample times.
-- **Tests** (`sw/tests/test_robot_validate.py`, with a `FakeKinematics` whose `ik` is a deterministic analytic stand-in and whose failures can be injected):
-  - a well-formed angles design and a well-formed target design pass all checks;
-  - IK returning None at one sample fails `check_ik` and names the sample index and time;
-  - an injected 30° jump on J4 fails `check_joint_steps` and `check_wrist`;
-  - an injected configuration flip (J5 changes sign) between adjacent samples fails `check_config_consistency`;
-  - a path crossing the wrist margin (|J5| < `min_wrist_margin_deg`) fails `check_singularity`;
-  - a joint beyond the controller's soft limit fails; a joint travelling more than 360° fails the winding check;
-  - a too-fast design (shrink keyframe times) fails speed/acc, and the peaks are reported;
-  - a point outside the box, and a keyframe `vel` override that overshoots a segment inside the box, fail `check_workspace` and `check_path_overshoot` respectively;
-  - `check_pan_turn`: |Δpan| > 180° fails unless `allow_long_pan`; cumulative pan above the limit fails;
-  - **target geometry:** a target coinciding with the camera position (zero vector), a target within `min_target_distance_mm`, a target directly above the path (horizontal distance < `min_horizontal_mm`), |tilt| above the limit, and a path passing close to the vertical through the target (pan rate above the limit) each fail `check_target_geometry` with the sample index;
-  - `check_pointing` passes for a correct target design and fails when the fake IK/FK introduces a 0.5° pointing offset;
-  - coarse sampling (e.g. a period of 500 ms with a large simultaneous pan and tilt change) fails the midpoint `check_roll` and `check_pointing` while dense sampling passes, which proves the checks are meaningful;
-  - an FK offset injected into the fake fails `check_fk_roundtrip`;
-  - `check_camera_tool`: unapproved calibration, and a controller tool offset that differs from `camera_tool.yaml`, both fail;
-  - `check_install_angle`: a non-zero install angle fails;
-  - the report serializes to the `validated.json` schema.
-- **Done when:** the gate passes.
+### Phase 1b: align the Phase 1 code with the TPD decision
+Small, mechanical. Tasks:
+- `schema.py`: `BACKENDS = ("tpd",)`; `RobotSettings.backend` default `"tpd"`; remove `stop_confirm_timeout_s` from `RobotSettings`.
+- `MotionConfig` / `MOTION_FILE_KEYS`: add `tpd_name`; remove `tcp_offset`, `camera_tool_sha256`, `validated_sha256`, `rehearsal`; `check_consistent()` as in § `motion.json`.
+- `templates.py`: every template uses `sample_period_ms: 8` (already the case) and `tool_id: 0`. Add `first_test`: angles mode, pan 0, tilt 0, two keyframes 4 s apart, the second 100 mm above the first (`[500, 0, 400]` → `[500, 0, 500]` as placeholders; the operator replaces them using `motionctl pose`).
+- `.gitignore`: add `sw/robot/motions/*/validated.json`, `sw/robot/build/`, `sw/robot/logs/`.
+- Tests: update `sw/tests/test_robot_schema.py` for the new `MotionConfig` and backend; add a test that every template loads, samples, and has period 8 and tool 0.
+- Done when: the gate passes.
 
-### Phase 3: Robot boundary (`fr5.py`) with fakes
-- **Work:** `FR5` wraps the SDK through `RobotClient`. Add `sw/tests/fakes/fake_robot.py` with a `FakeRobotClient` that:
-  - records every call;
-  - keeps joint state, which `MoveJ` sets instantly;
-  - fakes `robot_state_pkg` (`motion_done`, `jt_cur_pos`, `actual_qd`, `main_code`);
-  - stores uploaded files in memory and computes `ComputeFileMD5` with `hashlib.md5` (and can return an empty hash, an error code, or a wrong hash on demand);
-  - can inject error codes per method;
-  - can make `MoveTrajectoryJ` take N polls to complete, never complete, or block on an event;
-  - can fail `connect` for a second connection.
-- **Tests** (`sw/tests/test_robot_fr5.py`):
-  - every wrapper calls the right SDK method with the right argument types and order;
-  - a non-zero code raises `FairinoError` with the call name;
-  - `(code, value)` unpacking;
-  - `move_j` runs inside `speed(pct)`;
-  - **the `speed(pct)` context manager restores `safe_default_speed_pct` on normal exit and on an exception, and tolerates a failing restore;**
-  - `file_md5` returns the controller MD5 string, and the empty-hash and error cases surface as distinct exceptions.
-  - **`upload_file`** (fake XML-RPC `FileUpload` plus a local TCP listener standing in for port 20010):
-    - the listener starts 100 ms after `FileUpload`; the upload still succeeds (proves the connect retry);
-    - the listener never starts: `FileTransferError(stage="connect")` after the retry limit, with no further RPC calls;
-    - `FileUpload` returns non-zero: `stage="request"` and no connect attempt;
-    - the reply is not `SUCCESS`: `stage="transfer"`; the MD5 differs: `stage="verify"`;
-    - the bytes received by the listener equal the SDK framing (`/f/b`, 10-digit size, MD5, data, `/b/f`);
-    - every successful connect is followed by a full send (never connect-then-close);
-    - `file_type` other than 0 or 20 raises `ValueError` before any call;
-    - **no code path calls `TrajectoryJUpLoad`, `LuaUpload` or `PointTableUpLoad`** (the fake raises if they are called).
-- **Done when:** the gate passes. The module imports `fairino` lazily, inside `connect`, so tests don't need the SDK's native library.
+### Phase 2: robot boundary (`fr5.py`) with fakes
+- Work: `FR5` as in § Module interfaces. Port `upload_file` from `sw/robot/spike/file_port_probe.py`. `connect` imports `fairino` lazily.
+- Fake: `sw/tests/fakes/fake_robot.py` with `FakeRobotClient`: records calls; `GetInverseKinRef` returns a deterministic function of the pose (or `(err, None)` on demand); `GetForwardKin` inverts it; a fake `robot_state_pkg` (`jt_cur_pos`, `tl_cur_pos`, `motion_done`, `mc_queue_len`, `robot_mode`, `main_code`, `sub_code`, `tool`); in-memory files for `ComputeFileMD5`; injectable error codes per method; **`TrajectoryJUpLoad`, `LuaUpload`, `PointTableUpLoad` raise `AssertionError` if called.**
+- Tests (`sw/tests/test_robot_fr5.py`):
+  - each wrapper calls the right SDK method with the right arguments; non-zero codes raise `FairinoError` with the call name; `(code, value)` unpacking;
+  - `speed(pct)` restores the safe default on normal exit and on an exception, and tolerates a failing restore;
+  - `ensure_auto` calls `Mode(0)`, waits (monkeypatch `time.sleep`), and raises if `robot_mode` stays 1;
+  - `upload_file` with a local TCP listener on an ephemeral port standing in for 20010 (make the port a constructor argument): listener starts 100 ms after `FileUpload` → success; never starts → `stage="connect"`; `FileUpload` non-zero → `stage="request"` and no connect; reply not `SUCCESS` → `stage="transfer"`; MD5 differs → `stage="verify"`; the listener receives exactly the framing; type 5 → `ValueError` before any call;
+  - `file_md5` returns `None` for code 4.
+- Done when: the gate passes.
 
-### Phase 4: Backend, trajectory file and CLI (`backend.py`, `traj_file.py`, `motionctl.py`); needs Phase 0 results
-- **Work:**
-  - `traj_file.write/read` and `TrajectoryFileBackend` per the Q2/Q3 results (or `LuaBackend` if Phase 0 chose it).
-  - `motionctl` commands per Module interfaces:
-    - `compile` refuses when `validated.json` is missing, or when its `design_sha256` or `camera_tool_sha256` doesn't match the current files.
-    - `rehearse` uploads as `tmp_<name>.txt`, runs each requested ovl after an operator confirmation prompt (`input()`), logs `jt_cur_pos`/`tl_cur_pos` at the state-update rate to `sw/robot/logs/rehearsal/<name>/`, prints tracking, timing and roll statistics against the contract table, writes a rehearsal summary, and deletes the temporary file afterwards.
-    - `publish --ovl N` follows § Atomic publishing and requires a rehearsal at ≥ N.
-    - `verify` regenerates and compares, as described.
-  - Update `.gitignore` per § Which files are committed.
-- **Tests:**
-  - `sw/tests/test_robot_traj_file.py`: write → read round-trip with exact numeric precision; the header and line count match the sample count; the format matches the Phase 0 excerpt (golden string).
-  - `sw/tests/test_robot_motionctl.py`, with `FakeRobotClient` and a `tmp_path` motions dir:
-    - `validate` writes `validated.json` only on pass;
-    - **stale and mismatched metadata** (each expects a refusal with a named reason): `design_sha256`, `camera_tool_sha256`, `validated_sha256`, tool id, TCP offset, sample period, duration, `num_points`, start joints (vs the first validated sample), controller filename, and `approved_ovl` above the rehearsed ovl;
-    - `publish` writes `motion.json` with the correct md5, start_joints (= first sample's joints), duration and rehearsal summary;
-    - **atomic publish with failure injection at each step:** a bad temporary upload leaves nothing changed; a bad final upload leaves the old metadata as `.prev` and no new `motion.json`; a failure writing the metadata leaves no half-written file; re-running `publish` after each failure succeeds;
-    - `remove` deletes the controller file and `motion.json`;
-    - `list` reports a controller file without a `motion.json`, a `tmp_*` orphan, and the reverse;
-    - `verify` warns (not fails) on an md5 difference with an unchanged design hash;
-    - exit code 1 with a message on `FairinoError`.
-- **Done when:** the gate passes, and `plan`/`validate`/`compile`/`rehearse`/`publish` complete on the real robot for one template motion in each orientation mode (manual, operator present).
+### Phase 3: validator (`validate.py`)
+- Work: as in § Module interfaces. IK runs sample by sample: the first with `seed_joints` as reference, each next one with the previous solution. At 8 ms a 4 s motion is 501 IK calls (about a second or two over XML-RPC); print progress every 500 samples.
+- Defaults: joint limit margin 2° inside the soft limits; FK round trip on every 10th sample.
+- Tests (`sw/tests/test_robot_validate.py`, with a `FakeKinematics`): a good angles design and a good target design pass; IK `None` at one sample fails `check_ik` naming the index and time; a 30° jump on one joint fails `check_joint_steps`; a joint beyond its soft limit fails; a too-fast design fails speed/acc with peaks reported; a point outside the box fails `check_workspace`; an overshooting `vel` override fails `check_path_overshoot`; pan turn and target geometry failures; wrong active tool and non-zero install angle fail; an FK offset fails `check_fk_roundtrip`; the report serialises to the `validated.json` schema.
+- Done when: the gate passes.
 
-### Phase 5: `MotionRunner` (`motion_runner.py`); needs Phase 0 results
-- **Work:** as specified in Threading, Stop and shutdown, and Controller-file verification.
-  - `connect_and_check` runs once and checks, per motion: the remote MD5 per the verification table; the tool offset against `camera_tool.yaml` and `motion.json`; `MotionConfig.check_consistent()`. It also opens and tests the stop channel.
-  - `load` calls the backend's load, then verifies `GetTrajectoryPointNum() == num_points`.
-  - `move_to_start` runs `move_j(start_joints, tool, move_to_start_speed_pct)` inside `speed()`.
-  - `at_start` compares `jt_cur_pos` with `start_joints` (max absolute difference ≤ `start_tolerance_deg`).
-  - `run` re-loads first if Q4 says a `MoveJ` invalidates the loaded trajectory, then starts the motion at the approved ovl inside `speed()`, with the watchdog.
-- **Tests** (`sw/tests/test_motion_runner.py`, with `FakeRobotClient`):
-  - **verification outcomes**, each disabling the motion with its own reason: OK, file missing, SDK error on the hash call (retried twice, then disabled), empty hash, non-hex hash, mismatching hash (never retried), tool mismatch, and an inconsistent `motion.json`;
-  - **no runtime method calls `ComputeFileMD5` or uploads anything** after `connect_and_check` (the check happens once only);
-  - `load` never moves the robot (no MoveJ or MoveTrajectoryJ calls), and a point-count mismatch fails the load and marks the motion invalid for the session;
-  - `move_to_start` sets speed 10 before `MoveJ`, with the motion's start joints, and restores the safe default afterwards;
-  - `at_start` is true within tolerance, false just outside it, and reports the max error;
-  - `run` resolves when the fake's motion completes, and raises `FairinoError` when an error code appears mid-motion; speed is restored after completion, error, stop and timeout;
-  - **stop channel:** a second connection that can't be opened disables every motion with "no independent stop channel"; `stop()` while `run` is in progress calls `StopMotion` on the second connection immediately (not queued behind the worker);
-  - **stop failures:** `StopMotion` returning errors is retried 3 times, then `PauseMotion` is tried, then the state is `UNKNOWN`; a stop that is confirmed (joint speeds reach 0) gives `FAULT`/`IDLE`; a stop that isn't confirmed within the timeout gives `UNKNOWN`;
-  - **blocked worker:** a fake that blocks inside `MoveTrajectoryJ` forever: the watchdog fires at the deadline, `stop()` runs, the future fails with `MotionTimeout`, and the runner does not hang the test process (daemon thread);
-  - **`motion_done` never set:** the run times out the same way;
-  - **`close()`** during a pending run: stops the robot, rejects new jobs, joins within the timeout, and is idempotent;
-  - `stop()` is idempotent and never raises;
-  - the methods for a motion that failed the check raise `ValueError`.
-- **Done when:** the gate passes.
+### Phase 4: TPD writer, `motionctl`, first robot test ← **milestone**
+- Work: `tpd_file.py`; `motionctl` commands `new`, `pose`, `plan`, `validate`, `compile`, `upload`, `play`.
+- `play NAME --ovl N` sequence (copy `sw/fairino_basic_query.py`):
+  1. Check the local build file's MD5 equals the controller's (`file_md5`); if not, tell the operator to run `upload`.
+  2. `load_tpd(tpd_name)`; `tpd_start_pose` equals the first row's pose (0.01).
+  3. Print the current joints and the start joints. Ask `Type YES to continue:`. Anything else aborts.
+  4. `ensure_auto()`; `speed(10)`: `move_j(start_joints, tool_id, 10)`.
+  5. `Press Enter to play:`. Then `load_tpd` again (cheap insurance), `move_tpd(tpd_name, 0, N)`. Print how long `move_tpd` took to return.
+  6. Wait for completion as in § Motion runner, with the watchdog; print the elapsed time vs `duration_s · 100 / N`.
+  7. Ctrl-C at any point → `stop()`. Always reset speed and `close()` in `finally`.
+- Tests: `sw/tests/test_robot_tpd_file.py`: write → read round trip; header `N,1,8,0,0,0` and rows ending `8,0,17` for period 8 and tool 0; header `N,1,2,0,0,0` and `2,0,17` for period 2; 4 decimals; **golden test: writing the verified recording's first data row (§ TPD file format example; embed the line in the test, do not read `sw/tracktestpc.txt`) with N = 1 reproduces `1,1,2,0,0,0` and that row byte for byte**; length mismatch raises. `sw/tests/test_robot_motionctl.py` with `FakeRobotClient` and `tmp_path`: `new` writes a loadable design; `validate` writes `validated.json` only on pass; `compile` refuses a stale `design_sha256`; `upload` calls `upload_file` then `LoadTPD("traj/motion_<name>")`; `play` aborts without YES and never calls `MoveJ`/`MoveTPD` then; `play` with YES calls `Mode(0)`, `MoveJ(start_joints, …)`, `MoveTPD("traj/motion_<name>", 0, N)` in that order; Ctrl-C (raise `KeyboardInterrupt` from the fake) calls `StopMotion`.
+- **Operator acceptance on the real robot** (cell clear, e-stop in hand):
+  1. Jog the robot with the pendant to a pose where the flange points forward and level. `motionctl pose` → copy the position, pan, tilt into `first_test`'s first keyframe and the joints into `seed_joints`; second keyframe = 100 mm higher.
+  2. `motionctl validate first_test`, `compile first_test`, `upload first_test`.
+  3. `motionctl play first_test --ovl 25`: the robot moves to the start, then rises 100 mm in about 16 s (4 s at 25%) without turning the flange. **Time it.** About 4 s instead of 16 s means the controller ignored the 8 ms period: apply the fallback in § TPD file format. (This first test is small and slow on purpose, so a 4× speed error stays safe.)
+  4. Repeat with `sweep` adapted to the cell, at `--ovl 25` then `--ovl 100`.
+  5. Record in § History: did it play at 8 ms (and which fallback, if any); `move_tpd` return time (decides the stop design in Phase 5); measured vs expected duration; whether the camera stayed visually level.
+- Done when: the gate passes and step 3 succeeds on the robot.
 
-### Phase 6: Livestream integration (`sw/livestream.py`, `sw/robot/ui_state.py`)
-- **Work:**
-  - `ui_state.py` as in § UI state machine.
-  - `main()`: `--robot-ip` (overrides config) and `--no-robot`. Build a `MotionRunner` unless `--no-robot` is given, and pass it to `LivestreamApp(..., motion_runner: MotionRunner | None, motions: dict[str, MotionConfig])`.
-  - **Startup:** `connect_and_check` runs via `_run_robot`. The results enable or disable each motion button per § Disabled-motion behaviour. If the saved `"motion"` is OK, `load()` it.
-  - **Motion row** (`_build_motion_row`): one `tk.Button` per motion plus "No motion". The active one is highlighted (sunken relief and colour).
-    - Click → `messagebox.askyesno("Change motion", f"Change the motion to '{name}'?")`.
-    - Yes (and the state is still `IDLE`) → save `"motion"` and call `load(name)`; the status shows "Motion '{name}' loaded. Press Move to Start." **The robot does not move.**
-    - No, or clicking the active motion → nothing happens.
-  - **"Move to Start" button**, packed next to "Start recording" in the `controls` frame:
-    - Click → `move_to_start(name)`; the status shows "Moving to start of '{name}' (10%)…".
-    - Disabled for "No motion" and in every state except `IDLE`.
-    - Highlighted (orange) when `at_start` is false, re-evaluated in `_update_controls` and after each robot operation.
-  - **Record** and the rest of the flow follow the transition table. The first step of Record with a motion selected is `at_start(name)`; with "No motion", Record is unchanged.
-  - **Stop**, `_on_close`, a GoPro start/stop error, or a robot error: per the table and races. `_on_close` also cancels pending `after` handles and calls `motion_runner.close()`. Read the existing `GoProController.shutdown` first and make sure a recording in progress is stopped on close.
-  - `_update_controls` derives every button state from the `UiState`.
-- **Tests:**
-  - `sw/tests/test_robot_ui_state.py` (no Tk): **table-driven over every (state, event) pair**: the listed transitions return the expected new state and actions; every unlisted pair leaves the state unchanged and returns no actions.
-  - Extend `sw/tests/test_livestream_ui.py`, following its existing `root`/`app` fixture and `FakeController` patterns, plus a `FakeMotionRunner` that records calls and returns pre-resolved Futures (monkeypatch `messagebox.askyesno`):
-    - with `--no-robot` (runner None), no motion row and no Move to Start button are built, and the existing tests pass unchanged;
-    - the buttons reflect the startup check: failed motions are visible but disabled, with the reason in the status bar on mouse-over; an invalid saved motion resets to "No motion" in memory while the config file keeps the saved value; an unreachable robot disables every motion;
-    - confirming the dialog calls `load` and saves the config, and **does not call** `move_to_start` or `run`; declining changes nothing; clicking the active motion doesn't open the dialog; **a state change while the dialog is open discards the choice**;
-    - Move to Start calls `move_to_start` with the selected name;
-    - Record with `at_start` false doesn't call `controller.start_recording` and sets the status message;
-    - Record with `at_start` true starts recording, and `run` is called only after the recording-started callback plus pre-roll (drive `root.after` with `root.update()` or a monkeypatched `after`);
-    - motion completion triggers stop recording when `auto_stop_after_motion` is set;
-    - **races:** close during pre-roll cancels the `after` handle so `run` is never called, and stops the robot and the recording; a `motion_done` arriving after Stop is ignored and the recording stops exactly once; a motion failure while recording stops the robot and the recording and keeps the clip; a failing `run()` after a successful GoPro start does the same; a failing GoPro start never calls `run`; a stale `op_id` result is ignored;
-    - Stop during a motion calls `runner.stop()` before `stop_recording`;
-    - `UNKNOWN` runner state disables the motion controls and shows the banner, and plain recording still works;
-    - `_on_close` calls `stop()` and `close()`.
-- **Docs:** add a "Robot motions" section to `README.md` covering the workflow (`new` → `plan` → `validate` → `compile` → `rehearse` → `publish`), camera calibration, operating safety rules (the app must not run while publishing; nobody in the cell during rehearsal), and the config keys.
-- **Done when:** the gate passes, and the end-to-end check in Verification succeeds on hardware.
+### Phase 5: `publish` and `MotionRunner`
+- Work: `motionctl publish NAME --ovl N`: requires the build file and `validated.json` to be current; uploads; verifies MD5; `LoadTPD` + start pose check; writes `motion.json` via a temporary file and `os.replace`. `motionctl list`: published motions and whether the controller file's MD5 matches. `MotionRunner` as in § Motion runner and § Stop and shutdown. `connect_and_check` per motion: `check_consistent()`, controller MD5 equals `motion.json.md5` (reasons: `file missing on controller`, `md5 mismatch`, `hash query failed (code N)`).
+- Tests (`sw/tests/test_motion_runner.py`, `FakeRobotClient`): each startup reason disables only that motion; `load` never moves the robot and checks the start pose; `move_to_start` sets speed 10, calls `MoveJ` with the start joints, restores speed; `at_start` true inside the tolerance, false just outside, returns the max error; `run` resolves when the fake's `motion_done` goes 0 → 1, raises when it never goes 0, raises on a non-zero `main_code`; the watchdog fails a run whose `motion_done` never returns to 1 and calls `StopMotion`; `stop()` never raises and is idempotent; `close()` during a run stops and rejects new jobs; a blocked fake RPC does not hang the test process.
+- Done when: the gate passes and `motionctl publish first_test --ovl 25` succeeds on the robot.
+
+### Phase 6: livestream integration
+- Work: `ui_state.py` (§ UI state machine). `main()`: `--robot-ip`, `--no-robot`. Build a `MotionRunner` unless `--no-robot`; pass it and the loaded `motion.json` configs to `LivestreamApp`.
+  - Startup: `connect_and_check` via `_run_robot`; enable/disable buttons; if the saved motion is OK, `load()` it.
+  - Motion row: one button per motion plus "No motion"; the active one highlighted. Click → `askyesno("Change motion", …)`; Yes (state still `IDLE`) → save `"motion"` and `load(name)`. The robot does not move.
+  - "Move to Start" button next to "Start recording": `move_to_start(name)`; enabled only in `IDLE` with a motion selected; orange when `at_start` is false.
+  - Record with a motion: `at_start` first; then the transition table. Stop, close and errors per the table. `_on_close` cancels `after` handles and calls `runner.close()`; make sure a recording in progress is stopped (read `GoProController.shutdown` first).
+- Tests: `sw/tests/test_robot_ui_state.py`, table-driven over every (state, event) pair. Extend `sw/tests/test_livestream_ui.py` with a `FakeMotionRunner` returning pre-resolved futures (monkeypatch `messagebox.askyesno`): `--no-robot` builds no motion row and old tests pass; confirm → `load` + config saved, never `move_to_start`/`run`; decline → nothing; Move to Start calls `move_to_start`; Record not at start → no recording; Record at start → `run` only after recording started + pre-roll; motion done → recording stops when `auto_stop_after_motion`; close during pre-roll → `run` never called; Stop during a motion → `runner.stop()` before `stop_recording`; stale `op_id` ignored.
+- Docs: "Robot motions" section in `README.md`: workflow `new → pose → validate → compile → upload → play → publish`, safety rules (nobody in the cell; e-stop in hand; the app must not run while publishing), config keys.
+- Done when: the gate passes and § Verification step 3 succeeds on the robot.
+
+## Deferred (do not start; the user will ask)
+| Item | Notes for later |
+|---|---|
+| Camera tool calibration (`camera_tool.yaml`, tool ≠ 0, payload) | `CameraTool` exists in `schema.py`. Old procedure: `git show efdd2df:docs/design/feature/fairino-python-basic-control.md`, § Camera tool calibration. |
+| Measuring roll, tracking and timing on the robot | Would log `tl_cur_pos` during `play`. |
+| Stop latency, independent stop channel, stop confirmation | A second `RPC` connection's `StopMotion` did not interrupt a `MoveJ` on the simulator. |
+| Singularity thresholds, manipulability, IK configuration signature, wrist margin | `check_joint_steps` and the speed limits catch the practical failures for now. |
+| Re-confirming the Euler convention numerically on the real robot | Visual check in Phase 4 is enough for now. |
+| Other periods (2, 4 ms) except as the 8 ms fallback; motions > 20 s | — |
+| Rehearsal ramps, approval evidence, atomic publish with temporary files, `verify` | — |
+| `MoveTPD` blend = 1, `ovl` time-scaling accuracy | — |
+| Anything with `LoadTrajectoryJ`/`MoveTrajectoryJ`, Lua programs, `ServoJ` | **Not planned at all.** |
 
 ## Critical files
-- **New:**
-  - `sw/robot/__init__.py`, `frames.py`, `pose.py`, `path.py`, `schema.py`, `templates.py`, `validate.py`, `fr5.py`, `traj_file.py`, `backend.py`, `ui_state.py`, `motion_runner.py`, `motionctl.py`, `spike/*.py`
-  - `sw/robot/camera_tool.yaml`
-  - `sw/robot/motions/<name>/{design.yaml,motion.json}` (generated and local files are git-ignored)
-  - `sw/tests/fakes/fake_robot.py`
-  - `sw/tests/test_robot_{pose,frames,path,schema,validate,fr5,traj_file,motionctl,ui_state}.py`, `sw/tests/test_motion_runner.py`
-- **Modified:** `sw/livestream.py`, `sw/tests/test_livestream_ui.py`, `pyproject.toml` (`scipy`, `pyyaml`, `hardware` pytest marker), `.gitignore` (generated and local robot files), `README.md`.
-- **Already added:** `codegraph.json` (index scope for the SDK).
-- **Reference (read, don't modify):**
-  - `third_party/fairino_sdk/linux/fairino/Robot.py`
-  - `third_party/fairino_sdk/linux/example/TestUploadTrajectoryJ.py` and `servo.py`
-  - `sw/fairino_basic_query.py`
-  - the existing `_run`/`_events`/`_poll` pattern and `save_config` in `sw/livestream.py`
+- New: `sw/robot/tpd_file.py`, `validate.py`, `fr5.py`, `ui_state.py`, `motion_runner.py`, `motionctl.py`; `sw/robot/motions/<name>/{design.yaml,motion.json}`; `sw/tests/fakes/fake_robot.py`; `sw/tests/test_robot_{fr5,validate,tpd_file,motionctl,ui_state}.py`, `sw/tests/test_motion_runner.py`.
+- Modified: `sw/robot/schema.py`, `sw/robot/templates.py`, `sw/tests/test_robot_schema.py`, `sw/livestream.py`, `sw/tests/test_livestream_ui.py`, `.gitignore`, `README.md`.
+- Reference (read, don't modify): `sw/fairino_basic_query.py`, `sw/robot/spike/file_port_probe.py`, `sw/robot/spike/tpd_upload_check.py`, `third_party/fairino_sdk/linux/fairino/Robot.py`. `sw/tracktestpc.txt` is a local, untracked copy of a pendant recording (1.3 MB); tests must not depend on it.
 
 ## Verification
-1. **Automated:** `uv run pytest sw/tests/ -q` and ruff are green after every phase (gate rule).
-2. **Calibration:** run `calibrate_camera.py`; the horizon residual is ≤ 0.2°, the pointing residual ≤ 0.5° and the optical-centre error ≤ 3 mm, and `camera_tool.yaml` is approved.
-3. **Offline:** `motionctl new demo --template sweep`, then `plan demo --preview` and `validate demo`. Review the peak joint speeds, `max_roll_deg` and the wrist/singularity margins in the report. Repeat with a target-mode design (fixed target, then a per-keyframe target trajectory) and review `max_pointing_error_deg`.
-4. **Robot, nobody in the cell, e-stop at hand:** `compile demo`, then `rehearse demo --ovl 10,25,50,100`. At every level the measured roll stays within ±0.2°, tracking within the contract (3 mm / 0.3°) and timing within max(2%, 40 ms). Then `publish demo --ovl 100`, and `verify demo`.
-5. **End to end in `livestream.py`:**
-   - The startup check enables `demo`.
-   - Select it and confirm: the motion loads and the robot does not move.
-   - Press Record: it is refused with the "not at start" message.
-   - Press Move to Start: the robot moves at 10%.
-   - Press Record: the check passes, the GoPro records, the motion runs after the pre-roll, and recording auto-stops.
-   - Check the clip for a level horizon (and, for the target design, that the subject stays centred).
-   - Press Record again without Move to Start: it is refused.
-   - Repeat with Stop pressed mid-motion: the robot halts immediately and the recording stops.
-   - Close the app during a motion: the robot halts and the recording stops.
-6. **Failure handling:**
-   - Modify `motion.json`'s md5 and restart: `demo` is disabled with "md5 mismatch".
-   - Delete the controller file and restart: "file missing on controller".
-   - Unplug the robot's network during a motion: the watchdog stops it (or the app reports UNKNOWN) and the app still exits cleanly.
-   - Interrupt a `publish` between steps 3 and 5: the app disables the motion, and re-running `publish` fixes it.
+1. Automated: the gate after every phase.
+2. Robot, Phase 4: `first_test` (8 ms) plays at `--ovl 25` in about 16 s; the flange rises without turning; the camera stays visually level.
+3. End to end in `livestream.py` (Phase 6): the startup check enables `first_test`; selecting it loads it without moving; Record before Move to Start is refused; Move to Start moves at 10%; Record starts the GoPro, the motion runs after the pre-roll, recording auto-stops; Stop mid-motion halts the robot and stops recording; closing the app during a motion halts the robot.
+4. Failure handling: edit `motion.json`'s md5 → the motion is disabled with "md5 mismatch"; delete the controller file → "file missing on controller".
 
-## Phase 0 results (simulator, 192.168.58.2)
+## History (facts, not instructions)
+Full earlier text of this document: `git show efdd2df:docs/design/feature/fairino-python-basic-control.md`.
 
-Run on the Fairino simulator with the probes in `sw/robot/spike/`. The simulator behaves like the robot for the SDK calls below, but it does **not** reproduce trajectory playback or file storage, so several questions stay open and must be re-run on the real robot.
-
-| # | Result | Status |
-|---|---|---|
-| Q1 | Rotating J1 by +10° changed TCP rz by +9.98° and rotated the TCP xy by +9.98° about base z. The manual defines rx/ry/rz as rotations about **fixed** axes. Convention confirmed: scipy `"xyz"` (lowercase, extrinsic). Probe: `euler_probe.py`. | **Confirmed** |
-| Q2 | `TrajectoryJUpLoad` returned 0 for some files and -1 or a connection reset for others (flaky). `LoadTrajectoryJ` returned **8 for every file tried**, including a file that does not exist, for the Cartesian, joint, comma, tab, timed and headed formats. `GetTrajectoryStartPose` also returned 8. TPD recording (`tpd_record_probe.py`) needs manual mode plus drag-teach; with no hand motion it stored **zero points** and `LoadTPD` returned 0 with start pose zeros. Format undetermined. | **Blocked on simulator** |
-| Q3 | Depends on Q2 (no trajectory could be loaded). | **Blocked** |
-| Q4 | Depends on Q2. | **Blocked** |
-| Q5 | A `MoveJ` was running on connection A. A second connection B called `StopMotion`. The move ran to its target (J1 = 60.0°) and B's stop did not interrupt it. Two possibilities: the simulator serialises requests, so B's call waited behind A's move, or B's call was ignored. Either way, the independent stop channel is **not** demonstrated. Probe: `stop_channel_probe.py`. | **Failed in simulator; needs hardware test** |
-| Q6 | Needs trajectory playback or dense streaming. | **Blocked** |
-| Q7 | `ComputeFileMD5` returned error 4 with no hash for **every** path, including `test.lua`, which the controller lists. The controller-side hash is unusable on the simulator. | **Blocked on simulator** |
-| Q8 | Soft limits (deg): J1 ±175, J2 −265…85, J3 ±160, J4 −265…85, J5 ±175, J6 ±175. Install angle (0, 0). Tool 0 offset all zeros. State period 8 ms. Singularity thresholds not measured. | **Partial** |
-
-Other observations:
-- **Simulator speed is not real time.** At `SetSpeed(5)` a 60° joint move took more than two minutes. Speed limits from the manual cannot be checked on the simulator.
-- **Robot state at the end of Phase 0:** home pose, `robot_state` 1 (stopped), `motion_done` 1, error codes 0, auto mode.
-- **Consequence for the design:** the backend decision (A, B or C in § Backend and timing contract) cannot be made on the simulator. The stop-channel assumption (Threading / Stop and shutdown) is unverified and must be treated as failing until a hardware test shows otherwise. The design's fail-closed rule for the stop channel stays in force.
-
-## Implementation
-
-This section records, per phase, what differed from the plan during implementation and what was done about it. Each phase appends its entry when it finishes.
-
-### Phase 0 (partial): hardware spike, 2026-11-24
-
-Status: **partial.** Q1 and Q7 answered; Q2 and Q3 partly answered (the file exists and is found, but is rejected by LoadTrajectoryJ); Q4 not run; Q5 postponed by the user; Q6 and Q8 not run; camera calibration not run. Commits: `1526e5a` (spike scripts and first results).
-
-Controller identity: the probes ran against `192.168.58.2`, which the design calls the simulator. The user reports that the trajectory `tracktest1` was recorded on the real robot. Confirm which controller answered before treating any number below as robot evidence.
-
-| Item | Plan assumed | What happened | Action taken |
-|---|---|---|---|
-| Q1 Euler convention | Unknown, to be measured | A 10° J1 move changed TCP rz by 9.98°. Fixed-axis XYZ (`'xyz'`) is consistent with that on the simulator. | Recorded as the value of `SDK_EULER` in `pose.py`. Not yet confirmed on the real robot. |
-| Q2 TPD recording | `SetTPDStart` in auto mode | Auto mode returned 133. `DragTeachSwitch(1)` returned -1 in auto mode. Recording then returned 0 but stored zero points because no hand motion occurred. | Switched to manual mode (`Mode(1)`) before drag teach. The probe is `sw/robot/spike/tpd_record_probe.py`. |
-| Q2 download path | `FileDownload` then the data socket works | `__FileDownLoad` requires the destination to exist (-6 client side). Then the controller reported no file (-7) because the recording was empty. A second attempt returned -1 with 0 bytes written. | Created the destination file first. The -1 transfer failure is **not diagnosed**. |
-| Q2 data ports | Reliable transfers | Ports 20010 and 20011 refuse connections when idle (observed). Their behaviour during a transfer is inferred, not observed. `TrajectoryJUpLoad` returned -1 on most attempts: 1 success in 3 in one run, and each layout needed 2 tries in another. | **Superseded:** the cause is a connect race in the SDK, not a flaky link. Retrying the SDK call is not the fix; see § Controller file transfer. |
-| Q7 `ComputeFileMD5` | Works for any path | My earlier report said the function did not exist. It does (`Robot.py:4104`). Error 4 means "not found". Existing file: `(0, md5)`. | Corrected in the summary. Still open: the error code for an unreadable file. |
-| Q2/Q3 `LoadTrajectoryJ` | Works on the file the controller created | Error codes resolved: **8 = file not found, 4 = file found but rejected** (later checked against the protocol manual, Table 10-1: 4 = "parameter value abnormal", 8 = "tpd file does not exist"). Earlier "8 for every file" was all not-found paths. `tracktest1` at `/fruser/tracktest1.txt` returns 4. The file is at that path (MD5 `442c28842962b0e814d6ff9aa151a9f8`), not under `/fruser/traj/`. | Probe rewritten to use `/fruser/<name>.txt`. |
-| Q2 file format | Documented in the manual | The manual does not document the layout. `GetTrajectoryStartPose` on `tracktest1` returned `[11520, 0, 0, 0, 0, 0]`, which means the controller read the header line `11520,1,2,0,0,0` as the first pose. This is a hypothesis, not a confirmed cause. | Open. See the layout matrix below. |
-
-Layout matrix (all rejected with 4, for `opt` 0 and 1, `ovl` 100 and 10, paths `/fruser/traj/` and `/fruser/`):
-
-| Layout | Result |
-|---|---|
-| `tracktest1` as recorded (header `11520,1,2,0,0,0` + 15 columns per row) | 4 |
-| 3 rows, 6 columns, no header | 4 |
-| 3 rows, 15 columns, no header | 4 |
-| header `3,1,2,0,0,0` + 15 columns | 4 |
-| header `3,1,2,0,0,0` + 6 columns | 4 |
-| count `3` + 6 columns | 4 |
-
-Interpretation: the controller finds every uploaded file and rejects every layout we tried, so the rejection is about content or format, not the path. The format has not been identified. Changing `opt` or `ovl` did not help.
-
-Other deviations:
-- `ComputeFileMD5` and `LoadTrajectoryJ` return a code for "not found" (4 and 8 respectively). Callers must check both code and value. `fr5.py` must not treat 4 as "generic error" for MD5 calls. Note this in the `FR5` error contract.
-- The `tracktest1` file contains 15 numbers per row. By inference from the values, columns 1–6 are joint angles in degrees and columns 7–12 are TCP pose (mm and degrees). Columns 13–15 (`2, 0, 17`) are constant across the file and are not identified. Not verified against the controller's own readout.
-- Q4, Q5, Q6, Q8 and the camera calibration were not run. Q5 is postponed by the user.
-- The simulator needs about two minutes for a 60° move at 5% speed. Phase 0 timing numbers are therefore not usable for the timing contract. The real robot is needed for that.
-
-Action required from the user to close Q2/Q3:
-1. Confirm which controller answered (simulator or real robot).
-2. Create a trajectory with the teach pendant or web UI **trajectory playback** function, then tell me the name and where the UI shows it. Some UIs write playback files to `/fruser/traj/` and recording output elsewhere. We need the file that the controller's own playback function loads.
-3. If the UI offers "export", send that file. It shows the native format directly.
-
-### Phase 1: pure geometry and schemas, 2026-11-24
-
-Status: **complete.** Commit `36d0914`. 87 robot tests pass. The full gate was 352 passed and 6 skipped at the time. Ruff reports 183 errors across the existing repo, all pre-existing. The new files pass ruff.
-
-| Item | Plan | What happened | Action taken |
-|---|---|---|---|
-| Roll metric | Roll from the image-right axis | Measuring roll about the image-right axis underestimated true roll at non-zero tilt. | Changed to optical-axis roll relative to `u = normalise(z_cam × z_base)`. Recorded in the design doc. |
-| Roll sign | Not specified | The first reference used `-x_cam` and gave the wrong sign. | Reference changed to `z_cam × z_base`, measured about `z_cam`. |
-| Acceleration continuity test | Check finite-difference acceleration at keyframes | The test failed because of jerk discontinuity at keyframes, which is a finite-difference artifact. | Test now evaluates the second derivative of each segment polynomial at its ends. |
-| Pointing error | `acos(dot)` | Precision loss near 0. | Replaced with `atan2(|cross|, dot)`. |
-| Locality test | Float equality | Float comparison. | Use `pytest.approx`. |
-| Lint | Clean | E501 in `schema.py` and the spike scripts. | Wrapped and reformatted. |
-| Dead code | None expected | `keyframe_in_base`, `_single_keyframe_design`, a `vel_key` branch, `or True` assertions, `if False`. | Removed. |
-
-Open risk carried forward: the roll and pointing results are exact by construction and tested offline. They say nothing about the controller's own interpolation. That is measured only in Phase 0 Q6 and in rehearsal.
-
-### Next phase
-
-Phase 2 (validator) has not started. It is hardware-free and does not depend on the Q2/Q3 format. It can start now, but the trajectory format must be settled before Phase 4 writes files.
-
-### Phase 0 update: TPD recordings use the TPD API, not TrajectoryJ
-
-- **Finding.** `tracktest1` is a TPD recording (`SetTPDParam`/`SetTPDStart`), not a TrajectoryJ control-point file. The layout is `N,1,2,0,0,0` followed by N rows of 15 columns: 6 joints (deg), 6 TCP pose values (mm, deg), and `k,0,17`. The header `N` equals the data row count in all 12 backup files checked. `LoadTrajectoryJ` rejected it with error 4 for every layout tried. This was a wrong-loader error, not a format problem.
-- **Manual.** TPD playback is `LoadTPD(name)` → `GetTPDStartPose(name)` → `MoveTPD(name, blend, ovl)`, where `name` has no extension. The manual reference is Chapter 2 §2.1.9.6–2.1.9.8 and the TPD recording example.
-- **Action.** `LoadTPD("tracktest1")` returned 0 and `GetTPDStartPose` returned the first row's TCP pose, so the file parses. No motion was sent. `MoveTPD` has not been run and needs operator confirmation.
-- **Consequence.** The `TrajectoryJ` file-format work (Q2/Q3 as written) applies only to control-point files. The backend decision should compare `MoveTPD` against `MoveTrajectoryJ` with a control-point file the robot has built, not with a converted TPD file.
-
-### Phase 0 update: uploading files and loading them as TPD, 2026-11-24
-
-Goal: upload `sw/tracktestpc.txt` (a byte-identical copy of the pendant recording `tracktest1`) from Python, load it, and check it against the file. No motion was sent in any of these steps.
-
-**Status: solved for the TPD route, end to end on the real robot.** The file uploads, lands at `/fruser/traj/tracktestpc.txt`, loads with `LoadTPD("traj/tracktestpc")`, and its start pose matches the file. Playback confirmed by the operator: `sw/fairino_basic_query.py --play` with `NAME = "traj/tracktestpc"` (`MOVE_OVL` 50, `PLAY_OVL` 50, `BLEND` 0) moved to the start pose and `MoveTPD("traj/tracktestpc", 0, 50)` replayed the track.
-
-**Correction.** An earlier version of this section said the controller's file service was down, because ports 20010/20011 refused connections. That was wrong. The ports are closed while idle by design. The controller opens 20010 only after an upload request.
-
-#### How file upload works
-- Every SDK transfer is a handshake. First an XML-RPC call on 20003, then a TCP socket. Upload is `FileUpload(type, name)` then port 20010 (`Robot.py:7193`, `7197`). Download is `FileDownload` then port 20011 (`Robot.py:7123`).
-- The protocol manual (`third_party/fairino_sdk/Collaborative Robot Controller Communication Command Protocol User Manual.pdf`) documents this. It is a separate PDF from the SDK manual. Its §5.1.50 `FileUpload()` (command 1285) says "Use port 20010 to upload files". Its file types include 0 = Lua file and 20 = Trajectory J file; the others are firmware and upgrade packages. Its §5.1.32 lists the always-open ports as 20002, 20004, 8083 and 8080.
-- Observed on the real robot: after `FileUpload(20, name)` returns 0, port 20010 accepts a connection about 50 ms later. A connect made immediately is refused.
-
-#### Why `TrajectoryJUpLoad` returned -1
-- **Root cause: a race in the SDK.** `__FileUpLoad` makes exactly one connect attempt, immediately after `FileUpload` returns (`Robot.py:7202-7206`). A refused connect fails at once, so the 20 s socket timeout does not help, and the function returns `ERR_OTHER` (-1). This explains every -1 so far, and the occasional successes were runs where the listener happened to be up in time.
-- -1 from `__FileUpLoad` has three possible sources, and the SDK does not say which: the `FileUpload` RPC returning non-zero (`Robot.py:7194`), the connect failing, or the transfer finishing without a "SUCCESS" reply (`Robot.py:7230-7233`).
-- **Fix:** `sw/robot/spike/file_port_probe.py`. It calls `FileUpload`, retries the connect every 50 ms for up to 5 s, sends the file with the SDK's framing, and reports which step failed. The upload returned `SUCCESS`, and the controller's `ComputeFileMD5` matched the local MD5 (`442c28842962b0e814d6ff9aa151a9f8`).
-- **Side effect to avoid:** calling `FileUpload` and then connecting and closing without sending leaves an **empty file** at the target path (observed: MD5 of zero bytes, `d41d8cd98f00b204e9800998ecf8427e`). The probe now always sends once connected.
-
-#### Where files land
-| How it got there | Path | Evidence |
-|---|---|---|
-| Pendant TPD recording `tracktest1` | `/fruser/tracktest1.txt` | `ComputeFileMD5` matches the local copy. Not found under `/fruser/traj/`, `/fruser/tpd/` or `/fruser/TPD/`. |
-| `FileUpload` type 20 (Trajectory J) | `/fruser/traj/<name>` | `ComputeFileMD5` matches after upload. |
-| `FileUpload` type 0 (Lua) | not in `/fruser/` until `LuaUpLoadUpdate` | Upload returned `SUCCESS`, but `/fruser/tracktestpc.txt` is not found. `LuaUpLoadUpdate("tracktestpc.txt")` returned `[-1, 'LUA FILE SIZE IS TOO LARGE!']` for the 1.3 MB file. The Lua route cannot carry TPD recordings of this size. |
-
-#### Loading the uploaded file
-| Call | Result |
-|---|---|
-| `LoadTrajectoryJ("/fruser/traj/tracktestpc.txt", 100, opt)`, opt 1 and 0 | 4. `GetTrajectoryStartPose` returned `[11520, 0, 0, 0, 0, 0]` and `GetTrajectoryPointNum` 0: the controller reads the TPD header as a point. A TPD recording is not a TrajectoryJ file, as found earlier. |
-| `LoadTPD("tracktestpc")` | 8, "The tpd file does not exist" (protocol manual, Table 10-1). `LoadTPD` looks in `/fruser/`. |
-| `LoadTPD("/fruser/traj/tracktestpc")`, with or without `.txt` | 8 |
-| **`LoadTPD("traj/tracktestpc")`** | **0.** `GetTPDStartPose` returned `[135.9624, -268.4651, 361.4536, -179.6626, 0.0199, -178.7353]`, equal to columns 7-12 of the file's first row (float32 precision). Reference: `LoadTPD("tracktest1")` returns the same pose. |
-
-Error codes: the controller error table (protocol manual, Table 10-1) gives 4 = "The parameter value is abnormal" and 8 = "The tpd file does not exist". The earlier reading of `LoadTrajectoryJ`'s 4 as "found but rejected" is consistent with "parameter value abnormal", but the table is generic, so 4 does not prove the file was found.
-
-#### Other facts recorded
-- Controller: software `v3.9.1` (`FR5-V1-001(V5.0)`, `V3.9.5-QX`), control firmware `FR_CTRL_FV2.010.04`, SDK `V2.2.1`. Manual mode, no program running, no errors during these checks.
-- The web UI's trajectory import (SDK manual §1.3.9.5.15) also uploads `tracktestpc.txt` successfully. Its destination was not confirmed: the file found at `/fruser/traj/tracktestpc.txt` before the probe's fixed upload was empty, either because the probe truncated the web-uploaded copy or because the probe created it.
-- Ports open on the robot: 20001, 20002, 20003 (XML-RPC), 20004 (state), 8080, 8083. 20001 is in neither manual.
-
-#### Consequences for the plan
-- `fr5.py` must not use `TrajectoryJUpLoad`/`LuaUpload` directly. It needs its own upload, as in `file_port_probe.py`: `FileUpload` RPC, bounded connect retry, send, check `SUCCESS`, then verify with `ComputeFileMD5`. Allowed file types should be limited to 0 and 20.
-- For TPD recordings, upload as type 20 and refer to them as `traj/<name>` in `LoadTPD`, `GetTPDStartPose` and `MoveTPD` (all three confirmed). Recording names must leave room for the `traj/` prefix in the controller's name limit.
-- Generated motions written in the TPD layout (`N,1,period,0,0,0` plus 15 columns per row) could use the same route. This is an option for the backend decision, not yet tested with a generated file.
-
-Next steps:
-1. Done: playback of the uploaded file (see Status).
-2. Done: `sw/robot/spike/tpd_upload_check.py` now uploads with the retrying protocol (`upload_file` in `file_port_probe.py`), verifies the MD5, and checks `LoadTPD("traj/<stem>")` and its start pose.
-3. Try a small generated file in the TPD layout through the same route.
+- **Phase 1 (commit `36d0914`).** Pure geometry and schemas; 87 robot tests. Changes from the original plan: roll is measured about the optical axis against `u = normalise(z_cam × z_base)`; pointing error uses `atan2(|cross|, dot)`.
+- **Phase 0 on the simulator (commit `1526e5a`).** Euler convention `"xyz"` (extrinsic) from a J1 rotation test. The simulator does not store uploaded files or play trajectories. A second connection's `StopMotion` did not interrupt a running `MoveJ`.
+- **TrajectoryJ attempts (abandoned).** `LoadTrajectoryJ` returned 4 ("parameter value abnormal") for every layout tried, including the pendant's own recording; `GetTrajectoryStartPose` read the TPD header as a point. Dropped in favour of TPD (D1).
+- **TPD playback (commit `bcbcbee`).** `LoadTPD("tracktest1")` + `MoveTPD` replays a pendant recording from Python. `MoveTPD` needs auto mode; read `robot_mode` only after a 1 s wait.
+- **Upload race (commit `efdd2df`).** Ports 20010/20011 open only during a transfer, about 50 ms after the `FileUpload` request; the SDK's single immediate connect is refused (-1). Our retrying upload works; a connect without sending leaves an empty file. Type 0 uploads are rejected by `LuaUpLoadUpdate` for large files ("LUA FILE SIZE IS TOO LARGE!").
+- **End-to-end TPD route on the real robot (2026-11-24).** `sw/tracktestpc.txt` uploaded as type 20 → `/fruser/traj/tracktestpc.txt` (MD5 `442c28842962b0e814d6ff9aa151a9f8` matches) → `LoadTPD("traj/tracktestpc")` = 0 → `GetTPDStartPose` = first row's pose within 0.000013 → `MoveTPD("traj/tracktestpc", 0, 50)` played the track (`sw/fairino_basic_query.py`, `MOVE_OVL` 50, `PLAY_OVL` 50).
+- Pendant recordings live at `/fruser/<name>.txt` and load as `LoadTPD("<name>")`.
+- Phase 4 robot test results: *(to be filled in: played at 8 ms yes/no and fallback used, `move_tpd` return time, measured vs expected duration, visual level check)*.

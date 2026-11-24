@@ -20,7 +20,7 @@ import sys
 from fairino import Robot
 from file_port_probe import FILE_TYPE_TRAJ_J, upload_file
 
-ROBOT_IP = "192.168.58.2"  # real robot (the simulator is 192.168.50.2)
+ROBOT_IP = "192.168.58.2"  # real robot; upload/LoadTPD do not work on the simulator
 REMOTE_DIR = "/fruser/traj"
 POSE_TOL = 0.01  # the controller returns float32 values
 
