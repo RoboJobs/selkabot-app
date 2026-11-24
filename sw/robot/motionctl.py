@@ -30,6 +30,10 @@ MOTIONS_DIR = Path(__file__).resolve().parent / "motions"
 BUILD_DIR = Path(__file__).resolve().parent / "build"
 POSE_TOLERANCE = 0.01
 MOVE_TO_START_SPEED_PCT = 10
+# The controller's actual speed is max x global speed (SetSpeed) x the
+# command's own speed (MoveJ vel, MoveTPD ovl) -- manual 1.3.9.5. We use the
+# global speed as the one speed control and give commands 100%.
+COMMAND_PCT = 100
 
 
 class CommandError(Exception):
@@ -400,7 +404,7 @@ def cmd_simplay(args: argparse.Namespace) -> None:
     try:
         print(f"Moving to start pose at {MOVE_TO_START_SPEED_PCT}% speed...")
         with robot.speed(MOVE_TO_START_SPEED_PCT):
-            robot.move_j(start_joints, validated["tool_id"], MOVE_TO_START_SPEED_PCT)
+            robot.move_j(start_joints, validated["tool_id"], COMMAND_PCT)
         print(
             f"Streaming {len(tpd.joints)} rows at {period_s * 1000:.0f}ms "
             f"(ovl {args.ovl}; preview only, not the production path)..."
@@ -417,39 +421,174 @@ def cmd_simplay(args: argparse.Namespace) -> None:
 # -- upload (real robot only) --------------------------------------------
 
 
-def cmd_upload(args: argparse.Namespace) -> None:
-    if args.ip == SIM_IP:
+def _refuse_sim(command: str, ip: str) -> None:
+    if ip == SIM_IP:
         raise CommandError(
-            "upload needs the real robot (--ip 192.168.58.2); the simulator "
-            "does not store uploaded files"
+            f"{command} needs the real robot (--ip {ROBOT_IP}); the simulator "
+            "does not store uploaded files or play TPD trajectories"
         )
-    out = _ensure_compiled(args.name)
-    robot = FR5.connect(args.ip)
-    try:
+
+
+KINEMATICS_TOLERANCE_MM = 1.0
+KINEMATICS_TOLERANCE_DEG = 0.05
+
+
+def _check_same_kinematics(robot: FR5, out: Path, rows: int = 12) -> None:
+    """The file's pose columns must be this robot's FK of its joints.
+
+    A file computed with another controller's kinematics (the simulator's arm
+    model differs from the real FR5 by ~28 mm) has joints and poses that
+    disagree on this robot; the controller rejects it with "TPD command point
+    error" (main 1, sub 10). Read-only: FK calls only.
+    """
+    tpd = tpd_file.read(out)
+    step = max(1, len(tpd.joints) // rows)
+    for i in list(range(0, len(tpd.joints), step)) + [len(tpd.joints) - 1]:
+        fk = robot.fk(tpd.joints[i])
+        dpos = math.dist(fk[:3], tpd.poses[i][:3])
+        drot = max(
+            abs((a - b + 180.0) % 360.0 - 180.0)
+            for a, b in zip(fk[3:], tpd.poses[i][3:], strict=True)
+        )
+        if dpos > KINEMATICS_TOLERANCE_MM or drot > KINEMATICS_TOLERANCE_DEG:
+            raise CommandError(
+                f"{out.name} row {i}: this robot's FK of the joints is {dpos:.1f}mm "
+                f"/ {drot:.3f}deg from the file's pose. The file was computed with "
+                f"another controller's kinematics (the simulator?). Re-run capture, "
+                f"validate and compile with --ip {robot.ip}"
+            )
+
+
+def _put_on_controller(robot: FR5, name: str, out: Path, skip_upload: bool) -> str:
+    """Check the file matches this robot's kinematics, upload it (or, with
+    skip_upload, check a manual upload by MD5), then LoadTPD and compare the
+    start pose with the file. Returns the controller's MD5 of the file."""
+    _check_same_kinematics(robot, out)
+    remote = _controller_file(name)
+    local_md5 = tpd_file.md5(out)
+    if skip_upload:
+        remote_md5 = robot.file_md5(remote)
+        if remote_md5 is None or remote_md5.lower() != local_md5.lower():
+            raise CommandError(
+                f"{remote} on the controller does not match {out} "
+                f"(controller MD5 {remote_md5}, local {local_md5})"
+            )
+        print(f"Controller copy of {remote} matches (MD5 {local_md5}).")
+    else:
         try:
-            remote = robot.upload_file(str(out), file_type=20)
+            robot.upload_file(str(out), file_type=20)
         except FileTransferError as exc:
             raise CommandError(
                 f"upload failed at stage '{exc.stage}' ({exc.detail!r}). "
                 f"Ask the operator to upload {out} to the controller manually "
-                "(teach pendant or web UI trajectory import), then re-run "
-                "this check."
+                "(teach pendant or web UI trajectory import), then re-run with "
+                "--skip-upload."
             ) from exc
-        print(f"Uploaded to {remote}")
+        print(f"Uploaded to {remote} (MD5 verified).")
 
-        tpd_name = _tpd_name(args.name)
-        robot.load_tpd(tpd_name)
-        start_pose = robot.tpd_start_pose(tpd_name)
-        expected = tpd_file.read(out).poses[0]
-        diff = max(abs(a - b) for a, b in zip(start_pose, expected, strict=True))
-        print(f"LoadTPD({tpd_name!r}) OK. Start pose matches file (diff {diff:.6f}).")
-        if diff > POSE_TOLERANCE:
-            raise CommandError(
-                f"start pose differs from the file by {diff}, more than "
-                f"the tolerance ({POSE_TOLERANCE})"
-            )
+    tpd_name = _tpd_name(name)
+    robot.load_tpd(tpd_name)
+    start_pose = robot.tpd_start_pose(tpd_name)
+    expected = tpd_file.read(out).poses[0]
+    diff = max(abs(a - b) for a, b in zip(start_pose, expected, strict=True))
+    if diff > POSE_TOLERANCE:
+        raise CommandError(
+            f"start pose differs from the file by {diff}, more than "
+            f"the tolerance ({POSE_TOLERANCE})"
+        )
+    print(f"LoadTPD({tpd_name!r}) OK. Start pose matches file (diff {diff:.6f}).")
+    return local_md5
+
+
+def cmd_upload(args: argparse.Namespace) -> None:
+    _refuse_sim("upload", args.ip)
+    out = _ensure_compiled(args.name)
+    robot = FR5.connect(args.ip)
+    try:
+        _put_on_controller(robot, args.name, out, args.skip_upload)
     finally:
         robot.close()
+
+
+# -- publish / list (real robot only for publish) ---------------------------
+
+
+def cmd_publish(args: argparse.Namespace) -> None:
+    """Recompile from the current validated.json, put the file on the
+    controller, and write motion.json (what the livestream app reads)."""
+    import datetime
+    import os
+
+    _refuse_sim("publish", args.ip)
+    if not 1 <= args.ovl <= 100:
+        raise CommandError("--ovl must be 1..100")
+    out = compile_motion(args.name)  # refuses a missing or stale validated.json
+    validated = _load_validated(args.name)
+    robot = FR5.connect(args.ip)
+    try:
+        md5 = _put_on_controller(robot, args.name, out, args.skip_upload)
+    finally:
+        robot.close()
+
+    samples = validated["samples"]
+    raw = {
+        "name": args.name,
+        "backend": "tpd",
+        "controller_file": _controller_file(args.name),
+        "tpd_name": _tpd_name(args.name),
+        "md5": md5,
+        "num_points": validated["num_points"],
+        "sample_period_ms": validated["sample_period_ms"],
+        "duration_s": validated["duration_s"],
+        "design_duration_s": validated["design_duration_s"],
+        "start_joints": samples["joints"][0],
+        "start_pose": samples["pose"][0],
+        "tool_id": validated["tool_id"],
+        "approved_ovl": args.ovl,
+        "design_sha256": validated["design_sha256"],
+        "published_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    schema.motion_config_from_dict(raw, "motion.json")  # check_consistent()
+    path = _motion_json_path(args.name)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(_dumps(raw))
+    os.replace(tmp, path)
+    print(f"Published {args.name} at ovl {args.ovl}: wrote {path}")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    """Published motions; with --check, also whether the controller file's
+    MD5 still matches motion.json."""
+    if not MOTIONS_DIR.exists():
+        print("No motions.")
+        return
+    configs = schema.load_motion_configs(MOTIONS_DIR)
+    drafts = sorted(
+        d.name
+        for d in MOTIONS_DIR.iterdir()
+        if d.is_dir() and d.name not in configs and (d / "design.yaml").exists()
+    )
+    robot = FR5.connect(args.ip) if args.check and configs else None
+    try:
+        for name, config in configs.items():
+            line = (
+                f"{name}: {config.duration_s:.2f}s, ovl {config.approved_ovl}, "
+                f"tool {config.tool_id}, published {config.published_at}"
+            )
+            if robot is not None:
+                remote = robot.file_md5(config.controller_file)
+                if remote is None:
+                    line += "  [file missing on controller]"
+                elif remote.lower() != config.md5.lower():
+                    line += "  [md5 mismatch]"
+                else:
+                    line += "  [controller file OK]"
+            print(line)
+    finally:
+        if robot is not None:
+            robot.close()
+    for name in drafts:
+        print(f"{name}: not published")
 
 
 # -- play (real robot only; operator confirmation required) -----------------
@@ -468,6 +607,7 @@ def cmd_play(args: argparse.Namespace) -> None:
 
     robot = FR5.connect(args.ip)
     try:
+        _check_same_kinematics(robot, out)
         remote_md5 = robot.file_md5(remote_path)
         if remote_md5 is None or remote_md5.lower() != local_md5.lower():
             raise CommandError(
@@ -496,29 +636,67 @@ def cmd_play(args: argparse.Namespace) -> None:
 
         robot.ensure_auto()
         with robot.speed(MOVE_TO_START_SPEED_PCT):
-            robot.move_j(start_joints, validated["tool_id"], MOVE_TO_START_SPEED_PCT)
+            robot.move_j(start_joints, validated["tool_id"], COMMAND_PCT)
         input("Press Enter to play: ")
 
         robot.load_tpd(tpd_name)  # cheap insurance against a stale load
-        start = time.monotonic()
-        robot.move_tpd(tpd_name, 0, args.ovl)
-        print(f"move_tpd returned after {time.monotonic() - start:.3f}s")
-
         expected_duration = validated["duration_s"] * 100.0 / args.ovl
-        deadline = time.monotonic() + expected_duration * 1.5 + 3.0
-        while time.monotonic() < deadline:
-            if robot.motion_done():
-                break
-            time.sleep(0.1)
-        else:
-            print("Warning: motion_done not confirmed within the deadline.")
-        elapsed = time.monotonic() - start
-        print(f"Elapsed: {elapsed:.2f}s (expected about {expected_duration:.2f}s)")
+        with robot.speed(args.ovl):  # global speed = playback speed (see COMMAND_PCT)
+            start = time.monotonic()
+            robot.move_tpd(tpd_name, 0, COMMAND_PCT)
+            print(f"move_tpd returned after {time.monotonic() - start:.3f}s")
+            outcome = _wait_for_motion(robot, expected_duration * 1.5 + 3.0)
+            elapsed = time.monotonic() - start
+        print(f"{outcome}. Elapsed: {elapsed:.2f}s (expected about "
+              f"{expected_duration:.2f}s)")  # fmt: skip
+        if not outcome.startswith("Motion finished"):
+            print(_progress(robot, out, validated["sample_period_ms"], elapsed))
     except KeyboardInterrupt:
         print("\nInterrupted; stopping.")
         robot.stop()
     finally:
         robot.close()
+
+
+def _progress(robot: FR5, out: Path, period_ms: int, elapsed_s: float) -> str:
+    """Where in the file the robot stopped: the nearest row by joint distance.
+    Its planned time over the elapsed time is the effective playback speed."""
+    joints = robot.joints()
+    rows = tpd_file.read(out).joints
+    i = min(range(len(rows)), key=lambda k: math.dist(rows[k], joints))
+    planned = i * period_ms / 1000.0
+    rate = 100.0 * planned / elapsed_s if elapsed_s > 0 else 0.0
+    return (
+        f"Stopped near row {i} of {len(rows)} (planned t={planned:.2f}s): "
+        f"effective playback speed about {rate:.1f}% of planned"
+    )
+
+
+def _wait_for_motion(robot: FR5, deadline_s: float, start_s: float = 2.0) -> str:
+    """Wait for motion_done to go 0 (started; the state cache is stale right
+    after the command) and back to 1, watching the robot's error code.
+    Stops the robot on an error or a timeout. Returns a one-line outcome."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < start_s:
+        main, sub = robot.error_codes()
+        if main:
+            robot.stop()
+            return f"Robot error before the motion started: main {main}, sub {sub}"
+        if not robot.motion_done():
+            break
+        time.sleep(0.02)
+    else:
+        return "Motion did not start (motion_done never went to 0)"
+    while time.monotonic() - t0 < deadline_s:
+        main, sub = robot.error_codes()
+        if main:
+            robot.stop()
+            return f"Robot error during the motion: main {main}, sub {sub}"
+        if robot.motion_done():
+            return "Motion finished"
+        time.sleep(0.02)
+    robot.stop()
+    return "Motion did not finish before the deadline; stopped"
 
 
 # -- argparse wiring ---------------------------------------------------------
@@ -582,8 +760,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("upload")
     p.add_argument("name")
+    p.add_argument("--skip-upload", action="store_true", help="only verify by MD5")
     _add_ip(p, default=ROBOT_IP)
     p.set_defaults(func=cmd_upload)
+
+    p = sub.add_parser("publish")
+    p.add_argument("name")
+    p.add_argument("--ovl", type=int, required=True, help="approved speed, 1..100")
+    p.add_argument("--skip-upload", action="store_true", help="file already uploaded")
+    _add_ip(p, default=ROBOT_IP)
+    p.set_defaults(func=cmd_publish)
+
+    p = sub.add_parser("list")
+    p.add_argument("--check", action="store_true", help="check controller MD5s")
+    _add_ip(p, default=ROBOT_IP)
+    p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("play")
     p.add_argument("name")

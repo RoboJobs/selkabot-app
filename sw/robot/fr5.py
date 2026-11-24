@@ -64,7 +64,12 @@ class RobotClient(Protocol):
     def Mode(self, state: int) -> int: ...
     def SetSpeed(self, vel: int) -> int: ...
     def MoveJ(
-        self, joint_pos: list[float], tool: int, user: int, vel: float = 20.0
+        self,
+        joint_pos: list[float],
+        tool: int,
+        user: int,
+        vel: float = 20.0,
+        blendT: float = -1.0,
     ) -> int: ...
     def StopMotion(self) -> int: ...
     def CloseRPC(self) -> None: ...
@@ -199,8 +204,16 @@ class FR5:
 
     # -- Motion -----------------------------------------------------------
 
-    def move_j(self, joints: list[float], tool_id: int, vel_pct: float) -> None:
-        _call(self.client, "MoveJ", joints, tool_id, 0, vel=vel_pct)
+    def move_j(
+        self, joints: list[float], tool_id: int, vel_pct: float, blocking: bool = True
+    ) -> None:
+        """MoveJ. Blocking waits for the motion to end inside the RPC; with
+        blocking=False the call returns at once (blendT=0) and the caller
+        polls motion_done(), so a stop request is never stuck behind it."""
+        if blocking:
+            _call(self.client, "MoveJ", joints, tool_id, 0, vel=vel_pct)
+        else:
+            _call(self.client, "MoveJ", joints, tool_id, 0, vel=vel_pct, blendT=0.0)
 
     def move_tpd(self, name: str, blend: int, ovl: float) -> None:
         _call(self.client, "MoveTPD", name, blend, ovl)

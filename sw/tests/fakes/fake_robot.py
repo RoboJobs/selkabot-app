@@ -28,14 +28,27 @@ def _joints_to_pose(joints6: list[float]) -> list[float]:
 
 @dataclass
 class FakeStatePkg:
+    """The SDK's state cache. `motion_done` can be scripted: each read pops
+    the next value of `motion_script` (the last value repeats)."""
+
     jt_cur_pos: list[float] = field(default_factory=lambda: [0.0] * 6)
     tl_cur_pos: list[float] = field(default_factory=lambda: [0.0] * 6)
-    motion_done: int = 1
+    motion_script: list[int] = field(default_factory=lambda: [1])
     mc_queue_len: int = 0
     robot_mode: int = 1  # 1 = manual, 0 = auto
     main_code: int = 0
     sub_code: int = 0
     tool: int = 0
+
+    @property
+    def motion_done(self) -> int:
+        if len(self.motion_script) > 1:
+            return self.motion_script.pop(0)
+        return self.motion_script[0]
+
+    @motion_done.setter
+    def motion_done(self, value: int) -> None:
+        self.motion_script = [value]
 
 
 class _FakeProxy:
@@ -68,6 +81,11 @@ class FakeRobotClient:
         self.tpd_start_poses: dict[str, list[float]] = {}
         self.move_tpd_calls: list[tuple[str, int, float]] = []
         self.move_j_calls: list[tuple[list[float], int, int, float]] = []
+        # motion_done values a move produces (started, then done); tests
+        # override these to simulate a motion that never starts or never ends.
+        self.move_tpd_script: list[int] = [0, 0, 1]
+        self.move_j_script: list[int] = [0, 1]
+        self.move_tpd_block: Any = None  # a threading.Event to block MoveTPD on
         self.speeds: list[int] = []
         self.modes: list[int] = []
         self.servo_j_calls: list[tuple[list[float], list[float], float]] = []
@@ -184,6 +202,9 @@ class FakeRobotClient:
         if code:
             return code
         self.move_tpd_calls.append((name, blend, ovl))
+        if self.move_tpd_block is not None:
+            self.move_tpd_block.wait()
+        self.robot_state_pkg.motion_script = list(self.move_tpd_script)
         return 0
 
     # -- mode, speed, motion --------------------------------------------
@@ -206,14 +227,22 @@ class FakeRobotClient:
         return 0
 
     def MoveJ(
-        self, joint_pos: list[float], tool: int, user: int, vel: float = 20.0
+        self,
+        joint_pos: list[float],
+        tool: int,
+        user: int,
+        vel: float = 20.0,
+        blendT: float = -1.0,
     ) -> int:
-        self._record("MoveJ", (joint_pos, tool, user), {"vel": vel})
+        kwargs = {"vel": vel} if blendT == -1.0 else {"vel": vel, "blendT": blendT}
+        self._record("MoveJ", (joint_pos, tool, user), kwargs)
         code = self._err("MoveJ")
         if code:
             return code
         self.move_j_calls.append((list(joint_pos), tool, user, vel))
         self.robot_state_pkg.jt_cur_pos = list(joint_pos)
+        if blendT != -1.0:
+            self.robot_state_pkg.motion_script = list(self.move_j_script)
         return 0
 
     def StopMotion(self) -> int:
