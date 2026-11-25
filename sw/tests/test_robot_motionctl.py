@@ -907,3 +907,95 @@ def test_capture_warns_about_keyframes_left_from_the_template(
     assert "keyframe(s) at t=4 did not come from capture" in out
     assert _run(["capture", "demo", "--t", "0", "--reset"]) == 0
     assert "did not come from capture" not in capsys.readouterr().out
+
+
+# -- luaplay ------------------------------------------------------------------
+
+
+def _luaplay_ready(connect, monkeypatch):
+    """A compiled 'demo' and an FR5.upload_file stub that records the upload."""
+    _seed_ik_fk(connect)
+    _run(["new", "demo", "--template", "first_test"])
+    _run(["validate", "demo"])
+    _run(["compile", "demo"])
+    uploads = []
+
+    def fake_upload_file(self, local_path, file_type=20):
+        uploads.append((file_type, local_path))
+        return "/fruser/motion_demo.lua"
+
+    monkeypatch.setattr(fr5.FR5, "upload_file", fake_upload_file)
+    return uploads
+
+
+def test_luaplay_refuses_the_sim_ip(connect, _redirect_dirs):
+    assert _run(["luaplay", "demo", "--ip", motionctl.SIM_IP]) == 1
+
+
+def test_luaplay_uploads_the_program_and_aborts_without_yes(
+    connect, _redirect_dirs, monkeypatch
+):
+    _motions, build = _redirect_dirs
+    uploads = _luaplay_ready(connect, monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "no")
+    assert _run(["luaplay", "demo", "--ovl", "100"]) == 0
+    lua = build / "motion_demo.lua"
+    assert uploads == [(motionctl.LUA_UPLOAD_TYPE, str(lua))]
+    rows = tpd_file.read(build / "motion_demo.txt").joints
+    assert lua.read_text().count("\n{") == len(rows)
+    assert connect.move_j_calls == []
+    assert connect.program_runs == 0
+
+
+def test_luaplay_with_yes_moves_to_start_then_runs_the_program(
+    connect, _redirect_dirs, monkeypatch
+):
+    _luaplay_ready(connect, monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
+    assert _run(["luaplay", "demo", "--ovl", "50"]) == 0
+    names = [c[0] for c in connect.calls]
+    assert names.index("Mode") < names.index("MoveJ") < names.index("ProgramLoad")
+    assert names.index("ProgramLoad") < names.index("ProgramRun")
+    assert connect.programs_loaded == ["/fruser/motion_demo.lua"]
+    assert connect.program_runs == 1
+    assert connect.program_stops == 0
+    assert connect.move_tpd_calls == []
+    assert connect.servo_j_calls == []  # nothing streamed from Python
+
+
+def test_luaplay_stops_the_program_on_a_robot_error(
+    connect, _redirect_dirs, monkeypatch
+):
+    _luaplay_ready(connect, monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
+    connect.program_run_script = [2]  # never finishes by itself
+
+    real_run = connect.ProgramRun
+
+    def run_then_fault():
+        code = real_run()
+        connect.robot_state_pkg.main_code = 1
+        connect.robot_state_pkg.sub_code = 24
+        return code
+
+    connect.ProgramRun = run_then_fault
+    assert _run(["luaplay", "demo", "--ovl", "100"]) == 0
+    assert connect.program_stops == 1
+    assert ("StopMotion", (), {}) in connect.calls
+
+
+def test_luaplay_ctrl_c_stops_program_and_motion(connect, _redirect_dirs, monkeypatch):
+    _luaplay_ready(connect, monkeypatch)
+    answers = iter(["YES"])
+
+    def fake_input(prompt=""):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise KeyboardInterrupt from None
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    assert _run(["luaplay", "demo"]) == 0
+    assert connect.program_runs == 0
+    assert connect.program_stops == 1
+    assert ("StopMotion", (), {}) in connect.calls

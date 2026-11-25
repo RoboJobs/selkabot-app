@@ -116,7 +116,7 @@ def _send_file(sock: socket.socket, data: bytes) -> bytes:
 class FR5:
     """Wraps a `RobotClient`. Every method either returns a plain value or
     raises `FairinoError` / `FileTransferError`. Nothing here moves the robot
-    except `move_j` and `move_tpd`.
+    except `move_j`, `move_tpd`, `stream_joints` and `run_program`.
     """
 
     def __init__(
@@ -249,6 +249,20 @@ class FR5:
                     time.sleep(remaining)
         finally:
             _call(self.client, "ServoMoveEnd")
+
+    # -- Lua programs (joint playback on the controller) -------------------
+
+    def run_program(self, remote_path: str) -> None:
+        """ProgramLoad + ProgramRun. Needs auto mode (ensure_auto)."""
+        _call(self.client, "ProgramLoad", remote_path)
+        _call(self.client, "ProgramRun")
+
+    def stop_program(self) -> None:
+        _call(self.client, "ProgramStop")
+
+    def program_state(self) -> int:
+        """1 = stopped / no program, 2 = running, 3 = paused (state cache)."""
+        return self.client.robot_state_pkg.robot_state
 
     # -- TPD loading --------------------------------------------------------
 

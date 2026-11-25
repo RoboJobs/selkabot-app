@@ -18,8 +18,8 @@ from pathlib import Path
 
 import yaml
 
+from sw.robot import lua_program, schema, templates, tpd_file, validate
 from sw.robot import path as path_module
-from sw.robot import schema, templates, tpd_file, validate
 from sw.robot.fr5 import (
     FR5,
     TPD_BLEND_NONE,
@@ -78,6 +78,14 @@ def _controller_file(name: str) -> str:
 
 def _tpd_name(name: str) -> str:
     return f"traj/motion_{name}"
+
+
+def _lua_build_path(name: str) -> Path:
+    return BUILD_DIR / f"motion_{name}.lua"
+
+
+def _lua_controller_file(name: str) -> str:
+    return f"/fruser/motion_{name}.lua"
 
 
 def load_design(name: str) -> schema.Design:
@@ -848,6 +856,110 @@ def _wait_for_motion(robot: FR5, deadline_s: float, start_s: float = 2.0) -> str
     return "Motion did not finish before the deadline; stopped"
 
 
+# -- luaplay (real robot; joint playback on the controller) ------------------
+
+LUA_UPLOAD_TYPE = 0  # FileUpload type for Lua programs (stored in /fruser/)
+
+
+def write_lua(name: str, ovl: int, pace: str) -> tuple[Path, int, float]:
+    """Write the Lua program for the compiled file at `ovl`. Returns the path,
+    the row count and the expected duration (s)."""
+    out = _ensure_compiled(name)
+    validated = _load_validated(name)
+    period_ms = validated["sample_period_ms"]
+    rows = lua_program.resample(tpd_file.read(out).joints, ovl)
+    lua = _lua_build_path(name)
+    lua.write_text(lua_program.render(rows, period_ms, name, pace))
+    return lua, len(rows), (len(rows) - 1) * period_ms / 1000.0
+
+
+def cmd_luaplay(args: argparse.Namespace) -> None:
+    _refuse_sim("luaplay", args.ip)
+    if not 1 <= args.ovl <= 100:
+        raise CommandError("--ovl must be 1..100")
+    out = _ensure_compiled(args.name)
+    validated = _load_validated(args.name)
+    lua, rows, expected = write_lua(args.name, args.ovl, args.pace)
+    print(f"Wrote {lua} ({rows} rows, pace {args.pace}, about {expected:.2f}s).")
+
+    robot = FR5.connect(args.ip)
+    try:
+        _check_same_kinematics(robot, out)
+        try:
+            remote = robot.upload_file(str(lua), file_type=LUA_UPLOAD_TYPE)
+        except FileTransferError as exc:
+            raise CommandError(
+                f"upload of {lua} failed at stage '{exc.stage}' ({exc.detail!r})"
+            ) from exc
+        print(f"Uploaded to {remote} (MD5 verified).")
+
+        start_joints = validated["samples"]["joints"][0]
+        print("Current joints:", [round(v, 2) for v in robot.joints()])
+        print("Start joints:  ", [round(v, 2) for v in start_joints])
+        print("\nThe robot will MOVE to the start pose, then run the program.")
+        print("Cell must be clear and the e-stop in hand.")
+        if input("Type YES to continue: ").strip() != "YES":
+            print("Aborted.")
+            return
+
+        robot.ensure_auto()
+        with robot.speed(MOVE_TO_START_SPEED_PCT):
+            robot.move_j(start_joints, validated["tool_id"], COMMAND_PCT)
+        input("Press Enter to play: ")
+
+        start = time.monotonic()
+        robot.run_program(remote)
+        outcome = _wait_for_program(robot, expected * 1.5 + 3.0)
+        elapsed = time.monotonic() - start
+        print(f"{outcome}. Elapsed: {elapsed:.2f}s (expected about {expected:.2f}s)")
+        if not outcome.startswith("Program finished"):
+            print(_progress(robot, out, validated["sample_period_ms"], elapsed))
+    except KeyboardInterrupt:
+        print("\nInterrupted; stopping.")
+        _stop_program(robot)
+    finally:
+        robot.close()
+
+
+def _stop_program(robot: FR5) -> None:
+    """ProgramStop, then StopMotion; each is tried even if the other fails."""
+    for stop in (robot.stop_program, robot.stop):
+        try:
+            stop()
+        except FairinoError as exc:
+            print(f"{exc} while stopping")
+
+
+PROGRAM_RUNNING = 2
+
+
+def _wait_for_program(robot: FR5, deadline_s: float, start_s: float = 2.0) -> str:
+    """Wait for the program state to go to running (the cache is stale right
+    after ProgramRun) and back, watching the robot's error code. Stops the
+    program on an error or a timeout. Returns a one-line outcome."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < start_s:
+        main, sub = robot.error_codes()
+        if main:
+            _stop_program(robot)
+            return f"Robot error before the program started: main {main}, sub {sub}"
+        if robot.program_state() == PROGRAM_RUNNING:
+            break
+        time.sleep(0.02)
+    else:
+        return "Program did not start (state never went to running)"
+    while time.monotonic() - t0 < deadline_s:
+        main, sub = robot.error_codes()
+        if main:
+            _stop_program(robot)
+            return f"Robot error during the program: main {main}, sub {sub}"
+        if robot.program_state() != PROGRAM_RUNNING:
+            return "Program finished"
+        time.sleep(0.02)
+    _stop_program(robot)
+    return f"Program still running after {deadline_s:.1f}s; stopped it"
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -923,6 +1035,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ovl", type=int, default=100)
     _add_ip(p)
     p.set_defaults(func=cmd_simplay)
+
+    p = sub.add_parser(
+        "luaplay", help="play joints with ServoJ in a controller Lua program"
+    )
+    p.add_argument("name")
+    p.add_argument("--ovl", type=int, default=50, help="playback speed, 1..100")
+    p.add_argument(
+        "--pace",
+        choices=lua_program.PACES,
+        default="wait",
+        help="wait: WaitMs(period) after each ServoJ; queue: rely on the ServoJ queue",
+    )
+    _add_ip(p, default=ROBOT_IP)
+    p.set_defaults(func=cmd_luaplay)
 
     p = sub.add_parser("upload")
     p.add_argument("name")

@@ -173,6 +173,29 @@ def test_move_tpd_calls_with_blend_and_ovl(robot, client):
     assert client.move_tpd_calls == [("traj/motion_demo", 0, 50)]
 
 
+# -- Lua programs ------------------------------------------------------------
+
+
+def test_run_program_loads_then_runs(robot, client):
+    robot.run_program("/fruser/motion_demo.lua")
+    assert [c[0] for c in client.calls] == ["ProgramLoad", "ProgramRun"]
+    assert client.programs_loaded == ["/fruser/motion_demo.lua"]
+    assert robot.program_state() == 2
+
+
+def test_run_program_load_failure_does_not_run(robot, client):
+    client.errors["ProgramLoad"] = 3
+    with pytest.raises(fr5.FairinoError):
+        robot.run_program("/fruser/missing.lua")
+    assert client.program_runs == 0
+
+
+def test_stop_program_calls_program_stop(robot, client):
+    robot.stop_program()
+    assert client.program_stops == 1
+    assert robot.program_state() == 1
+
+
 # -- stream_joints (D9, simulator preview only) -----------------------------
 
 

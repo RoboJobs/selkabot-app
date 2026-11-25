@@ -39,6 +39,14 @@ class FakeStatePkg:
     main_code: int = 0
     sub_code: int = 0
     tool: int = 0
+    # Program state (1 stopped, 2 running, 3 paused), scripted like motion_done.
+    program_script: list[int] = field(default_factory=lambda: [1])
+
+    @property
+    def robot_state(self) -> int:
+        if len(self.program_script) > 1:
+            return self.program_script.pop(0)
+        return self.program_script[0]
 
     @property
     def motion_done(self) -> int:
@@ -91,6 +99,11 @@ class FakeRobotClient:
         self.servo_j_calls: list[tuple[list[float], list[float], float]] = []
         self.servo_move_started = False
         self.servo_move_ended = False
+        self.programs_loaded: list[str] = []
+        self.program_runs = 0
+        self.program_stops = 0
+        # robot_state values a ProgramRun produces (running, then stopped).
+        self.program_run_script: list[int] = [2, 2, 1]
 
         self.install_angle: list[float] = [0.0, 0.0]
         self.soft_limits: list[float] = [
@@ -282,4 +295,32 @@ class FakeRobotClient:
             return code
         self.servo_j_calls.append((list(joint_pos), list(axisPos), cmdT))
         self.robot_state_pkg.jt_cur_pos = list(joint_pos)
+        return 0
+
+    # -- Lua programs ---------------------------------------------------------
+
+    def ProgramLoad(self, program_name: str) -> int:
+        self._record("ProgramLoad", (program_name,), {})
+        code = self._err("ProgramLoad")
+        if code:
+            return code
+        self.programs_loaded.append(program_name)
+        return 0
+
+    def ProgramRun(self) -> int:
+        self._record("ProgramRun", (), {})
+        code = self._err("ProgramRun")
+        if code:
+            return code
+        self.program_runs += 1
+        self.robot_state_pkg.program_script = list(self.program_run_script)
+        return 0
+
+    def ProgramStop(self) -> int:
+        self._record("ProgramStop", (), {})
+        code = self._err("ProgramStop")
+        if code:
+            return code
+        self.program_stops += 1
+        self.robot_state_pkg.program_script = [1]
         return 0
