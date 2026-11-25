@@ -1,31 +1,39 @@
 {
   "name": "up_down_horizontal",
-  "backend": "tpd",
-  "controller_file": "/fruser/traj/motion_up_down_horizontal.txt",
-  "tpd_name": "traj/motion_up_down_horizontal",
-  "md5": "5343bc1cd7e4ca50436c11459d230010",
-  "num_points": 255,
+  "backend": "lua",
+  "controller_file": "/fruser/motion_up_down_horizontal.lua",
+  "md5": "f6d036e41d50f932a2435bda6abedd25",
+  "num_points": 214,
   "sample_period_ms": 8,
-  "duration_s": 2.032,
-  "design_duration_s": 2.03,
+  "duration_s": 1.704,
+  "design_duration_s": 1.7,
   "start_joints": [
-    89.71810913085938,
-    -90.33719635009766,
-    0.16054536402225497,
-    29.626134404293353,
-    -89.56583585853711,
-    45.76890969191907
+    89.7181,
+    -90.3372,
+    0.1605,
+    29.6261,
+    -89.5658,
+    45.7689
+  ],
+  "end_joints": [
+    89.9999,
+    53.9273,
+    12.336,
+    -181.2633,
+    -90.0,
+    45.0
   ],
   "start_pose": [
     122.9729919433593,
     -403.5740356445312,
     675.1069946289062,
     -119.4524002075195,
-    2.110977561642358e-07,
+    2.1109774195338107e-07,
     178.8350982666015
   ],
   "tool_id": 1,
   "approved_ovl": 100,
-  "design_sha256": "4b9013fc446dc4a7782424aa58d5f72f727ff3675a6f37b16e0ddd92f6ea9ea6",
-  "published_at": "2026-11-25T02:35:30"
+  "design_sha256": "337e0813ca638399e5bd933e3931d57d47113962593b880bf030638bbe8703ed",
+  "published_at": "2026-11-25T15:36:59",
+  "format": "landscape"
 }
