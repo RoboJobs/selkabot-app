@@ -909,7 +909,8 @@ def cmd_luaplay(args: argparse.Namespace) -> None:
 
         start = time.monotonic()
         robot.run_program(remote)
-        outcome = _wait_for_program(robot, expected * 1.5 + 3.0)
+        end_joints = validated["samples"]["joints"][-1]
+        outcome = _wait_for_program(robot, end_joints, expected * 1.5 + 3.0)
         elapsed = time.monotonic() - start
         print(f"{outcome}. Elapsed: {elapsed:.2f}s (expected about {expected:.2f}s)")
         if not outcome.startswith("Program finished"):
@@ -931,31 +932,59 @@ def _stop_program(robot: FR5) -> None:
 
 
 PROGRAM_RUNNING = 2
+AT_END_DEG = 0.5  # max joint error to the last row to count as arrived
+STILL_DEG = 0.01  # max joint change between two polls to count as standing
+SETTLE_S = 0.3  # how long the arm must stand still
 
 
-def _wait_for_program(robot: FR5, deadline_s: float, start_s: float = 2.0) -> str:
-    """Wait for the program state to go to running (the cache is stale right
-    after ProgramRun) and back, watching the robot's error code. Stops the
-    program on an error or a timeout. Returns a one-line outcome."""
+def _wait_for_program(
+    robot: FR5,
+    end_joints: list[float],
+    deadline_s: float,
+    start_s: float = 2.0,
+    poll_s: float = 0.02,
+) -> str:
+    """Wait until the arm has moved, reached `end_joints` and stands still,
+    watching the robot's error code. The program state alone is not used to
+    detect the end: on the real robot it left "running" 0.4 s into a 10 s
+    ServoJ program (2026-11-25). Its changes are printed, to learn what it
+    reports. Stops the program on an error or a timeout. Returns a one-line
+    outcome."""
     t0 = time.monotonic()
-    while time.monotonic() - t0 < start_s:
-        main, sub = robot.error_codes()
-        if main:
-            _stop_program(robot)
-            return f"Robot error before the program started: main {main}, sub {sub}"
-        if robot.program_state() == PROGRAM_RUNNING:
-            break
-        time.sleep(0.02)
-    else:
-        return "Program did not start (state never went to running)"
-    while time.monotonic() - t0 < deadline_s:
+    last_state = None
+    prev = robot.joints()
+    moved = False
+    still_since: float | None = None
+    while (now := time.monotonic()) - t0 < deadline_s:
         main, sub = robot.error_codes()
         if main:
             _stop_program(robot)
             return f"Robot error during the program: main {main}, sub {sub}"
-        if robot.program_state() != PROGRAM_RUNNING:
+        state = robot.program_state()
+        if state != last_state:
+            print(f"  t={now - t0:.2f}s program state {state}")
+            last_state = state
+        joints = robot.joints()
+        step = max(abs(a - b) for a, b in zip(joints, prev, strict=True))
+        prev = joints
+        if step >= STILL_DEG:
+            moved = True
+            still_since = None
+        elif still_since is None:
+            still_since = now
+        settled = still_since is not None and now - still_since >= SETTLE_S
+        at_end = (
+            max(abs(a - b) for a, b in zip(joints, end_joints, strict=True))
+            <= AT_END_DEG
+        )
+        if settled and moved and at_end:
             return "Program finished"
-        time.sleep(0.02)
+        if settled and state != PROGRAM_RUNNING and now - t0 > start_s:
+            _stop_program(robot)
+            if not moved:
+                return "Program ended without moving the robot"
+            return "Program ended before the end of the path"
+        time.sleep(poll_s)
     _stop_program(robot)
     return f"Program still running after {deadline_s:.1f}s; stopped it"
 

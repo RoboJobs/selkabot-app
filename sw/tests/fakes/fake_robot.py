@@ -31,7 +31,9 @@ class FakeStatePkg:
     """The SDK's state cache. `motion_done` can be scripted: each read pops
     the next value of `motion_script` (the last value repeats)."""
 
-    jt_cur_pos: list[float] = field(default_factory=lambda: [0.0] * 6)
+    # Joint readings, scripted like motion_done: each read pops the next
+    # vector (the last repeats); assigning jt_cur_pos sets a single vector.
+    joints_script: list[list[float]] = field(default_factory=lambda: [[0.0] * 6])
     tl_cur_pos: list[float] = field(default_factory=lambda: [0.0] * 6)
     motion_script: list[int] = field(default_factory=lambda: [1])
     mc_queue_len: int = 0
@@ -41,6 +43,16 @@ class FakeStatePkg:
     tool: int = 0
     # Program state (1 stopped, 2 running, 3 paused), scripted like motion_done.
     program_script: list[int] = field(default_factory=lambda: [1])
+
+    @property
+    def jt_cur_pos(self) -> list[float]:
+        if len(self.joints_script) > 1:
+            return list(self.joints_script.pop(0))
+        return list(self.joints_script[0])
+
+    @jt_cur_pos.setter
+    def jt_cur_pos(self, value: list[float]) -> None:
+        self.joints_script = [list(value)]
 
     @property
     def robot_state(self) -> int:

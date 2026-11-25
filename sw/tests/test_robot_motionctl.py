@@ -928,6 +928,31 @@ def _luaplay_ready(connect, monkeypatch):
     return uploads
 
 
+def _script_program_motion(connect, _redirect_dirs, *, stop_off=0.0, state=None):
+    """Make ProgramRun move the fake arm from the start joints to the end
+    joints (20 readings), then stand still there. `stop_off` (deg on J1)
+    makes it stop that far from the end instead. `state` overrides the
+    program-state script."""
+    motions, _build = _redirect_dirs
+    joints = json.loads((motions / "demo" / "validated.json").read_text())
+    start, end = joints["samples"]["joints"][0], joints["samples"]["joints"][-1]
+    end = [end[0] + stop_off, *end[1:]]
+    path = [
+        [a + (b - a) * k / 20 for a, b in zip(start, end, strict=True)]
+        for k in range(21)
+    ]
+    real_run = connect.ProgramRun
+
+    def run():
+        code = real_run()
+        connect.robot_state_pkg.joints_script = [list(start)] + path
+        if state is not None:
+            connect.robot_state_pkg.program_script = list(state)
+        return code
+
+    connect.ProgramRun = run
+
+
 def test_luaplay_refuses_the_sim_ip(connect, _redirect_dirs):
     assert _run(["luaplay", "demo", "--ip", motionctl.SIM_IP]) == 1
 
@@ -951,6 +976,7 @@ def test_luaplay_with_yes_moves_to_start_then_runs_the_program(
     connect, _redirect_dirs, monkeypatch
 ):
     _luaplay_ready(connect, monkeypatch)
+    _script_program_motion(connect, _redirect_dirs)
     monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
     assert _run(["luaplay", "demo", "--ovl", "50"]) == 0
     names = [c[0] for c in connect.calls]
@@ -999,3 +1025,28 @@ def test_luaplay_ctrl_c_stops_program_and_motion(connect, _redirect_dirs, monkey
     assert connect.program_runs == 0
     assert connect.program_stops == 1
     assert ("StopMotion", (), {}) in connect.calls
+
+
+def test_luaplay_waits_for_the_arm_even_when_the_state_leaves_running_early(
+    connect, _redirect_dirs, monkeypatch, capsys
+):
+    """Real robot: the program state left 'running' 0.4 s into a 10 s program."""
+    _luaplay_ready(connect, monkeypatch)
+    _script_program_motion(connect, _redirect_dirs, state=[2, 1])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
+    assert _run(["luaplay", "demo", "--ovl", "100"]) == 0
+    out = capsys.readouterr().out
+    assert "Program finished" in out
+    assert connect.program_stops == 0
+
+
+def test_luaplay_reports_a_program_that_stops_short_of_the_end(
+    connect, _redirect_dirs, monkeypatch, capsys
+):
+    _luaplay_ready(connect, monkeypatch)
+    _script_program_motion(connect, _redirect_dirs, stop_off=5.0, state=[2, 1])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
+    assert _run(["luaplay", "demo", "--ovl", "100"]) == 0
+    out = capsys.readouterr().out
+    assert "Program ended before the end of the path" in out
+    assert "Stopped near row" in out
