@@ -1,0 +1,70 @@
+name: updownup_land
+tool_id: 1
+interpolation: joint
+ramp_fraction: 0.2
+sample_period_ms: 8
+seed_joints:
+- 89.718
+- -90.297
+- 0.077
+- 29.6695
+- -89.5659
+- 45.7689
+orientation:
+  mode: angles
+workspace:
+  min:
+  - -50
+  - -1400
+  - -650
+  max:
+  - 250
+  - -300
+  - 800
+keyframes:
+- t: 0.0
+  pos:
+  - 122.973
+  - -403.574
+  - 675.107
+  pan: -91.1649
+  tilt: -29.4524
+  seed:
+  - 89.718
+  - -90.297
+  - 0.077
+  - 29.6695
+  - -89.5659
+  - 45.7689
+- t: 1.7
+  pos:
+  - 129.857
+  - -889
+  - -397
+  pan: -90.0
+  tilt: 25.0
+  seed:
+  - 89.0
+  - 60.0
+  - 0.0
+  - -175.0
+  - -90.0
+  - 45.0
+- t: 3.4
+  pos:
+  - 122.973
+  - -403.574
+  - 675.107
+  pan: -91.1649
+  tilt: -29.4524
+  seed:
+  - 89.718
+  - -90.297
+  - 0.077
+  - 29.6695
+  - -89.5659
+  - 45.7689
+limits:
+  max_tcp_speed_mm_s: 1800.0
+  max_joint_speed_deg_s: 200.0
+  max_joint_acc_deg_s2: 800
