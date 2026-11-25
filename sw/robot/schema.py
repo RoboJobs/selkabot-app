@@ -132,8 +132,9 @@ class Design:
     ramp_fraction: float | None = None  # joint mode: cruise profile, see joint_path
     format: str = DEFAULT_FORMAT  # "landscape" or "portrait" (D11)
     # Joint mode: solve J4-J6 at every sample for the exact roll (default), or
-    # follow the joint blend (for moves whose wrist sits at the singularity
-    # but whose blend keeps the roll; check_roll still verifies it).
+    # follow the joint blend (check_roll still verifies the roll, and the
+    # wrist singularity check still applies: the controller will not play a
+    # TPD at J5 = 0/180).
     level_wrist: bool = True
 
     @property

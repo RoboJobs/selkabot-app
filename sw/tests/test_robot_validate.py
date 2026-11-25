@@ -608,7 +608,7 @@ def _singular_portrait_joints(kin, pan, tilt, pos, roll=90):
 
 
 def test_level_wrist_false_blends_joints_and_still_checks_the_roll():
-    kin = WristFK(mount=SINGULAR_PORTRAIT_MOUNT)
+    kin = WristFK()  # portrait wrist at J5 = -85: away from the singularity
     a = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0))
     b = [a[0], a[1] + 2.0, a[2] - 1.0, a[3], a[4], a[5]]  # arm only moves
     raw = {**PORTRAIT_JOINT, "level_wrist": False,
@@ -616,19 +616,29 @@ def test_level_wrist_false_blends_joints_and_still_checks_the_roll():
     design = _design(raw)
     report = validate.validate(design, [], kin)
     assert report.passed, [c for c in report.checks if not c.passed]
-    assert abs(a[4]) < 1.0  # J5 at the singularity, accepted
     _, kf_joints = validate.check_keyframe_ik(design, kin)
     from sw.robot.joint_path import sample_joint_path
 
     _, blend = sample_joint_path(design, kf_joints)
     assert report.joints == [list(q) for q in blend]  # no wrist solve
-    # The same blend with the wrist leveled is rejected at the singularity.
-    leveled = validate.validate(_design({**raw, "level_wrist": True}), [], kin)
-    assert not leveled.passed
+
+
+def test_level_wrist_false_at_the_wrist_singularity_is_rejected():
+    """The controller will not play a TPD at J5 = 0 (main 10 'singular pose',
+    or joint overspeed without smoothing), so the check applies here too."""
+    kin = WristFK(mount=SINGULAR_PORTRAIT_MOUNT)
+    a = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0))
+    assert abs(a[4]) < 1.0
+    b = [a[0], a[1] + 2.0, a[2] - 1.0, a[3], a[4], a[5]]
+    raw = {**PORTRAIT_JOINT, "level_wrist": False,
+           "keyframes": [{"t": 0.0, "joints": a}, {"t": 2.0, "joints": b}]}  # fmt: skip
+    report = validate.validate(_design(raw), [], kin)
+    assert not _check(report, "check_wrist_singularity").passed
+    assert _check(report, "check_roll").passed  # level, but unplayable
 
 
 def test_level_wrist_false_fails_check_roll_when_the_blend_rolls():
-    kin = WristFK(mount=SINGULAR_PORTRAIT_MOUNT)
+    kin = WristFK()
     a = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0))
     b = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0), roll=80)
     raw = {**PORTRAIT_JOINT, "level_wrist": False,

@@ -657,16 +657,10 @@ def _validate_joint(design: Design, kin: Kinematics) -> ValidationReport:
     ]
 
     peaks = _compute_peaks(design, samples, joints)
-    if design.level_wrist:
-        checks.append(check_wrist_singularity(design, samples, joints))
-    else:  # no wrist solve to be ill-conditioned; check_roll verifies the level
-        checks.append(
-            CheckResult(
-                "check_wrist_singularity",
-                True,
-                "skipped: level_wrist is false (the wrist is not solved)",
-            )
-        )
+    # Always, also with level_wrist false: the controller refuses to play a
+    # TPD at the wrist singularity (main 10 "singular pose" with smoothing,
+    # main 1 sub 24 joint overspeed without; real robot, 2026-11-25).
+    checks.append(check_wrist_singularity(design, samples, joints))
     roll_result, peaks.max_roll_deg = check_roll(
         poses, design.limits.max_roll_deg, design.camera_roll_deg
     )
