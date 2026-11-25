@@ -587,7 +587,9 @@ def level_joint_path(
 
     The blended wrist is the starting guess; the previous sample's solution
     (shifted by the blend's change) warm-starts the next, so each solve takes
-    a handful of FK calls.
+    a handful of FK calls. A sample counts as level within the design's
+    max_roll_deg and max_pointing_error_deg (near J5 = 0/180 the solve stops
+    short of exact); check_roll then verifies the roll on FK.
     """
     times, blend = sample_joint_path(design, kf_joints)
     if not design.level_wrist:
@@ -618,6 +620,8 @@ def level_joint_path(
                 tilt_ch.value(t),
                 guess,
                 roll=design.camera_roll_deg,
+                roll_tol_deg=design.limits.max_roll_deg,
+                point_tol_deg=design.limits.max_pointing_error_deg,
             )
         except LevelError as exc:
             return (

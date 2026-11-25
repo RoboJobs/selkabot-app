@@ -62,6 +62,24 @@ def test_a_wrist_that_cannot_change_the_orientation_fails():
         level.solve_wrist(stuck_fk, [0.0] * 6, pan=0.0, tilt=0.0)
 
 
+def test_solve_wrist_accepts_a_small_residual_within_the_given_tolerances():
+    """Near the wrist singularity the solve stops short of exact; the
+    validator accepts that within the design's tolerances."""
+    fixed = FakeKinematics().fk(_joints_for((600, 0, 400), pan=0, tilt=0, roll=0.09))
+
+    def stuck_fk(joints):  # roll stays 0.09deg off, pan/tilt exact
+        return list(fixed)
+
+    with pytest.raises(level.LevelError, match="roll off by 0.09"):
+        level.solve_wrist(stuck_fk, [0.0] * 6, pan=0.0, tilt=0.0)  # exact default
+    solved = level.solve_wrist(
+        stuck_fk, [0.0] * 6, pan=0.0, tilt=0.0, roll_tol_deg=0.5, point_tol_deg=0.1
+    )
+    assert len(solved) == 6
+    with pytest.raises(level.LevelError, match="pan/tilt off"):
+        level.solve_wrist(stuck_fk, [0.0] * 6, pan=0.3, tilt=0.0, roll_tol_deg=0.5)
+
+
 # -- portrait (roll 90) with a real spherical wrist (WristFK) -----------------
 
 PORTRAIT_SEED = [0.0, 0.0, 0.0, 0.0, -90.0, 0.0]

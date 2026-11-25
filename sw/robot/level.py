@@ -60,13 +60,18 @@ def solve_wrist(
     tilt: float,
     wrist_guess: list[float] | None = None,
     roll: float = 0.0,
+    roll_tol_deg: float = TOLERANCE_DEG,
+    point_tol_deg: float = TOLERANCE_DEG,
 ) -> list[float]:
     """J4-J6 that put the camera at the given pan and tilt with a constant
     roll about its optical axis (0 = landscape, 90 = portrait), keeping J1-J3
     of `joints`. Returns the full joint vector; raises LevelError when the
-    orientation cannot be reached. A singular wrist (J5 near 0/180) may still
-    succeed here; a wrist that spins there is caught by the validator's joint
-    speed/acceleration/step checks."""
+    best solution is still more than `roll_tol_deg` off in roll or
+    `point_tol_deg` off in pan/tilt. The defaults are exact (capture); the
+    validator passes the design's own tolerances, since near the wrist
+    singularity (J5 near 0/180) the solve is ill-conditioned and stops short
+    of exact by an invisible amount. A wrist that spins there is caught by
+    the validator's joint speed/acceleration/step checks."""
     if abs(tilt) > MAX_ABS_TILT_DEG:
         raise LevelError(
             f"tilt {tilt:.1f}deg is too close to vertical for a level horizon"
@@ -79,11 +84,14 @@ def solve_wrist(
 
     start = list(wrist_guess) if wrist_guess is not None else list(joints[3:])
     sol = least_squares(residual, start, diff_step=DIFF_STEP, xtol=1e-10, ftol=1e-10)
-    worst = max(abs(v) for v in sol.fun)
-    if worst > TOLERANCE_DEG:
+    roll_err = abs(sol.fun[0])
+    point_err = max(abs(sol.fun[1]), abs(sol.fun[2]))
+    if roll_err > roll_tol_deg or point_err > point_tol_deg:
         raise LevelError(
-            f"wrist could not level the camera (residual {worst:.4f}deg; J5 near "
-            "0 or 180 is the wrist singularity)"
+            f"wrist could not level the camera (roll off by {roll_err:.4f}deg, "
+            f"limit {roll_tol_deg:g}; pan/tilt off by {point_err:.4f}deg, limit "
+            f"{point_tol_deg:g}; J5={float(sol.x[1]):.1f}deg, and J5 near 0 or "
+            "180 is the wrist singularity)"
         )
     return [*arm, *(float(v) for v in sol.x)]
 

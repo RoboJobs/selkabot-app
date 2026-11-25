@@ -108,7 +108,7 @@ class Limits:
     overshoot_pct: float = 2.0
     # Max deviation from the format's roll (0 landscape, 90 portrait).
     max_roll_deg: float = 0.5
-    max_pointing_error_deg: float = 0.1
+    max_pointing_error_deg: float = 0.1  # joint mode: per-sample pan/tilt solve
     min_segment_s: float = 0.05
 
 

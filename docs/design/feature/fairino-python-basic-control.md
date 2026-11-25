@@ -319,7 +319,7 @@ keyframes:
 ```
 Joint-mode rules: a keyframe is either a pose (`pos`, `pan`, `tilt`, optional `seed`) or `joints` (then no `pos`/`pan`/`tilt`/`seed`); no `vel` overrides; `joints`/`seed` are rejected in cartesian mode.
 
-Limits used: `max_tcp_speed_mm_s`, `max_joint_speed_deg_s`, `max_joint_acc_deg_s2`, `max_joint_step_deg` (both modes); `min_elbow_margin_deg` (5) and `min_wrist_margin_deg` (15) (cartesian `check_singularity`); `max_roll_deg` (0.5, joint `check_roll`); `overshoot_pct` (cartesian). `max_wrist_step_deg` and `max_pointing_error_deg` are accepted and ignored.
+Limits used: `max_tcp_speed_mm_s`, `max_joint_speed_deg_s`, `max_joint_acc_deg_s2`, `max_joint_step_deg` (both modes); `min_elbow_margin_deg` (5) and `min_wrist_margin_deg` (15) (cartesian `check_singularity`); `max_roll_deg` (0.5, joint `check_roll` and the per-sample wrist solve); `max_pointing_error_deg` (0.1, joint: the per-sample wrist solve's pan/tilt tolerance); `overshoot_pct` (cartesian). `max_wrist_step_deg` is accepted and ignored.
 
 ### `sw/robot/motions/<name>/validated.json` (written by `validate`; git-ignored)
 - `name`, `design_sha256`, `created` (ISO 8601), `sample_period_ms`, `tool_id`, `interpolation`, `install_angle`.

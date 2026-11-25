@@ -647,3 +647,20 @@ def test_level_wrist_false_fails_check_roll_when_the_blend_rolls():
            "keyframes": [{"t": 0.0, "joints": a}, {"t": 2.0, "joints": b}]}  # fmt: skip
     report = validate.validate(_design(raw), [], kin)
     assert not _check(report, "check_roll").passed
+
+
+def test_level_joint_path_uses_the_design_tolerances(monkeypatch):
+    seen = {}
+    real = validate.solve_wrist
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(validate, "solve_wrist", spy)
+    raw = {
+        **PORTRAIT_JOINT,
+        "limits": {"max_roll_deg": 0.4, "max_pointing_error_deg": 0.2},
+    }
+    validate.validate(_design(raw), [], WristFK())
+    assert seen["roll_tol_deg"] == 0.4 and seen["point_tol_deg"] == 0.2
