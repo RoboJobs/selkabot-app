@@ -23,14 +23,13 @@ from sw.robot.motion_runner import MotionError, MotionStopped, RunnerState
 from sw.robot.schema import RobotSettings, motion_config_from_dict
 from sw.robot.ui_state import UiState
 
-# The committed motion.json predates Lua playback (published for MoveTPD).
-TPD_MOTION_JSON = (
-    Path(__file__).resolve().parents[1]
-    / "robot"
-    / "motions"
-    / "up_down_horizontal"
-    / "motion.json"
-)
+# A motion.json published for MoveTPD, before Lua playback.
+TPD_MOTION_RAW = {
+    "name": "old",
+    "backend": "tpd",
+    "controller_file": "/fruser/traj/motion_old.txt",
+    "tpd_name": "traj/motion_old",
+}
 MOTION_RAW = {
     "name": "up_down_horizontal",
     "backend": "lua",
@@ -546,7 +545,7 @@ def test_load_motions_reports_broken_files(tmp_path):
     (bad / "motion.json").write_text("{}")
     old = tmp_path / "old"
     old.mkdir()
-    (old / "motion.json").write_text(TPD_MOTION_JSON.read_text())
+    (old / "motion.json").write_text(json.dumps(TPD_MOTION_RAW))
     (tmp_path / "draft").mkdir()
     configs, broken = l.load_motions(tmp_path)
     assert list(configs) == ["up_down_horizontal"]
