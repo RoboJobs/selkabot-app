@@ -1053,3 +1053,13 @@ def test_wait_for_program_stops_on_a_robot_error(client):
     outcome = motionctl._wait_for_program(robot, [0.0] * 6, deadline_s=5.0)
     assert outcome == "Robot error during the program: main 1, sub 24"
     assert client.program_stops == 1
+
+
+def test_luaplay_reports_how_long_the_program_ran(
+    connect, _redirect_dirs, monkeypatch, capsys
+):
+    _luaplay_ready(connect, monkeypatch)
+    _script_program_motion(connect, _redirect_dirs, state=[1, 2, 2, 2, 2, 1])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
+    assert _run(["luaplay", "demo", "--ovl", "100"]) == 0
+    assert "(program ran " in capsys.readouterr().out

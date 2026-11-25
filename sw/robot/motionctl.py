@@ -940,6 +940,7 @@ def _stop_program(robot: FR5) -> None:
             print(f"{exc} while stopping")
 
 
+PROGRAM_RUNNING = 2
 AT_END_DEG = 0.5  # max joint error to the last row to count as arrived
 STILL_DEG = 0.01  # max joint change between two polls to count as standing
 SETTLE_S = 0.3  # how long the arm must stand still
@@ -950,18 +951,30 @@ def _wait_for_program(
 ) -> str:
     """Wait until the arm has moved, reached `end_joints` and stands still,
     watching the robot's error code; stop the program on an error or at the
-    deadline. The program state is not used: on the real robot it toggles
-    between 1 and 2 every ~0.1 s while a ServoJ program runs (2026-11-25).
+    deadline. The program state does not decide completion (with WaitMs
+    between ServoJ calls it toggled 1/2 every ~0.1 s; a motion may pause);
+    it is only used to report how long the program itself ran.
     Returns a one-line outcome."""
     t0 = time.monotonic()
     prev = robot.joints()
     moved = False
     still_since: float | None = None
+    ran: list[float | None] = [None, None]  # program state: first/last running
+
+    def timing() -> str:
+        if ran[0] is None or ran[1] is None:
+            return ""
+        return f" (program ran {ran[1] - ran[0]:.2f}s, from t={ran[0]:.2f}s)"
+
     while (now := time.monotonic()) - t0 < deadline_s:
         main, sub = robot.error_codes()
         if main:
             _stop_program(robot)
             return f"Robot error during the program: main {main}, sub {sub}"
+        if robot.program_state() == PROGRAM_RUNNING:
+            if ran[0] is None:
+                ran[0] = now - t0
+            ran[1] = now - t0
         joints = robot.joints()
         step = max(abs(a - b) for a, b in zip(joints, prev, strict=True))
         prev = joints
@@ -976,7 +989,7 @@ def _wait_for_program(
             <= AT_END_DEG
         )
         if settled and moved and at_end:
-            return "Program finished"
+            return "Program finished" + timing()
         time.sleep(poll_s)
     _stop_program(robot)
     return f"Program still running after {deadline_s:.1f}s; stopped it"
