@@ -1,0 +1,39 @@
+{
+  "name": "br2tl_land",
+  "backend": "lua",
+  "controller_file": "/fruser/motion_br2tl_land.lua",
+  "md5": "f48c40d1e55accb3f5bbb3f45ad7fcb3",
+  "num_points": 1005,
+  "sample_period_ms": 8,
+  "duration_s": 8.032,
+  "design_duration_s": 5.62,
+  "start_joints": [
+    -0.4103,
+    43.6007,
+    2.353,
+    -128.4497,
+    -73.0531,
+    -69.3183
+  ],
+  "end_joints": [
+    0.8363,
+    -46.0456,
+    3.0296,
+    -53.8459,
+    -104.8535,
+    -70.147
+  ],
+  "start_pose": [
+    -531.5796508789062,
+    -491.0639343261718,
+    -369.6532897949218,
+    -71.51071166992188,
+    -3.05288381241553e-07,
+    -157.2115020751953
+  ],
+  "tool_id": 1,
+  "approved_ovl": 70,
+  "design_sha256": "d220bbdcce23d5d95097b3fc7ab0f2e00b4d6335d178fb94302f39be692c12b7",
+  "published_at": "2026-11-25T17:28:48",
+  "format": "landscape"
+}
