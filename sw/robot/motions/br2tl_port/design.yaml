@@ -1,0 +1,39 @@
+name: br2tl_port
+interpolation: joint
+format: portrait
+tool_id: 1
+ramp_fraction: 0.2
+sample_period_ms: 8
+seed_joints: [3.6607, 48.431, 1.5474, -229.9784, 111.4129, 126.1114]
+orientation:
+  mode: angles
+workspace:  # keyframes span x -405..551, y -496..-353, z -307..649, plus margin
+  min: [-650.0, -1300.0, -450.0]
+  max: [700.0, -250.0, 800.0]
+# Rebuilt from the capture output (each capture was run with --reset by
+# mistake): pos/pan/tilt and the leveled joints (seed) as printed.
+keyframes:
+- t: 0.0
+  pos: [-306.671, -495.528, -306.334]
+  pan: -64.9264
+  tilt: 8.8886
+  seed: [3.6607, 48.431, 1.5474, -229.9784, 111.4129, 126.1114]
+- t: 2.0
+  pos: [551.431, -409.303, 648.689]
+  pan: -113.0838
+  tilt: -16.9672
+  seed: [165.3201, -31.7368, -14.8705, -133.3927, -98.4039, 151.9673]
+- t: 3.0
+  pos: [413.477, -352.976, -307.229]
+  pan: -117.9299
+  tilt: 6.3224
+  seed: [168.9023, 37.6572, 22.9312, -240.5884, -106.8322, 128.6776]
+- t: 5.0
+  pos: [-405.31, -380.218, 648.641]
+  pan: -58.3938
+  tilt: -13.7692
+  seed: [-4.224, -43.9105, 14.45, -150.5395, 125.8302, 148.7692]
+limits:
+  max_tcp_speed_mm_s: 3000.0
+  max_joint_speed_deg_s: 180.0
+  max_joint_acc_deg_s2: 1500.0
