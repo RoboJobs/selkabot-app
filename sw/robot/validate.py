@@ -34,14 +34,14 @@ from sw.robot.level import LevelError, solve_wrist
 from sw.robot.path import Sample, to_sdk_pose
 from sw.robot.pose import (
     camera_angles,
-    roll_error_deg,
+    pose_rotation_diff_deg,
+    roll_deviation_deg,
     sdk_euler_to_rotation,
     unwrap_deg,
 )
 from sw.robot.schema import Design
 
 JOINT_LIMIT_MARGIN_DEG = 2.0
-FK_ROUNDTRIP_STRIDE = 10  # check every 10th sample
 FK_ROUNDTRIP_MAX_POS_MM = 0.1
 FK_ROUNDTRIP_MAX_ROT_DEG = 0.05
 
@@ -69,7 +69,7 @@ class Peaks:
     max_joint_step_deg: float = 0.0
     max_fk_pos_err_mm: float = 0.0
     max_fk_rot_err_deg: float = 0.0
-    max_roll_deg: float = 0.0
+    max_roll_deg: float = 0.0  # max deviation from the format's roll
 
 
 @dataclass
@@ -267,7 +267,7 @@ def check_ik(
     joints: list[list[float]] = []
     ref = list(design.seed_joints)
     for i, s in enumerate(samples):
-        pose = to_sdk_pose(s)
+        pose = to_sdk_pose(s, design.camera_roll_deg)
         solution = kin.ik(pose, ref)
         if solution is None:
             return (
@@ -350,24 +350,28 @@ def check_wrist_singularity(
     return CheckResult("check_wrist_singularity", True)
 
 
-def check_roll(poses: list[list[float]], limit_deg: float) -> tuple[CheckResult, float]:
-    """Joint mode: the camera's roll about its optical axis stays within limit."""
+def check_roll(
+    poses: list[list[float]], limit_deg: float, target_roll: float = 0.0
+) -> tuple[CheckResult, float]:
+    """The camera's roll about its optical axis stays within limit_deg of
+    target_roll (0 landscape, 90 portrait). Returns the worst deviation."""
     worst, worst_i = 0.0, 0
     for i, pose in enumerate(poses):
-        roll = abs(roll_error_deg(sdk_euler_to_rotation(*pose[3:])))
-        if roll > worst:
-            worst, worst_i = roll, i
+        dev = abs(roll_deviation_deg(sdk_euler_to_rotation(*pose[3:]), target_roll))
+        if dev > worst:
+            worst, worst_i = dev, i
     if worst > limit_deg:
         return (
             CheckResult(
                 "check_roll",
                 False,
-                f"sample {worst_i}: camera roll {worst:.3f}deg exceeds max_roll_deg "
-                f"({limit_deg}). Give the keyframes equal J5 and J6 to keep it level",
+                f"sample {worst_i}: camera roll is {worst:.3f}deg off the wanted "
+                f"{target_roll:g}deg, more than max_roll_deg ({limit_deg})",
             ),
             worst,
         )
-    return CheckResult("check_roll", True, f"max roll {worst:.3f}deg"), worst
+    detail = f"max deviation {worst:.3f}deg from roll {target_roll:g}deg"
+    return CheckResult("check_roll", True, detail), worst
 
 
 def check_keyframe_ik(
@@ -386,7 +390,9 @@ def check_keyframe_ik(
         if kf.joints is not None:
             joints = list(kf.joints)
         else:
-            pose = to_sdk_pose(Sample(kf.t, kf.pos, kf.pan, kf.tilt, None))
+            pose = to_sdk_pose(
+                Sample(kf.t, kf.pos, kf.pan, kf.tilt, None), design.camera_roll_deg
+            )
             seed = list(kf.seed) if kf.seed is not None else prev
             joints = kin.ik(pose, seed)
             if joints is None:
@@ -477,30 +483,27 @@ def check_joint_speed_acc(
     return CheckResult("check_joint_speed_acc", True)
 
 
-def _angle_diff_deg(a: float, b: float) -> float:
-    """Smallest difference between two angles in degrees, wrapped to [0, 180].
-
-    Plain subtraction is wrong here: Euler angles near +/-180deg represent
-    almost the same rotation but differ by ~360deg as raw numbers.
-    """
-    return abs((a - b + 180.0) % 360.0 - 180.0)
-
-
 def check_fk_roundtrip(
-    samples: list[Sample], joints: list[list[float]], kin: Kinematics
-) -> tuple[CheckResult, float, float]:
-    """Returns the check result plus the max position/rotation error found,
-    even when the check fails, so callers can report the peaks either way."""
+    samples: list[Sample],
+    joints: list[list[float]],
+    kin: Kinematics,
+    roll_deg: float = 0.0,
+) -> tuple[CheckResult, float, float, list[list[float]]]:
+    """FK every solved sample and compare it with the *planned* pose
+    (position, and orientation as a rotation: Euler triples near ry = 90 are
+    not unique). Returns the result, the max position/rotation errors (even
+    when the check fails) and the FK poses, which become the artifact's pose
+    columns (the controller's own representation)."""
     max_pos_err = 0.0
     max_rot_err = 0.0
     failure: str | None = None
-    for i in range(0, len(joints), FK_ROUNDTRIP_STRIDE):
-        pose = kin.fk(joints[i])
-        expected = to_sdk_pose(samples[i])
+    fk_poses: list[list[float]] = []
+    for i, js in enumerate(joints):
+        pose = list(kin.fk(js))
+        fk_poses.append(pose)
+        expected = to_sdk_pose(samples[i], roll_deg)
         pos_err = math.dist(pose[:3], expected[:3])
-        rot_err = max(
-            _angle_diff_deg(a, b) for a, b in zip(pose[3:], expected[3:], strict=True)
-        )
+        rot_err = pose_rotation_diff_deg(pose, expected)
         max_pos_err = max(max_pos_err, pos_err)
         max_rot_err = max(max_rot_err, rot_err)
         if failure is None and (
@@ -511,7 +514,7 @@ def check_fk_roundtrip(
                 f"{rot_err:.4f}deg from the planned pose"
             )
     result = CheckResult("check_fk_roundtrip", failure is None, failure or "")
-    return result, max_pos_err, max_rot_err
+    return result, max_pos_err, max_rot_err, fk_poses
 
 
 # -- peaks from finite differences -------------------------------------------
@@ -584,9 +587,21 @@ def level_joint_path(
 
     The blended wrist is the starting guess; the previous sample's solution
     (shifted by the blend's change) warm-starts the next, so each solve takes
-    a handful of FK calls.
+    a handful of FK calls. A sample counts as level within the design's
+    max_roll_deg and max_pointing_error_deg (near J5 = 0/180 the solve stops
+    short of exact); check_roll then verifies the roll on FK.
     """
     times, blend = sample_joint_path(design, kf_joints)
+    if not design.level_wrist:
+        return (
+            CheckResult(
+                "check_wrist_level",
+                True,
+                "skipped: level_wrist is false, J4-J6 follow the joint blend",
+            ),
+            times,
+            [list(q) for q in blend],
+        )
     kf_times = [kf.t for kf in design.keyframes]
     stop = [i for i, kf in enumerate(design.keyframes) if kf.stop]
     kf_pans, kf_tilts = _keyframe_view(design, kin, kf_joints)
@@ -598,7 +613,16 @@ def level_joint_path(
         if i > 0:
             guess = [g + q[k + 3] - blend[i - 1][k + 3] for k, g in enumerate(guess)]
         try:
-            solved = solve_wrist(kin.fk, q, pan_ch.value(t), tilt_ch.value(t), guess)
+            solved = solve_wrist(
+                kin.fk,
+                q,
+                pan_ch.value(t),
+                tilt_ch.value(t),
+                guess,
+                roll=design.camera_roll_deg,
+                roll_tol_deg=design.limits.max_roll_deg,
+                point_tol_deg=design.limits.max_pointing_error_deg,
+            )
         except LevelError as exc:
             return (
                 CheckResult(
@@ -637,8 +661,12 @@ def _validate_joint(design: Design, kin: Kinematics) -> ValidationReport:
     ]
 
     peaks = _compute_peaks(design, samples, joints)
-    checks.append(check_wrist_singularity(design, samples, joints))
-    roll_result, peaks.max_roll_deg = check_roll(poses, design.limits.max_roll_deg)
+    # No wrist-singularity check in joint mode: it existed because MoveTPD
+    # refuses paths at J5 = 0; the Lua ServoJ playback plays them (real robot,
+    # 2026-11-25). The joint speed/acceleration/step checks bound J4/J6.
+    roll_result, peaks.max_roll_deg = check_roll(
+        poses, design.limits.max_roll_deg, design.camera_roll_deg
+    )
     checks += [
         check_workspace(design, samples),
         check_tcp_speed(design, samples, peaks),
@@ -676,13 +704,23 @@ def _validate_cartesian(
         checks.append(check_joint_steps(design, joints))
         checks.append(check_joint_limits(joints, kin))
         checks.append(check_joint_speed_acc(design, joints, peaks))
-        fk_result, pos_err, rot_err = check_fk_roundtrip(samples, joints, kin)
+        fk_result, pos_err, rot_err, fk_poses = check_fk_roundtrip(
+            samples, joints, kin, design.camera_roll_deg
+        )
         peaks.max_fk_pos_err_mm = pos_err
         peaks.max_fk_rot_err_deg = rot_err
         checks.append(fk_result)
+        roll_result, peaks.max_roll_deg = check_roll(
+            fk_poses, design.limits.max_roll_deg, design.camera_roll_deg
+        )
+        checks.append(roll_result)
+        # The artifact's pose columns are the controller's FK of the joints
+        # (its own Euler representation), checked above against the plan.
+        poses = fk_poses
+    else:
+        poses = [to_sdk_pose(s, design.camera_roll_deg) for s in samples]
 
     passed = all(c.passed for c in checks)
-    poses = [to_sdk_pose(s) for s in samples]
     return ValidationReport(passed, checks, peaks, joints, list(samples), poses)
 
 
@@ -695,7 +733,7 @@ def report_to_validated(
     come from FK, not from `samples`); `samples` is kept for older callers.
     """
     samples = report.samples or samples
-    poses = report.poses or [to_sdk_pose(s) for s in samples]
+    poses = report.poses or [to_sdk_pose(s, design.camera_roll_deg) for s in samples]
     duration_s = design.sample_period_ms * (len(samples) - 1) / 1000.0
     design_duration_s = float(design.keyframes[-1].t)
     return {
@@ -704,6 +742,7 @@ def report_to_validated(
         "created": datetime.datetime.now(datetime.UTC).isoformat(),
         "sample_period_ms": design.sample_period_ms,
         "tool_id": design.tool_id,
+        "format": design.format,
         "interpolation": design.interpolation,
         "install_angle": None,  # filled by the caller from kin.install_angle()
         "num_points": len(samples),

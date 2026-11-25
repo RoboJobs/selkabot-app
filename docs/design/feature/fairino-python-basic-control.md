@@ -1,7 +1,7 @@
 # Plan: Camera-level robot motions (Fairino FR5) for livestream.py
 
 ## Read this first (rules for whoever implements this)
-1. **Motions are played with `MoveTPD`.** We generate a TPD file (the same format the teach pendant records), upload it, load it with `LoadTPD`, and play it with `MoveTPD`. This route is verified end to end on the real robot (§ History). **Do not use `LoadTrajectoryJ`/`MoveTrajectoryJ`, Lua programs, or `ServoJ` streaming.** Questions about the TrajectoryJ file format are closed: they do not matter.
+1. **Motions are played as controller Lua programs** (decision 2026-11-25; see `docs/design/feature/fairino-control-2.md`, § Lua playback for every motion). `compile` serializes the validated joint rows; `upload`/`publish` render them into a Lua program (`ServoJ` per row, the speed baked in) and upload it; the app runs it with `ProgramLoad`/`ProgramRun`. **`MoveTPD`/`LoadTPD` are no longer used** (they refuse paths at the wrist singularity); the TPD sections below are history. Do not use `LoadTrajectoryJ`/`MoveTrajectoryJ` or `ServoJ` streaming from Python in production (`simplay` is a preview).
 2. **Upload files only with `FR5.upload_file`** (§ Controller file transfer). Never call `TrajectoryJUpLoad`, `LuaUpload` or `PointTableUpLoad`: they fail with -1 because of a race in the SDK.
 3. **Work the phases in order** (§ Phases). Each phase lists its tasks, its tests and when it is done. The first goal is Phase 4's milestone: **a motion generated from a `design.yaml` plays on the real robot.**
 4. **Do not work on anything in § Deferred**, even if it looks related: camera calibration, roll measurement on the robot, stop latency, tracking/timing accuracy, singularity analysis, an independent stop channel, rehearsal ramps, atomic publishing. The user will ask for those later.
@@ -52,6 +52,7 @@ Consequences for implementation and testing:
 | D7 | Keep motions **≤ 20 s** for now. | The verified recording is 23 s (11520 points at 2 ms, 1.3 MB). |
 | D8 | Safety minimum: operator YES prompt before any motion; move to start at 25% speed (user's choice, 2026-11-25; was 10%); `StopMotion` on Ctrl-C, Stop, close or error; controller collision detection stays on. **The physical e-stop is the primary safety device.** | — |
 | D10 | Two interpolation modes (§ Interpolation modes), both exactly level. **`interpolation: joint` is the default choice for large moves** (cranes and swings that reach full extension or fold the arm); `cartesian` (the default value) for moves where the camera must follow a planned spatial path or track a target. | Found on the first real motion: a Cartesian straight line between "arm straight up" and "arm straight down" needs the elbow past its 160° limit and passes the wrist past the shoulder; no timing fixes that. The pendant's joint move does the same swing smoothly. |
+| D11 | `format: landscape \| portrait` in `design.yaml`: the camera's roll about its optical axis is held at 0° (landscape) or +90° (portrait, reached with the wrist; same tool 1). Cartesian pose columns are now the controller's FK of the solved joints, like joint mode (D6). See `docs/design/feature/fairino-control-2.md`. | Portrait videos without a second tool frame; portrait poses sit at the SDK Euler singularity (ry = ±90), so orientations are compared as rotations. |
 | D9 | The sim preview (`motionctl simplay`) streams a compiled TPD file's joints with `ServoJ`, one row per call, timed by the file's own period. **Never `ServoJT` (torque control).** | `ServoJ` is a direct joint-position stream, the closest thing to "replay this file" the sim can do, since `upload`/`MoveTPD` don't work there (§ Simulator vs real robot). `ServoJT` has no position reference; using it to track a trajectory needs a PD controller we have not built and do not need for visualization. |
 
 ## TPD file format (binding)
@@ -318,7 +319,7 @@ keyframes:
 ```
 Joint-mode rules: a keyframe is either a pose (`pos`, `pan`, `tilt`, optional `seed`) or `joints` (then no `pos`/`pan`/`tilt`/`seed`); no `vel` overrides; `joints`/`seed` are rejected in cartesian mode.
 
-Limits used: `max_tcp_speed_mm_s`, `max_joint_speed_deg_s`, `max_joint_acc_deg_s2`, `max_joint_step_deg` (both modes); `min_elbow_margin_deg` (5) and `min_wrist_margin_deg` (15) (cartesian `check_singularity`); `max_roll_deg` (0.5, joint `check_roll`); `overshoot_pct` (cartesian). `max_wrist_step_deg` and `max_pointing_error_deg` are accepted and ignored.
+Limits used: `max_tcp_speed_mm_s`, `max_joint_speed_deg_s`, `max_joint_acc_deg_s2`, `max_joint_step_deg` (both modes); `min_elbow_margin_deg` (5) and `min_wrist_margin_deg` (15) (cartesian `check_singularity`); `max_roll_deg` (0.5, joint `check_roll` and the per-sample wrist solve); `max_pointing_error_deg` (0.1, joint: the per-sample wrist solve's pan/tilt tolerance); `overshoot_pct` (cartesian). `max_wrist_step_deg` is accepted and ignored.
 
 ### `sw/robot/motions/<name>/validated.json` (written by `validate`; git-ignored)
 - `name`, `design_sha256`, `created` (ISO 8601), `sample_period_ms`, `tool_id`, `interpolation`, `install_angle`.

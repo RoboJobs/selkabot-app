@@ -1,0 +1,39 @@
+{
+  "name": "updownup_port",
+  "backend": "lua",
+  "controller_file": "/fruser/motion_updownup_port.lua",
+  "md5": "af6e63ad3341340caf58b903cf8f1541",
+  "num_points": 470,
+  "sample_period_ms": 8,
+  "duration_s": 3.752,
+  "design_duration_s": 3.0,
+  "start_joints": [
+    89.7094,
+    -90.3374,
+    0.161,
+    20.9054,
+    2.0,
+    51.2555
+  ],
+  "end_joints": [
+    89.7094,
+    -90.3374,
+    0.161,
+    20.9054,
+    2.0,
+    51.2555
+  ],
+  "start_pose": [
+    188.6188659667968,
+    -448.6852722167968,
+    758.1038208007812,
+    175.8849639892578,
+    62.94419479370117,
+    85.33519744873047
+  ],
+  "tool_id": 1,
+  "approved_ovl": 80,
+  "design_sha256": "1ca5d0e5d59e025797d9743ebb8c6f42a8fa208d36bad4289759cdc513bc8d0a",
+  "published_at": "2026-11-25T15:36:24",
+  "format": "portrait"
+}

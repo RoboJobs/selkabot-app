@@ -1,0 +1,39 @@
+{
+  "name": "up_down_portrait",
+  "backend": "lua",
+  "controller_file": "/fruser/motion_up_down_portrait.lua",
+  "md5": "5cc79af795a8ad37fd516b3ce9ec208b",
+  "num_points": 189,
+  "sample_period_ms": 8,
+  "duration_s": 1.504,
+  "design_duration_s": 1.5,
+  "start_joints": [
+    89.7094,
+    -90.3374,
+    0.161,
+    20.9054,
+    2.0,
+    51.2555
+  ],
+  "end_joints": [
+    88.5111,
+    53.6524,
+    15.8975,
+    -96.8609,
+    2.0,
+    -47.1213
+  ],
+  "start_pose": [
+    188.6188659667968,
+    -448.6852722167968,
+    758.1038208007812,
+    175.8849639892578,
+    62.94419479370117,
+    85.33519744873047
+  ],
+  "tool_id": 1,
+  "approved_ovl": 100,
+  "design_sha256": "efc697d512c9bcd1a7c650caf2cc3454fe5ffea417baaeea224a1fa738b51321",
+  "published_at": "2026-11-25T15:37:11",
+  "format": "portrait"
+}

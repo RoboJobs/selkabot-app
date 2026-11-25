@@ -13,21 +13,22 @@ from sw.robot.schema import RobotSettings, motion_config_from_dict
 from sw.tests.fakes.fake_robot import FakeRobotClient
 
 START_JOINTS = [10.0, -90.0, 90.0, -90.0, -90.0, 0.0]
+END_JOINTS = [40.0, -80.0, 80.0, -90.0, 2.0, 0.0]
 START_POSE = [600.0, 0.0, 400.0, -90.0, 0.0, -90.0]
 
 
-def _config(name="demo", data=b"tpd file", **overrides):
+def _config(name="demo", data=b"lua program", **overrides):
     raw = {
         "name": name,
-        "backend": "tpd",
-        "controller_file": f"/fruser/traj/motion_{name}.txt",
-        "tpd_name": f"traj/motion_{name}",
+        "backend": "lua",
+        "controller_file": f"/fruser/motion_{name}.lua",
         "md5": hashlib.md5(data).hexdigest(),
         "num_points": 6,
         "sample_period_ms": 8,
         "duration_s": 0.04,
         "design_duration_s": 0.04,
         "start_joints": START_JOINTS,
+        "end_joints": END_JOINTS,
         "start_pose": START_POSE,
         "tool_id": 1,
         "approved_ovl": 100,
@@ -41,8 +42,8 @@ def _config(name="demo", data=b"tpd file", **overrides):
 @pytest.fixture
 def client():
     c = FakeRobotClient()
-    c.files["/fruser/traj/motion_demo.txt"] = b"tpd file"
-    c.tpd_start_poses["traj/motion_demo"] = list(START_POSE)
+    c.files["/fruser/motion_demo.lua"] = b"lua program"
+    c.program_end_joints = list(END_JOINTS)
     return c
 
 
@@ -75,7 +76,7 @@ def _calls(client, name):
 
 
 def test_each_startup_problem_disables_only_that_motion(client):
-    client.files["/fruser/traj/motion_wrong.txt"] = b"something else"
+    client.files["/fruser/motion_wrong.lua"] = b"something else"
     motions = {
         "demo": _config(),
         "missing": _config("missing"),
@@ -123,17 +124,18 @@ def test_disabled_or_unknown_motions_raise_value_error(client):
 # -- load, move to start, at_start ------------------------------------------------
 
 
-def test_load_checks_the_start_pose_and_never_moves(runner, client):
+def test_load_checks_the_program_and_loads_it_without_moving(runner, client):
     runner.load("demo").result(timeout=5)
-    assert client.tpd_loaded == "traj/motion_demo"
-    assert not _calls(client, "MoveJ") and not _calls(client, "MoveTPD")
+    assert client.programs_loaded == ["/fruser/motion_demo.lua"]
+    assert not _calls(client, "MoveJ") and not _calls(client, "ProgramRun")
 
 
-def test_load_with_a_wrong_start_pose_fails_and_disables_the_motion(runner, client):
-    client.tpd_start_poses["traj/motion_demo"] = [0.0] * 6
-    with pytest.raises(mr.MotionError, match="start pose"):
+def test_load_of_a_changed_program_fails_and_disables_the_motion(runner, client):
+    client.files["/fruser/motion_demo.lua"] = b"changed on the controller"
+    with pytest.raises(mr.MotionError, match="md5 mismatch"):
         runner.load("demo").result(timeout=5)
     assert "demo" in runner.disabled
+    assert client.programs_loaded == []
 
 
 def test_move_to_start_at_25_percent_then_restores_the_speed(
@@ -174,53 +176,66 @@ def auto(client, monkeypatch):
     client.robot_state_pkg.robot_mode = 0
 
 
-def test_run_resolves_when_motion_done_goes_0_then_1(runner, client, auto):
+def test_run_plays_the_program_until_it_ends_at_the_last_row(runner, client, auto):
+    speeds_before = list(client.speeds)
     runner.run("demo").result(timeout=5)
-    assert client.move_tpd_calls == [("traj/motion_demo", 1, 100)]  # smoothed
-    assert client.speeds[-2:] == [100, 10]  # approved ovl as global speed, restored
+    assert client.programs_loaded == ["/fruser/motion_demo.lua"]
+    assert client.program_runs == 1
+    assert client.speeds == speeds_before  # the speed is baked into the program
+    assert not _calls(client, "MoveTPD")
     assert runner.state is mr.RunnerState.IDLE
 
 
-def test_run_fails_when_the_motion_never_starts(runner, client, auto):
-    client.move_tpd_script = [1]
+def test_run_fails_when_the_program_never_starts(runner, client, auto):
+    client.program_run_script = [1]
     with pytest.raises(mr.MotionError, match="did not start"):
         runner.run("demo").result(timeout=5)
     assert runner.state is mr.RunnerState.FAULT
 
 
+def test_run_fails_when_the_program_ends_away_from_the_last_row(
+    runner, client, auto, monkeypatch
+):
+    monkeypatch.setattr(mr, "END_WAIT_S", 0.05)
+    client.program_end_joints = [0.0] * 6
+    with pytest.raises(mr.MotionError, match="away from the motion's end"):
+        runner.run("demo").result(timeout=5)
+
+
 def test_run_raises_and_stops_on_a_robot_error(runner, client, auto):
-    client.move_tpd_script = [0]
+    client.program_run_script = [2]
     client.robot_state_pkg.main_code = 5
     with pytest.raises(FairinoError):
         runner.run("demo").result(timeout=5)
-    assert _calls(client, "StopMotion")
+    assert _calls(client, "ProgramStop") and _calls(client, "StopMotion")
 
 
-def test_watchdog_stops_a_motion_that_never_finishes(runner, client, auto):
-    client.move_tpd_script = [0]  # starts, never completes
+def test_watchdog_stops_a_program_that_never_finishes(runner, client, auto):
+    client.program_run_script = [2]  # starts, never completes
     with pytest.raises(mr.MotionTimeout):
         runner.run("demo").result(timeout=10)
-    assert _calls(client, "StopMotion")
+    assert _calls(client, "ProgramStop") and _calls(client, "StopMotion")
 
 
 def test_a_fault_blocks_motions_until_cleared(runner, client, auto):
-    client.move_tpd_script = [1]
+    client.program_run_script = [1]
     with pytest.raises(mr.MotionError):
         runner.run("demo").result(timeout=5)
     with pytest.raises(mr.MotionError, match="fault"):
         runner.run("demo")
     runner.clear_fault()
-    client.move_tpd_script = [0, 0, 1]
+    client.program_run_script = [2, 2, 1]
     runner.run("demo").result(timeout=5)
 
 
 def test_stop_during_a_run_ends_it_without_a_fault(runner, client, auto):
-    client.move_tpd_script = [0]
+    client.program_run_script = [2]
     future = runner.run("demo")
     threading.Timer(0.05, runner.stop).start()
     with pytest.raises(mr.MotionStopped):
         future.result(timeout=5)
     assert runner.state is mr.RunnerState.IDLE
+    assert _calls(client, "ProgramStop")
 
 
 # -- stop and close ---------------------------------------------------------------
@@ -237,7 +252,7 @@ def test_stop_never_raises_and_is_idempotent(runner, client, monkeypatch):
 def test_stop_uses_a_fresh_connection_when_an_rpc_blocks(client, auto, monkeypatch):
     monkeypatch.setattr(mr, "STOP_LOCK_TIMEOUT_S", 0.05)
     gate = threading.Event()
-    client.move_tpd_block = gate
+    client.program_run_block = gate
     r = _runner(client, watchdog_margin_s=0.3)
     try:
         r.connect_and_check().result(timeout=5)
@@ -246,14 +261,14 @@ def test_stop_uses_a_fresh_connection_when_an_rpc_blocks(client, auto, monkeypat
         threading.Timer(0.5, gate.set).start()
         with pytest.raises(mr.MotionError):
             future.result(timeout=10)
-        assert _calls(client, "StopMotion")  # sent while MoveTPD was blocked
+        assert _calls(client, "StopMotion")  # sent while ProgramRun was blocked
     finally:
         gate.set()
         r.close()
 
 
 def test_close_during_a_run_stops_and_rejects_new_jobs(client, auto):
-    client.move_tpd_script = [0]
+    client.program_run_script = [2]
     r = _runner(client, watchdog_margin_s=5.0)
     r.connect_and_check().result(timeout=5)
     future = r.run("demo")
@@ -267,3 +282,17 @@ def test_close_during_a_run_stops_and_rejects_new_jobs(client, auto):
         r.run("demo")
     r.close()  # idempotent
     assert r.state is mr.RunnerState.CLOSED and client.closed
+
+
+def test_portrait_motion_checks_and_runs_like_a_landscape_one(client, monkeypatch):
+    monkeypatch.setattr("sw.robot.fr5.time.sleep", lambda s: None)
+    client.robot_state_pkg.robot_mode = 0
+    r = _runner(client, {"demo": _config(format="portrait")})
+    try:
+        assert r.connect_and_check().result(timeout=5) == {"demo": None}
+        r.move_to_start("demo").result(timeout=5)
+        r.run("demo").result(timeout=5)
+    finally:
+        r.close()
+    assert client.move_j_calls[-1][1] == 1  # same camera tool
+    assert client.program_runs == 1

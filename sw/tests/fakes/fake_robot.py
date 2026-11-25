@@ -31,7 +31,9 @@ class FakeStatePkg:
     """The SDK's state cache. `motion_done` can be scripted: each read pops
     the next value of `motion_script` (the last value repeats)."""
 
-    jt_cur_pos: list[float] = field(default_factory=lambda: [0.0] * 6)
+    # Joint readings, scripted like motion_done: each read pops the next
+    # vector (the last repeats); assigning jt_cur_pos sets a single vector.
+    joints_script: list[list[float]] = field(default_factory=lambda: [[0.0] * 6])
     tl_cur_pos: list[float] = field(default_factory=lambda: [0.0] * 6)
     motion_script: list[int] = field(default_factory=lambda: [1])
     mc_queue_len: int = 0
@@ -39,6 +41,24 @@ class FakeStatePkg:
     main_code: int = 0
     sub_code: int = 0
     tool: int = 0
+    # Program state (1 stopped, 2 running, 3 paused), scripted like motion_done.
+    program_script: list[int] = field(default_factory=lambda: [1])
+
+    @property
+    def jt_cur_pos(self) -> list[float]:
+        if len(self.joints_script) > 1:
+            return list(self.joints_script.pop(0))
+        return list(self.joints_script[0])
+
+    @jt_cur_pos.setter
+    def jt_cur_pos(self, value: list[float]) -> None:
+        self.joints_script = [list(value)]
+
+    @property
+    def robot_state(self) -> int:
+        if len(self.program_script) > 1:
+            return self.program_script.pop(0)
+        return self.program_script[0]
 
     @property
     def motion_done(self) -> int:
@@ -61,6 +81,10 @@ class _FakeProxy:
         self._outer.file_upload_calls.append((file_type, name))
         return self._outer.file_upload_rtn
 
+    def LuaUpLoadUpdate(self, name: str) -> list:
+        self._outer.lua_registered.append(name)
+        return [self._outer.lua_update_rtn, ""]
+
 
 class FakeRobotClient:
     """Records every call. `errors[name] = code` injects a failure for `name`."""
@@ -75,6 +99,8 @@ class FakeRobotClient:
 
         self.file_upload_rtn = 0
         self.file_upload_calls: list[tuple[int, str]] = []
+        self.lua_registered: list[str] = []  # names passed to LuaUpLoadUpdate
+        self.lua_update_rtn = 0
         self.files: dict[str, bytes] = {}  # remote path -> bytes, for ComputeFileMD5
         self.deleted_files: list[str] = []
         self.tpd_loaded: str | None = None
@@ -91,6 +117,14 @@ class FakeRobotClient:
         self.servo_j_calls: list[tuple[list[float], list[float], float]] = []
         self.servo_move_started = False
         self.servo_move_ended = False
+        self.programs_loaded: list[str] = []
+        self.program_runs = 0
+        self.program_stops = 0
+        # robot_state values a ProgramRun produces (running, then stopped).
+        self.program_run_script: list[int] = [2, 2, 1]
+        # Where ProgramRun leaves the arm (None: it does not move the fake).
+        self.program_end_joints: list[float] | None = None
+        self.program_run_block: Any = None  # a threading.Event to block on
 
         self.install_angle: list[float] = [0.0, 0.0]
         self.soft_limits: list[float] = [
@@ -282,4 +316,36 @@ class FakeRobotClient:
             return code
         self.servo_j_calls.append((list(joint_pos), list(axisPos), cmdT))
         self.robot_state_pkg.jt_cur_pos = list(joint_pos)
+        return 0
+
+    # -- Lua programs ---------------------------------------------------------
+
+    def ProgramLoad(self, program_name: str) -> int:
+        self._record("ProgramLoad", (program_name,), {})
+        code = self._err("ProgramLoad")
+        if code:
+            return code
+        self.programs_loaded.append(program_name)
+        return 0
+
+    def ProgramRun(self) -> int:
+        self._record("ProgramRun", (), {})
+        code = self._err("ProgramRun")
+        if code:
+            return code
+        self.program_runs += 1
+        if self.program_run_block is not None:
+            self.program_run_block.wait()
+        self.robot_state_pkg.program_script = list(self.program_run_script)
+        if self.program_end_joints is not None:
+            self.robot_state_pkg.jt_cur_pos = list(self.program_end_joints)
+        return 0
+
+    def ProgramStop(self) -> int:
+        self._record("ProgramStop", (), {})
+        code = self._err("ProgramStop")
+        if code:
+            return code
+        self.program_stops += 1
+        self.robot_state_pkg.program_script = [1]
         return 0

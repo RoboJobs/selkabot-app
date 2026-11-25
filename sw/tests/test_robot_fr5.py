@@ -90,11 +90,11 @@ def test_state_readers_use_the_cache_not_an_rpc(robot, client):
 
 
 def test_nonzero_code_raises_fairino_error_with_call_name(robot, client):
-    client.errors["LoadTPD"] = 8
+    client.errors["ProgramLoad"] = 8
     with pytest.raises(fr5.FairinoError) as exc:
-        robot.load_tpd("traj/missing")
+        robot.load_program("/fruser/missing.lua")
     assert exc.value.code == 8
-    assert exc.value.call == "LoadTPD"
+    assert exc.value.call == "ProgramLoad"
 
 
 def test_plain_int_return_raises_on_nonzero(robot, client):
@@ -168,9 +168,27 @@ def test_move_j_calls_with_tool_and_user_zero(robot, client):
     assert kwargs == {"vel": 25}
 
 
-def test_move_tpd_calls_with_blend_and_ovl(robot, client):
-    robot.move_tpd("traj/motion_demo", 0, 50)
-    assert client.move_tpd_calls == [("traj/motion_demo", 0, 50)]
+# -- Lua programs ------------------------------------------------------------
+
+
+def test_run_program_loads_then_runs(robot, client):
+    robot.run_program("/fruser/motion_demo.lua")
+    assert [c[0] for c in client.calls] == ["ProgramLoad", "ProgramRun"]
+    assert client.programs_loaded == ["/fruser/motion_demo.lua"]
+    assert robot.program_state() == 2
+
+
+def test_run_program_load_failure_does_not_run(robot, client):
+    client.errors["ProgramLoad"] = 3
+    with pytest.raises(fr5.FairinoError):
+        robot.run_program("/fruser/missing.lua")
+    assert client.program_runs == 0
+
+
+def test_stop_program_calls_program_stop(robot, client):
+    robot.stop_program()
+    assert client.program_stops == 1
+    assert robot.program_state() == 1
 
 
 # -- stream_joints (D9, simulator preview only) -----------------------------
@@ -235,17 +253,10 @@ def test_stream_joints_never_calls_servo_jt(robot, client, monkeypatch):
 # -- TPD loading --------------------------------------------------------
 
 
-def test_load_tpd_and_start_pose(robot, client):
-    client.tpd_start_poses["traj/motion_demo"] = [1, 2, 3, 4, 5, 6]
-    robot.load_tpd("traj/motion_demo")
-    assert client.tpd_loaded == "traj/motion_demo"
-    assert robot.tpd_start_pose("traj/motion_demo") == [1, 2, 3, 4, 5, 6]
-
-
-def test_load_tpd_missing_file_raises_with_code_8(robot):
-    with pytest.raises(fr5.FairinoError) as exc:
-        robot.load_tpd("traj/nope")
-    assert exc.value.code == 8
+def test_robot_has_no_movetpd_calls(robot):
+    """Every motion is a Lua program; MoveTPD refuses the wrist singularity."""
+    for name in ("move_tpd", "load_tpd", "tpd_start_pose"):
+        assert not hasattr(robot, name)
 
 
 # -- file_md5 -------------------------------------------------------------
@@ -367,6 +378,41 @@ def test_upload_file_succeeds_when_listener_starts_late(client, data_port, tmp_p
     assert server.received.endswith(data + b"/b/f")
 
 
+def test_upload_lua_registers_the_program_before_verifying(client, data_port, tmp_path):
+    local = tmp_path / "motion_demo.lua"
+    local.write_text("P = {}\n")
+    server = data_port(store_as=(client, "/fruser/motion_demo.lua"))
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+
+    remote = robot.upload_file(str(local), file_type=0)
+
+    assert remote == "/fruser/motion_demo.lua"
+    assert client.file_upload_calls == [(0, "motion_demo.lua")]
+    assert client.lua_registered == ["motion_demo.lua"]
+
+
+def test_upload_lua_raises_register_when_the_controller_refuses(
+    client, data_port, tmp_path
+):
+    local = tmp_path / "motion_demo.lua"
+    local.write_text("P = {}\n")
+    server = data_port(store_as=(client, "/fruser/motion_demo.lua"))
+    client.lua_update_rtn = 7
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+    with pytest.raises(fr5.FileTransferError) as exc:
+        robot.upload_file(str(local), file_type=0)
+    assert exc.value.stage == "register"
+
+
+def test_upload_traj_does_not_register_a_program(client, data_port, tmp_path):
+    local = tmp_path / "motion_demo.txt"
+    local.write_text("1,1,8,0,0,0\n")
+    server = data_port(store_as=(client, "/fruser/traj/motion_demo.txt"))
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+    robot.upload_file(str(local), file_type=20)
+    assert client.lua_registered == []
+
+
 def test_upload_file_raises_connect_when_listener_never_starts(client, tmp_path):
     local = tmp_path / "motion_demo.txt"
     local.write_text("x")
@@ -437,3 +483,20 @@ def test_upload_file_never_calls_banned_sdk_methods(client, data_port, tmp_path)
     robot = _robot_for_upload(client, server.port)
 
     robot.upload_file(str(local), file_type=20)  # must not raise AssertionError
+
+
+def test_upload_lua_accepts_a_rewritten_program_but_not_a_missing_one(
+    client, data_port, tmp_path
+):
+    local = tmp_path / "motion_demo.lua"
+    local.write_text("P = {}\n")
+    server = data_port()  # stores nothing: the controller has no such file
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+    with pytest.raises(fr5.FileTransferError) as exc:
+        robot.upload_file(str(local), file_type=0)
+    assert exc.value.stage == "verify"
+
+    client.files["/fruser/motion_demo.lua"] = b"-- rewritten by the controller\n"
+    server = data_port()
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+    assert robot.upload_file(str(local), file_type=0) == "/fruser/motion_demo.lua"

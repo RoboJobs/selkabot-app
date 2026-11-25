@@ -1,0 +1,39 @@
+{
+  "name": "updownup_land",
+  "backend": "lua",
+  "controller_file": "/fruser/motion_updownup_land.lua",
+  "md5": "a5b58322a2a54df6639be4eb2b272b3e",
+  "num_points": 426,
+  "sample_period_ms": 8,
+  "duration_s": 3.4,
+  "design_duration_s": 3.4,
+  "start_joints": [
+    89.7181,
+    -90.3372,
+    0.1605,
+    29.6261,
+    -89.5658,
+    45.7689
+  ],
+  "end_joints": [
+    89.7181,
+    -90.3372,
+    0.1605,
+    29.6261,
+    -89.5658,
+    45.7689
+  ],
+  "start_pose": [
+    122.9729919433593,
+    -403.5740356445312,
+    675.1069946289062,
+    -119.4524002075195,
+    2.1109774195338107e-07,
+    178.8350982666015
+  ],
+  "tool_id": 1,
+  "approved_ovl": 100,
+  "design_sha256": "29bb0902709e341b2e396e4b519f385f350915106f35b9d180125b4a46c9d2f1",
+  "published_at": "2026-11-25T15:36:45",
+  "format": "landscape"
+}

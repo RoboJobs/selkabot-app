@@ -20,16 +20,33 @@ import pytest
 from sw import livestream as l
 from sw.camera import hero10_table as table
 from sw.robot.motion_runner import MotionError, MotionStopped, RunnerState
-from sw.robot.schema import RobotSettings, load_motion_config
+from sw.robot.schema import RobotSettings, motion_config_from_dict
 from sw.robot.ui_state import UiState
 
-MOTION_JSON = (
-    Path(__file__).resolve().parents[1]
-    / "robot"
-    / "motions"
-    / "up_down_horizontal"
-    / "motion.json"
-)
+# A motion.json published for MoveTPD, before Lua playback.
+TPD_MOTION_RAW = {
+    "name": "old",
+    "backend": "tpd",
+    "controller_file": "/fruser/traj/motion_old.txt",
+    "tpd_name": "traj/motion_old",
+}
+MOTION_RAW = {
+    "name": "up_down_horizontal",
+    "backend": "lua",
+    "controller_file": "/fruser/motion_up_down_horizontal.lua",
+    "md5": "c901903068df8cec7ce222efa8c1816a",
+    "num_points": 255,
+    "sample_period_ms": 8,
+    "duration_s": 2.032,
+    "design_duration_s": 2.03,
+    "start_joints": [89.72, -90.34, 0.16, 29.63, -89.57, 45.77],
+    "end_joints": [90.0, 70.97, 0.05, -181.03, -90.0, 45.0],
+    "start_pose": [122.97, -403.57, 675.11, -119.45, 0.0, 178.84],
+    "tool_id": 1,
+    "approved_ovl": 100,
+    "design_sha256": "4" * 64,
+    "published_at": "2026-11-25T12:00:00",
+}
 
 
 class FakeController:
@@ -157,7 +174,7 @@ def make_app(root, tmp_path, monkeypatch):
         ),
     )
     apps = []
-    base = load_motion_config(MOTION_JSON)
+    base = motion_config_from_dict(MOTION_RAW)
     motions = {
         "up_down_horizontal": base,
         "other": dataclasses.replace(base, name="other"),
@@ -522,11 +539,24 @@ def test_motion_config_round_trip_keeps_other_keys(tmp_path):
 def test_load_motions_reports_broken_files(tmp_path):
     good = tmp_path / "up_down_horizontal"
     good.mkdir()
-    (good / "motion.json").write_text(MOTION_JSON.read_text())
+    (good / "motion.json").write_text(json.dumps(MOTION_RAW))
     bad = tmp_path / "bad"
     bad.mkdir()
     (bad / "motion.json").write_text("{}")
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "motion.json").write_text(json.dumps(TPD_MOTION_RAW))
     (tmp_path / "draft").mkdir()
     configs, broken = l.load_motions(tmp_path)
     assert list(configs) == ["up_down_horizontal"]
-    assert list(broken) == ["bad"]
+    assert list(broken) == ["bad", "old"]
+    assert "re-publish" in broken["old"]  # published for MoveTPD
+
+
+def test_portrait_motions_are_marked_on_their_button(make_app, monkeypatch):
+    ui, *_ = make_app()
+    assert ui.motion_buttons["up_down_horizontal"].cget("text") == "up_down_horizontal"
+    assert ui.motion_buttons[None].cget("text") == "No motion"
+    portrait = dataclasses.replace(ui.motions["other"], format="portrait")
+    ui.motions["other"] = portrait
+    assert ui._motion_label("other") == "other (portrait)"

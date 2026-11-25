@@ -18,12 +18,9 @@ from contextlib import contextmanager
 from typing import Any, Protocol
 
 DATA_PORT = 20010
-ALLOWED_UPLOAD_TYPES = (0, 20)  # 0 = Lua, 20 = Trajectory J (TPD files use this)
+LUA_FILE_TYPE = 0
+ALLOWED_UPLOAD_TYPES = (LUA_FILE_TYPE, 20)  # 0 = Lua, 20 = Trajectory J (TPD files)
 TRAJ_DIR = "/fruser/traj"
-# MoveTPD blend: 1 = controller smoothing. Default for every motion: without
-# it the joints were audibly rough at low playback speeds (2026-11-25).
-TPD_BLEND_SMOOTH = 1
-TPD_BLEND_NONE = 0
 
 
 class FairinoError(RuntimeError):
@@ -36,7 +33,10 @@ class FairinoError(RuntimeError):
 
 
 class FileTransferError(RuntimeError):
-    """A controller file upload failed. `stage` is request/connect/transfer/verify."""
+    """A controller file upload failed.
+
+    `stage` is request/connect/transfer/register/verify.
+    """
 
     def __init__(self, stage: str, detail: Any = None) -> None:
         self.stage = stage
@@ -62,9 +62,9 @@ class RobotClient(Protocol):
     def GetRobotInstallAngle(self) -> tuple[int, list[float] | None]: ...
     def ComputeFileMD5(self, file_path: str) -> tuple[int, str | None]: ...
     def TrajectoryJDelete(self, fileName: str) -> int: ...
-    def LoadTPD(self, name: str) -> int: ...
-    def GetTPDStartPose(self, name: str) -> tuple[int, list[float] | None]: ...
-    def MoveTPD(self, name: str, blend: int, ovl: float) -> int: ...
+    def ProgramLoad(self, program_name: str) -> int: ...
+    def ProgramRun(self) -> int: ...
+    def ProgramStop(self) -> int: ...
     def Mode(self, state: int) -> int: ...
     def SetSpeed(self, vel: int) -> int: ...
     def MoveJ(
@@ -116,7 +116,8 @@ def _send_file(sock: socket.socket, data: bytes) -> bytes:
 class FR5:
     """Wraps a `RobotClient`. Every method either returns a plain value or
     raises `FairinoError` / `FileTransferError`. Nothing here moves the robot
-    except `move_j` and `move_tpd`.
+    except `move_j`, `stream_joints` and `run_program`. Motions are played
+    as controller Lua programs (`run_program`); MoveTPD is not used.
     """
 
     def __init__(
@@ -219,20 +220,17 @@ class FR5:
         else:
             _call(self.client, "MoveJ", joints, tool_id, 0, vel=vel_pct, blendT=0.0)
 
-    def move_tpd(self, name: str, blend: int, ovl: float) -> None:
-        _call(self.client, "MoveTPD", name, blend, ovl)
-
     def stop(self) -> None:
         _call(self.client, "StopMotion")
 
     def stream_joints(
         self, rows: list[list[float]], period_s: float, ovl: int = 100
     ) -> None:
-        """Simulator preview only (D9): replay `rows` (6 joint angles each)
-        with ServoJ, one row per call, paced by `period_s * 100 / ovl`.
+        """Preview only (D9): replay `rows` (6 joint angles each) with ServoJ
+        from Python, one row per call, paced by `period_s * 100 / ovl`.
 
-        This is a preview, not the production path: it does not use
-        LoadTPD/MoveTPD or exercise the controller's own TPD interpolation.
+        Not the production path: that runs the same ServoJ loop inside a
+        controller Lua program (`run_program`), immune to network delays.
         Never ServoJT (torque control) -- see the design doc, "Simulator
         playback via ServoJ".
         """
@@ -250,13 +248,26 @@ class FR5:
         finally:
             _call(self.client, "ServoMoveEnd")
 
-    # -- TPD loading --------------------------------------------------------
+    # -- Lua programs (joint playback on the controller) -------------------
 
-    def load_tpd(self, name: str) -> None:
-        _call(self.client, "LoadTPD", name)
+    def run_program(self, remote_path: str) -> None:
+        """ProgramLoad + ProgramRun. Needs auto mode (ensure_auto)."""
+        self.load_program(remote_path)
+        self.start_program()
 
-    def tpd_start_pose(self, name: str) -> list[float]:
-        return _call(self.client, "GetTPDStartPose", name)
+    def load_program(self, remote_path: str) -> None:
+        _call(self.client, "ProgramLoad", remote_path)
+
+    def start_program(self) -> None:
+        """ProgramRun of the loaded program; returns at once."""
+        _call(self.client, "ProgramRun")
+
+    def stop_program(self) -> None:
+        _call(self.client, "ProgramStop")
+
+    def program_state(self) -> int:
+        """1 = stopped / no program, 2 = running, 3 = paused (state cache)."""
+        return self.client.robot_state_pkg.robot_state
 
     # -- Controller files -----------------------------------------------
 
@@ -297,11 +308,24 @@ class FR5:
             sock.close()
         if reply[:7] != b"SUCCESS":
             raise FileTransferError("transfer", reply[:64])
+        if file_type == LUA_FILE_TYPE:
+            # The SDK's LuaUpload follows the transfer with LuaUpLoadUpdate,
+            # which registers the program in /fruser/; without it the file is
+            # not there (real robot, 2026-11-25: ComputeFileMD5 "not found").
+            rtn = self.client.robot.LuaUpLoadUpdate(name)
+            code = rtn[0] if isinstance(rtn, (list, tuple)) else rtn
+            if code != 0:
+                raise FileTransferError("register", rtn)
 
         remote = f"{TRAJ_DIR}/{name}" if file_type == 20 else f"/fruser/{name}"
         local_md5 = hashlib.md5(data).hexdigest()
         remote_md5 = self.file_md5(remote)
-        if remote_md5 is None or remote_md5.lower() != local_md5:
+        if remote_md5 is None:
+            raise FileTransferError("verify", "not found on the controller")
+        # LuaUpLoadUpdate rewrites the program, so a Lua file's controller MD5
+        # differs from ours (real robot, 2026-11-25; it still runs as sent).
+        # Only its presence is checked; callers record the controller MD5.
+        if file_type != LUA_FILE_TYPE and remote_md5.lower() != local_md5:
             raise FileTransferError("verify", remote_md5)
         return remote
 

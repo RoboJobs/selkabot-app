@@ -164,15 +164,15 @@ def test_load_design_rejects_invalid_yaml(tmp_path):
 def _motion_dict(**overrides):
     base = {
         "name": "demo",
-        "backend": "tpd",
-        "controller_file": "/fruser/traj/motion_demo.txt",
-        "tpd_name": "traj/motion_demo",
+        "backend": "lua",
+        "controller_file": "/fruser/motion_demo.lua",
         "md5": "0" * 32,
         "num_points": 251,
         "sample_period_ms": 8,
         "duration_s": 2.0,
         "design_duration_s": 2.0,
         "start_joints": [0, -90, 90, -90, -90, 0],
+        "end_joints": [10, -80, 90, -90, -90, 0],
         "start_pose": [600, -400, 450, 180, 0, 90],
         "tool_id": 0,
         "approved_ovl": 50,
@@ -188,14 +188,16 @@ def test_motion_config_round_trips_through_json(tmp_path):
     path = tmp_path / "motion.json"
     path.write_text(json.dumps(raw))
     config = schema.load_motion_config(path)
-    assert schema.motion_config_to_dict(config) == raw
+    # A file without 'format' loads as landscape and is written back with it.
+    assert schema.motion_config_to_dict(config) == {**raw, "format": "landscape"}
 
 
 @pytest.mark.parametrize(
     "override, field",
     [
-        ({"controller_file": "/fruser/traj/other.txt"}, "controller_file"),
-        ({"tpd_name": "traj/other"}, "tpd_name"),
+        ({"controller_file": "/fruser/other.lua"}, "controller_file"),
+        ({"end_joints": [0, 0]}, "end_joints"),
+        ({"backend": "tpd"}, "backend"),
         ({"duration_s": 1.5}, "duration_s"),
         ({"approved_ovl": 0}, "approved_ovl"),
         ({"approved_ovl": 101}, "approved_ovl"),
@@ -246,9 +248,11 @@ def test_camera_tool_requires_approval():
 def test_robot_settings_defaults_and_validation():
     defaults = schema.robot_settings_from_dict(None)
     assert defaults.move_to_start_speed_pct == 25
-    assert defaults.backend == "tpd"
+    assert defaults.backend == "lua"
     with pytest.raises(schema.SchemaError):
         schema.robot_settings_from_dict({"move_to_start_speed_pct": 200})
+    with pytest.raises(schema.SchemaError, match="no longer supported"):
+        schema.robot_settings_from_dict({"backend": "tpd"})
     with pytest.raises(schema.SchemaError):
         schema.robot_settings_from_dict({"backend": "servo"})
     with pytest.raises(schema.SchemaError):
@@ -339,3 +343,70 @@ def test_joints_and_seed_are_rejected_in_cartesian_mode(key):
     with pytest.raises(schema.SchemaError) as exc:
         schema.design_from_dict(raw, "demo")
     assert exc.value.field == f"keyframes[1].{key}"
+
+
+# -- format (D11: landscape / portrait) ---------------------------------------
+
+
+def test_format_defaults_to_landscape():
+    d = schema.design_from_dict(ANGLES, "demo")
+    assert d.format == "landscape"
+    assert d.camera_roll_deg == 0.0
+
+
+@pytest.mark.parametrize("base", [ANGLES, TARGET, JOINT])
+def test_portrait_format_in_every_mode(base):
+    raw = _mutate(base, lambda r: r.update(format="portrait"))
+    d = schema.design_from_dict(raw, "demo")
+    assert d.format == "portrait"
+    assert d.camera_roll_deg == 90.0
+
+
+def test_unknown_format_is_rejected():
+    raw = _mutate(ANGLES, lambda r: r.update(format="square"))
+    with pytest.raises(schema.SchemaError) as exc:
+        schema.design_from_dict(raw, "demo")
+    assert exc.value.field == "format"
+
+
+def test_motion_config_without_format_loads_as_landscape(tmp_path):
+    path = tmp_path / "motion.json"
+    path.write_text(json.dumps(_motion_dict()))
+    assert schema.load_motion_config(path).format == "landscape"
+
+
+def test_portrait_motion_config_round_trips(tmp_path):
+    raw = _motion_dict(format="portrait")
+    path = tmp_path / "motion.json"
+    path.write_text(json.dumps(raw))
+    config = schema.load_motion_config(path)
+    assert config.format == "portrait"
+    assert schema.motion_config_to_dict(config) == raw
+
+
+def test_motion_config_with_unknown_format_is_rejected(tmp_path):
+    path = tmp_path / "motion.json"
+    path.write_text(json.dumps(_motion_dict(format="square")))
+    with pytest.raises(schema.SchemaError) as exc:
+        schema.load_motion_config(path)
+    assert exc.value.field == "format"
+
+
+def test_a_motion_json_published_for_movetpd_asks_for_a_re_publish(tmp_path):
+    raw = {"name": "demo", "backend": "tpd", "tpd_name": "traj/motion_demo"}
+    path = tmp_path / "motion.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(schema.SchemaError, match="re-publish") as exc:
+        schema.load_motion_config(path)
+    assert exc.value.field == "backend"
+
+
+def test_level_wrist_defaults_true_and_is_joint_mode_only():
+    assert schema.design_from_dict(JOINT, "demo").level_wrist is True
+    off = _mutate(JOINT, lambda r: r.update(level_wrist=False))
+    assert schema.design_from_dict(off, "demo").level_wrist is False
+    for bad, base in [(False, ANGLES), ("no", JOINT)]:
+        raw = _mutate(base, lambda r, v=bad: r.update(level_wrist=v))
+        with pytest.raises(schema.SchemaError) as exc:
+            schema.design_from_dict(raw, "demo")
+        assert exc.value.field == "level_wrist"

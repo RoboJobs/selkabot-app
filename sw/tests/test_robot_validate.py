@@ -7,7 +7,16 @@ import copy
 import pytest
 
 from sw.robot import path, schema, validate
+from sw.robot.pose import (
+    camera_angles,
+    pose_rotation_diff_deg,
+)
 from sw.tests.fakes.fake_kinematics import FakeKinematics
+from sw.tests.fakes.wrist_kinematics import (
+    SINGULAR_PORTRAIT_MOUNT,
+    WristFK,
+    j5_margin_deg,
+)
 
 ANGLES = {
     "name": "demo",
@@ -229,12 +238,14 @@ def test_fk_offset_fails_check_fk_roundtrip():
 
 def test_fk_roundtrip_angle_wraparound_is_not_a_false_failure():
     """rz near +180deg vs -180deg is the same rotation, not a 360deg error."""
-    from sw.robot import validate as validate_module
+    from sw.robot.pose import pose_rotation_diff_deg
 
-    assert validate_module._angle_diff_deg(179.999, -179.999) == pytest.approx(0.002)
-    assert validate_module._angle_diff_deg(180.0, -180.0) == 0.0
-    assert validate_module._angle_diff_deg(10.0, -10.0) == 20.0
-    assert validate_module._angle_diff_deg(0.0, 170.0) == 170.0
+    p = [0, 0, 0, 10.0, 5.0]
+    assert pose_rotation_diff_deg(p + [179.999], p + [-179.999]) == pytest.approx(
+        0.002, abs=1e-6
+    )
+    assert pose_rotation_diff_deg(p + [180.0], p + [-180.0]) == pytest.approx(0.0)
+    assert pose_rotation_diff_deg([0] * 6, [0, 0, 0, 0, 0, 20.0]) == pytest.approx(20.0)
 
 
 def test_report_serialises_to_validated_json_schema():
@@ -455,3 +466,201 @@ def test_check_wrist_singularity_flags_j5_near_zero():
     assert not check.passed and "sample 1" in check.detail
     far = [[0, -90, 90, -90, -90, 0]] * 2
     assert validate.check_wrist_singularity(design, samples, far).passed
+
+
+# -- portrait (D11): constant roll 90, real spherical wrist (WristFK) ---------
+
+PORTRAIT_CARTESIAN = {
+    **ANGLES,
+    "tool_id": 1,
+    "format": "portrait",
+    "seed_joints": [0, 0, 0, 0, -90, 0],
+    "workspace": {"min": [-1000, -1500, -1000], "max": [1500, 1500, 1500]},
+}
+
+PORTRAIT_JOINT = {
+    "name": "demo",
+    "tool_id": 1,
+    "format": "portrait",
+    "interpolation": "joint",
+    "sample_period_ms": 8,
+    "seed_joints": [0, 0, 0, 0, -90, 0],
+    "orientation": {"mode": "angles"},
+    "workspace": {"min": [-1000, -1500, -1000], "max": [1500, 1500, 1500]},
+    "keyframes": [
+        {"t": 0.0, "pos": [600, -400, 450], "pan": 20, "tilt": -5},
+        {"t": 3.0, "pos": [600, 400, 650], "pan": -20, "tilt": 10},
+    ],
+}
+
+
+def _check(report, name):
+    return next(c for c in report.checks if c.name == name)
+
+
+def _roll(pose6):
+    return camera_angles(*pose6[3:])[2]
+
+
+def test_check_roll_measures_the_deviation_from_the_target():
+    sample = path.Sample(0, (0, 0, 0), 10, 0, None)
+    portrait = path.to_sdk_pose(sample, 90)
+    landscape = path.to_sdk_pose(sample)
+    ok, worst = validate.check_roll([portrait], 0.5, target_roll=90)
+    assert ok.passed and worst < 1e-6
+    bad, worst = validate.check_roll([portrait, landscape], 0.5, target_roll=90)
+    assert not bad.passed
+    assert worst == pytest.approx(90.0, abs=1e-6)
+    assert "sample 1" in bad.detail and "90deg" in bad.detail
+    assert not validate.check_roll([portrait], 0.5)[0].passed  # target 0 default
+
+
+def test_portrait_joint_design_passes_on_its_actual_requirements():
+    design = _design(PORTRAIT_JOINT)
+    kin = WristFK()
+    report = validate.validate(design, [], kin)
+    assert report.passed, [c for c in report.checks if not c.passed]
+    for pose in report.poses:  # roll held at 90 at every sample
+        assert abs(_roll(pose) - 90.0) <= design.limits.max_roll_deg
+    assert report.peaks.max_roll_deg < 1e-2  # deviation from 90, not |roll|
+    soft = kin.joint_soft_limits()
+    for js in report.joints:
+        assert all(lo <= v <= hi for v, (lo, hi) in zip(js, soft, strict=True))
+        assert j5_margin_deg(js) > design.limits.min_wrist_margin_deg
+    steps = [
+        max(abs(a - b) for a, b in zip(p, q, strict=True))
+        for p, q in zip(report.joints, report.joints[1:], strict=False)
+    ]
+    assert max(steps) <= design.limits.max_joint_step_deg
+
+
+def test_portrait_joint_design_keeps_j1_to_j3_on_the_joint_blend():
+    from sw.robot.joint_path import sample_joint_path
+
+    design = _design(PORTRAIT_JOINT)
+    kin = WristFK()
+    _, kf_joints = validate.check_keyframe_ik(design, kin)
+    report = validate.validate(design, [], kin)
+    _, blend = sample_joint_path(design, kf_joints)
+    for solved, blended in zip(report.joints, blend, strict=True):
+        assert solved[:3] == pytest.approx(blended[:3], abs=1e-9)
+
+
+def test_same_keyframes_in_landscape_also_pass():
+    raw = {**PORTRAIT_JOINT, "format": "landscape"}
+    report = validate.validate(_design(raw), [], WristFK())
+    assert report.passed
+    assert all(abs(_roll(p)) < 0.5 for p in report.poses)
+
+
+def test_portrait_cartesian_stores_fk_poses_checked_against_the_plan():
+    design = _design(PORTRAIT_CARTESIAN)
+    kin = WristFK()
+    samples = _samples(design)
+    report = validate.validate(design, samples, kin)
+    assert report.passed, [c for c in report.checks if not c.passed]
+    for js, pose in zip(report.joints, report.poses, strict=True):
+        assert pose == kin.fk(js)  # artifact pose columns = controller FK
+        assert _roll(pose) == pytest.approx(90.0, abs=1e-6)
+    assert _check(report, "check_roll").passed
+
+
+def test_cartesian_roundtrip_accepts_another_euler_triple_of_the_same_rotation():
+    design = _design(PORTRAIT_CARTESIAN)
+    report = validate.validate(design, _samples(design), WristFK(alternate_euler=True))
+    assert _check(report, "check_fk_roundtrip").passed
+    planned = path.to_sdk_pose(_samples(design)[0], 90)
+    assert report.poses[0][3:] != pytest.approx(planned[3:], abs=1e-3)  # triples differ
+    assert pose_rotation_diff_deg(report.poses[0], planned) < 1e-6
+
+
+def test_cartesian_roundtrip_still_fails_a_real_rotation_error():
+    design = _design(PORTRAIT_CARTESIAN)
+    kin = WristFK(fk_rot_offset_deg=0.5)
+    report = validate.validate(design, _samples(design), kin)
+    check = _check(report, "check_fk_roundtrip")
+    assert not check.passed
+    assert report.peaks.max_fk_rot_err_deg == pytest.approx(0.5, abs=1e-3)
+
+
+def test_joint_mode_has_no_wrist_singularity_check():
+    """Lua ServoJ playback plays J5 = 0 paths (MoveTPD refused them); joint
+    speed/acceleration/step checks still bound J4/J6."""
+    design = _design(PORTRAIT_JOINT)
+    report = validate.validate(design, [], WristFK(mount=SINGULAR_PORTRAIT_MOUNT))
+    assert "check_wrist_singularity" not in [c.name for c in report.checks]
+    assert _check(report, "check_joint_speed_acc") is not None
+
+
+def test_validated_json_records_format_and_tool():
+    design = _design(PORTRAIT_JOINT)
+    report = validate.validate(design, [], WristFK())
+    data = validate.report_to_validated(report, design, [])
+    assert data["format"] == "portrait"
+    assert data["tool_id"] == 1
+    assert data["peaks"]["max_roll_deg"] < 1e-2
+
+
+def _singular_portrait_joints(kin, pan, tilt, pos, roll=90):
+    """Portrait joints on the singular mount (J5 = 0 when tilt = 0)."""
+    return kin.ik(
+        [*pos, *path.to_sdk_pose(path.Sample(0, pos, pan, tilt, None), roll)[3:]],
+        [0, 0, 0, 0, 0, 0],
+    )
+
+
+def test_level_wrist_false_blends_joints_and_still_checks_the_roll():
+    kin = WristFK()  # portrait wrist at J5 = -85: away from the singularity
+    a = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0))
+    b = [a[0], a[1] + 2.0, a[2] - 1.0, a[3], a[4], a[5]]  # arm only moves
+    raw = {**PORTRAIT_JOINT, "level_wrist": False,
+           "keyframes": [{"t": 0.0, "joints": a}, {"t": 2.0, "joints": b}]}  # fmt: skip
+    design = _design(raw)
+    report = validate.validate(design, [], kin)
+    assert report.passed, [c for c in report.checks if not c.passed]
+    _, kf_joints = validate.check_keyframe_ik(design, kin)
+    from sw.robot.joint_path import sample_joint_path
+
+    _, blend = sample_joint_path(design, kf_joints)
+    assert report.joints == [list(q) for q in blend]  # no wrist solve
+
+
+def test_level_wrist_false_at_the_wrist_singularity_validates():
+    """A level path held at J5 = 0 (the real up_down_portrait case) passes:
+    it plays with Lua ServoJ."""
+    kin = WristFK(mount=SINGULAR_PORTRAIT_MOUNT)
+    a = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0))
+    assert abs(a[4]) < 1.0
+    b = [a[0], a[1] + 2.0, a[2] - 1.0, a[3], a[4], a[5]]
+    raw = {**PORTRAIT_JOINT, "level_wrist": False,
+           "keyframes": [{"t": 0.0, "joints": a}, {"t": 2.0, "joints": b}]}  # fmt: skip
+    report = validate.validate(_design(raw), [], kin)
+    assert report.passed, [c for c in report.checks if not c.passed]
+    assert _check(report, "check_roll").passed
+
+
+def test_level_wrist_false_fails_check_roll_when_the_blend_rolls():
+    kin = WristFK()
+    a = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0))
+    b = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0), roll=80)
+    raw = {**PORTRAIT_JOINT, "level_wrist": False,
+           "keyframes": [{"t": 0.0, "joints": a}, {"t": 2.0, "joints": b}]}  # fmt: skip
+    report = validate.validate(_design(raw), [], kin)
+    assert not _check(report, "check_roll").passed
+
+
+def test_level_joint_path_uses_the_design_tolerances(monkeypatch):
+    seen = {}
+    real = validate.solve_wrist
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(validate, "solve_wrist", spy)
+    raw = {
+        **PORTRAIT_JOINT,
+        "limits": {"max_roll_deg": 0.4, "max_pointing_error_deg": 0.2},
+    }
+    validate.validate(_design(raw), [], WristFK())
+    assert seen["roll_tol_deg"] == 0.4 and seen["point_tol_deg"] == 0.2

@@ -1,0 +1,33 @@
+name: updownup_port
+format: portrait
+tool_id: 1
+interpolation: joint
+ramp_fraction: 0.2
+# The portrait wrist sits at J5 = 0 (the wrist singularity) for this whole
+# move; only J2 and J4 swing, and with J5 = 0 exactly the joint blend holds
+# roll at 90deg (checked on FK by check_roll). No per-sample wrist solve.
+level_wrist: false
+sample_period_ms: 8
+seed_joints: [89.709351, -90.337425, 0.160988, 20.905352, 2.0, 51.255463]
+orientation:
+  mode: angles
+workspace:  # the camera path plus ~50-100 mm (path: x 162, y -1320..-597,
+  # z -452..711 on the simulator; the real robot differs by ~28 mm)
+  min: [-100, -1500, -650]
+  max: [500, -400, 900]
+keyframes:
+- t: 0.0
+  # read on the robot (J5 was 0.947: 0.947deg of roll error); J5 set to 0
+  joints: [89.709351, -90.337425, 0.160988, 20.905352, 2.0, 51.255463]
+- t: 1.5
+  # read on the robot (J5 was 0.999865); J5 set to 0
+  joints: [88.511078, 53.652439, 15.897543, -96.860909, 2.0, -47.121342]
+- t: 3.0
+  # read on the robot (J5 was 0.947: 0.947deg of roll error); J5 set to 0
+  joints: [89.709351, -90.337425, 0.160988, 20.905352, 2.0, 51.255463]
+limits:
+  max_tcp_speed_mm_s: 3000.0
+  max_joint_speed_deg_s: 180.0
+  max_joint_acc_deg_s2: 1500.0
+  min_wrist_margin_deg: 0   # test only: allow J5 near 0
+  max_roll_deg: 3.0         # accept your 2.1° start
