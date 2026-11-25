@@ -815,11 +815,19 @@ def cmd_play(args: argparse.Namespace) -> None:
         robot.close()
 
 
-def _progress(robot: FR5, out: Path, period_ms: int, elapsed_s: float) -> str:
-    """Where in the file the robot stopped: the nearest row by joint distance.
-    Its planned time over the elapsed time is the effective playback speed."""
+def _progress(
+    robot: FR5,
+    out: Path,
+    period_ms: int,
+    elapsed_s: float,
+    rows: list[list[float]] | None = None,
+) -> str:
+    """Where in the file (or in `rows`, the rows actually played) the robot
+    stopped: the nearest row by joint distance. Its planned time over the
+    elapsed time is the effective playback speed."""
     joints = robot.joints()
-    rows = tpd_file.read(out).joints
+    if rows is None:
+        rows = tpd_file.read(out).joints
     i = min(range(len(rows)), key=lambda k: math.dist(rows[k], joints))
     planned = i * period_ms / 1000.0
     rate = 100.0 * planned / elapsed_s if elapsed_s > 0 else 0.0
@@ -861,16 +869,15 @@ def _wait_for_motion(robot: FR5, deadline_s: float, start_s: float = 2.0) -> str
 LUA_UPLOAD_TYPE = 0  # FileUpload type for Lua programs (stored in /fruser/)
 
 
-def write_lua(name: str, ovl: int, pace: str) -> tuple[Path, int, float]:
-    """Write the Lua program for the compiled file at `ovl`. Returns the path,
-    the row count and the expected duration (s)."""
+def write_lua(name: str, ovl: int, pace: str) -> tuple[Path, list[list[float]]]:
+    """Write the Lua program for the compiled file at `ovl`. Returns the path
+    and the rows it plays (one per sample period)."""
     out = _ensure_compiled(name)
     validated = _load_validated(name)
-    period_ms = validated["sample_period_ms"]
     rows = lua_program.resample(tpd_file.read(out).joints, ovl)
     lua = _lua_build_path(name)
-    lua.write_text(lua_program.render(rows, period_ms, name, pace))
-    return lua, len(rows), (len(rows) - 1) * period_ms / 1000.0
+    lua.write_text(lua_program.render(rows, validated["sample_period_ms"], name, pace))
+    return lua, rows
 
 
 def cmd_luaplay(args: argparse.Namespace) -> None:
@@ -879,8 +886,10 @@ def cmd_luaplay(args: argparse.Namespace) -> None:
         raise CommandError("--ovl must be 1..100")
     out = _ensure_compiled(args.name)
     validated = _load_validated(args.name)
-    lua, rows, expected = write_lua(args.name, args.ovl, args.pace)
-    print(f"Wrote {lua} ({rows} rows, pace {args.pace}, about {expected:.2f}s).")
+    period_ms = validated["sample_period_ms"]
+    lua, rows = write_lua(args.name, args.ovl, args.pace)
+    expected = (len(rows) - 1) * period_ms / 1000.0
+    print(f"Wrote {lua} ({len(rows)} rows, pace {args.pace}, about {expected:.2f}s).")
 
     robot = FR5.connect(args.ip)
     try:
@@ -914,7 +923,7 @@ def cmd_luaplay(args: argparse.Namespace) -> None:
         elapsed = time.monotonic() - start
         print(f"{outcome}. Elapsed: {elapsed:.2f}s (expected about {expected:.2f}s)")
         if not outcome.startswith("Program finished"):
-            print(_progress(robot, out, validated["sample_period_ms"], elapsed))
+            print(_progress(robot, out, period_ms, elapsed, rows))
     except KeyboardInterrupt:
         print("\nInterrupted; stopping.")
         _stop_program(robot)
@@ -931,27 +940,20 @@ def _stop_program(robot: FR5) -> None:
             print(f"{exc} while stopping")
 
 
-PROGRAM_RUNNING = 2
 AT_END_DEG = 0.5  # max joint error to the last row to count as arrived
 STILL_DEG = 0.01  # max joint change between two polls to count as standing
 SETTLE_S = 0.3  # how long the arm must stand still
 
 
 def _wait_for_program(
-    robot: FR5,
-    end_joints: list[float],
-    deadline_s: float,
-    start_s: float = 2.0,
-    poll_s: float = 0.02,
+    robot: FR5, end_joints: list[float], deadline_s: float, poll_s: float = 0.02
 ) -> str:
     """Wait until the arm has moved, reached `end_joints` and stands still,
-    watching the robot's error code. The program state alone is not used to
-    detect the end: on the real robot it left "running" 0.4 s into a 10 s
-    ServoJ program (2026-11-25). Its changes are printed, to learn what it
-    reports. Stops the program on an error or a timeout. Returns a one-line
-    outcome."""
+    watching the robot's error code; stop the program on an error or at the
+    deadline. The program state is not used: on the real robot it toggles
+    between 1 and 2 every ~0.1 s while a ServoJ program runs (2026-11-25).
+    Returns a one-line outcome."""
     t0 = time.monotonic()
-    last_state = None
     prev = robot.joints()
     moved = False
     still_since: float | None = None
@@ -960,10 +962,6 @@ def _wait_for_program(
         if main:
             _stop_program(robot)
             return f"Robot error during the program: main {main}, sub {sub}"
-        state = robot.program_state()
-        if state != last_state:
-            print(f"  t={now - t0:.2f}s program state {state}")
-            last_state = state
         joints = robot.joints()
         step = max(abs(a - b) for a, b in zip(joints, prev, strict=True))
         prev = joints
@@ -979,11 +977,6 @@ def _wait_for_program(
         )
         if settled and moved and at_end:
             return "Program finished"
-        if settled and state != PROGRAM_RUNNING and now - t0 > start_s:
-            _stop_program(robot)
-            if not moved:
-                return "Program ended without moving the robot"
-            return "Program ended before the end of the path"
         time.sleep(poll_s)
     _stop_program(robot)
     return f"Program still running after {deadline_s:.1f}s; stopped it"
@@ -1073,8 +1066,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--pace",
         choices=lua_program.PACES,
-        default="wait",
-        help="wait: WaitMs(period) after each ServoJ; queue: rely on the ServoJ queue",
+        default="queue",
+        help="queue: ServoJ paces itself (measured); wait: also WaitMs(period)",
     )
     _add_ip(p, default=ROBOT_IP)
     p.set_defaults(func=cmd_luaplay)

@@ -16,8 +16,9 @@ def _rows_in(text):
     ]
 
 
-def test_render_lists_every_row_and_one_servoj_loop():
+def test_render_lists_every_row_and_one_servoj_loop_without_a_wait():
     text = lua_program.render(ROWS, 8, "demo")
+    assert "WaitMs" not in text  # ServoJ paces itself (real robot)
     assert _rows_in(text) == ROWS
     assert text.count("ServoJ(") == 1
     assert "ServoJ(P[i], E, 0, 0, 0.008, 0, 0)" in text

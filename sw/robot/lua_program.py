@@ -8,8 +8,9 @@ controller, so a lost connection or a slow packet cannot stall the motion.
 
 The program syntax follows the Fairino manual's Lua example
 (`ServoJ({j1..j6}, {0, 0, 0, 0}, acc, vel, cmdT, filterT, gain)`, `WaitMs(ms)`).
-Whether ServoJ inside Lua blocks for cmdT or queues is not documented, so the
-pacing is selectable (`pace`) and measured on the robot.
+ServoJ inside Lua takes its own cmdT per call (real robot, 2026-11-25: with an
+extra WaitMs(period) a 10 s program took about 20 s), so the default pace adds
+no wait; `pace="wait"` is kept only for comparison.
 """
 
 from __future__ import annotations
@@ -37,11 +38,11 @@ def resample(rows: list[list[float]], ovl: int) -> list[list[float]]:
 
 
 def render(
-    rows: list[list[float]], period_ms: int, name: str, pace: str = "wait"
+    rows: list[list[float]], period_ms: int, name: str, pace: str = "queue"
 ) -> str:
-    """The Lua program text. `pace="wait"` adds WaitMs(period) after each
-    ServoJ (as the SDK's own streaming examples sleep cmdT between calls);
-    `pace="queue"` relies on the controller's ServoJ queue to pace them."""
+    """The Lua program text. `pace="queue"` (default) lets each ServoJ take
+    its cmdT; `pace="wait"` also adds WaitMs(period) after each call, which
+    doubles the duration on the real robot."""
     if pace not in PACES:
         raise ValueError(f"pace must be one of {PACES}")
     if not rows:

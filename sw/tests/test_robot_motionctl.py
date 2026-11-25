@@ -928,15 +928,13 @@ def _luaplay_ready(connect, monkeypatch):
     return uploads
 
 
-def _script_program_motion(connect, _redirect_dirs, *, stop_off=0.0, state=None):
+def _script_program_motion(connect, _redirect_dirs, *, state=None):
     """Make ProgramRun move the fake arm from the start joints to the end
-    joints (20 readings), then stand still there. `stop_off` (deg on J1)
-    makes it stop that far from the end instead. `state` overrides the
+    joints (20 readings), then stand still there. `state` overrides the
     program-state script."""
     motions, _build = _redirect_dirs
     joints = json.loads((motions / "demo" / "validated.json").read_text())
     start, end = joints["samples"]["joints"][0], joints["samples"]["joints"][-1]
-    end = [end[0] + stop_off, *end[1:]]
     path = [
         [a + (b - a) * k / 20 for a, b in zip(start, end, strict=True)]
         for k in range(21)
@@ -1027,12 +1025,12 @@ def test_luaplay_ctrl_c_stops_program_and_motion(connect, _redirect_dirs, monkey
     assert ("StopMotion", (), {}) in connect.calls
 
 
-def test_luaplay_waits_for_the_arm_even_when_the_state_leaves_running_early(
+def test_luaplay_ignores_the_toggling_program_state(
     connect, _redirect_dirs, monkeypatch, capsys
 ):
-    """Real robot: the program state left 'running' 0.4 s into a 10 s program."""
+    """Real robot: the program state toggles 1/2 while the program runs."""
     _luaplay_ready(connect, monkeypatch)
-    _script_program_motion(connect, _redirect_dirs, state=[2, 1])
+    _script_program_motion(connect, _redirect_dirs, state=[2, 1, 2, 1, 2, 1])
     monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
     assert _run(["luaplay", "demo", "--ovl", "100"]) == 0
     out = capsys.readouterr().out
@@ -1040,13 +1038,18 @@ def test_luaplay_waits_for_the_arm_even_when_the_state_leaves_running_early(
     assert connect.program_stops == 0
 
 
-def test_luaplay_reports_a_program_that_stops_short_of_the_end(
-    connect, _redirect_dirs, monkeypatch, capsys
-):
-    _luaplay_ready(connect, monkeypatch)
-    _script_program_motion(connect, _redirect_dirs, stop_off=5.0, state=[2, 1])
-    monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
-    assert _run(["luaplay", "demo", "--ovl", "100"]) == 0
-    out = capsys.readouterr().out
-    assert "Program ended before the end of the path" in out
-    assert "Stopped near row" in out
+def test_wait_for_program_stops_a_program_that_never_reaches_the_end(client):
+    robot = fr5.FR5(client, motionctl.ROBOT_IP)
+    client.robot_state_pkg.joints_script = [[0.0] * 6, [1.0] + [0.0] * 5]
+    outcome = motionctl._wait_for_program(robot, [5.0] + [0.0] * 5, deadline_s=0.5)
+    assert outcome.startswith("Program still running")
+    assert client.program_stops == 1
+    assert ("StopMotion", (), {}) in client.calls
+
+
+def test_wait_for_program_stops_on_a_robot_error(client):
+    robot = fr5.FR5(client, motionctl.ROBOT_IP)
+    client.robot_state_pkg.main_code, client.robot_state_pkg.sub_code = 1, 24
+    outcome = motionctl._wait_for_program(robot, [0.0] * 6, deadline_s=5.0)
+    assert outcome == "Robot error during the program: main 1, sub 24"
+    assert client.program_stops == 1
