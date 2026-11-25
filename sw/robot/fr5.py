@@ -327,7 +327,12 @@ class FR5:
         remote = f"{TRAJ_DIR}/{name}" if file_type == 20 else f"/fruser/{name}"
         local_md5 = hashlib.md5(data).hexdigest()
         remote_md5 = self.file_md5(remote)
-        if remote_md5 is None or remote_md5.lower() != local_md5:
+        if remote_md5 is None:
+            raise FileTransferError("verify", "not found on the controller")
+        # LuaUpLoadUpdate rewrites the program, so a Lua file's controller MD5
+        # differs from ours (real robot, 2026-11-25; it still runs as sent).
+        # Only its presence is checked; callers record the controller MD5.
+        if file_type != LUA_FILE_TYPE and remote_md5.lower() != local_md5:
             raise FileTransferError("verify", remote_md5)
         return remote
 

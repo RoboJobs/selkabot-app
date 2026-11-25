@@ -495,3 +495,20 @@ def test_upload_file_never_calls_banned_sdk_methods(client, data_port, tmp_path)
     robot = _robot_for_upload(client, server.port)
 
     robot.upload_file(str(local), file_type=20)  # must not raise AssertionError
+
+
+def test_upload_lua_accepts_a_rewritten_program_but_not_a_missing_one(
+    client, data_port, tmp_path
+):
+    local = tmp_path / "motion_demo.lua"
+    local.write_text("P = {}\n")
+    server = data_port()  # stores nothing: the controller has no such file
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+    with pytest.raises(fr5.FileTransferError) as exc:
+        robot.upload_file(str(local), file_type=0)
+    assert exc.value.stage == "verify"
+
+    client.files["/fruser/motion_demo.lua"] = b"-- rewritten by the controller\n"
+    server = data_port()
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+    assert robot.upload_file(str(local), file_type=0) == "/fruser/motion_demo.lua"

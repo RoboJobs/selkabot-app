@@ -891,7 +891,7 @@ def cmd_luaplay(args: argparse.Namespace) -> None:
             raise CommandError(
                 f"upload of {lua} failed at stage '{exc.stage}' ({exc.detail!r})"
             ) from exc
-        print(f"Uploaded to {remote} (MD5 verified).")
+        print(f"Uploaded to {remote} (controller MD5 {robot.file_md5(remote)}).")
 
         start_joints = validated["samples"]["joints"][0]
         print("Current joints:", [round(v, 2) for v in robot.joints()])
