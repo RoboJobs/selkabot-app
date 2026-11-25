@@ -1,6 +1,6 @@
 {
-  "folder": "lr_up_test",
-  "image": "likegym_watermark.png",
+  "folder": "cakeshoptest",
+  "image": "",
   "fadein_image": "likegym.png",
   "fadeout_image": "selkabot.png",
   "slowdowns": "1.5-2.8, 7-8.5",
@@ -21,5 +21,8 @@
     "fps": 120,
     "lens": "Wide",
     "zoom": 0
-  }
+  },
+  "flash_enabled": true,
+  "fades_enabled": true,
+  "motion": "up_down_horizontal"
 }
