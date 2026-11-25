@@ -18,7 +18,7 @@ import yaml
 NAME_RE = re.compile(r"^[a-z0-9_]{1,19}$")
 ALLOWED_PERIODS_MS = (2, 4, 8)
 MAX_ABS_TILT_DEG = 85.0
-BACKENDS = ("tpd",)
+BACKENDS = ("lua",)  # a controller Lua program replaying joints with ServoJ
 INTERPOLATIONS = ("cartesian", "joint")
 # Constant camera roll about the optical axis per format (D11). Portrait is
 # reached with the wrist; the camera stays the same tool.
@@ -132,9 +132,8 @@ class Design:
     ramp_fraction: float | None = None  # joint mode: cruise profile, see joint_path
     format: str = DEFAULT_FORMAT  # "landscape" or "portrait" (D11)
     # Joint mode: solve J4-J6 at every sample for the exact roll (default), or
-    # follow the joint blend (check_roll still verifies the roll, and the
-    # wrist singularity check still applies: the controller will not play a
-    # TPD at J5 = 0/180).
+    # follow the joint blend (check_roll still verifies the roll; useful where
+    # the wrist sits at J5 = 0, where the per-sample solve breaks down).
     level_wrist: bool = True
 
     @property
@@ -486,26 +485,36 @@ def load_camera_tool(path: Path) -> CameraTool:
 
 
 MOTION_FILE_KEYS = (
-    "name", "backend", "controller_file", "tpd_name", "md5", "num_points",
+    "name", "backend", "controller_file", "md5", "num_points",
     "sample_period_ms", "duration_s", "design_duration_s", "start_joints",
-    "start_pose", "tool_id", "approved_ovl", "design_sha256", "published_at",
+    "end_joints", "start_pose", "tool_id", "approved_ovl", "design_sha256",
+    "published_at",
 )  # fmt: skip
+TPD_REPUBLISH = (
+    "published for MoveTPD, which is no longer used: re-publish with "
+    "'motionctl publish NAME --ovl N'"
+)
 
 
 @dataclass(frozen=True)
 class MotionConfig:
-    """The published metadata of one motion; the only file the app reads."""
+    """The published metadata of one motion; the only file the app reads.
+
+    The motion is the Lua program `controller_file` (ServoJ over the joint
+    rows), resampled at `approved_ovl`: `num_points` and `duration_s` are the
+    program as uploaded, and `md5` is the controller's MD5 of it (registering
+    a program rewrites it, so it is not the local file's)."""
 
     name: str
     backend: str
     controller_file: str
-    tpd_name: str
     md5: str
     num_points: int
     sample_period_ms: int
     duration_s: float
     design_duration_s: float
     start_joints: tuple[float, ...]
+    end_joints: tuple[float, ...]
     start_pose: tuple[float, ...]
     tool_id: int
     approved_ovl: int
@@ -517,12 +526,9 @@ class MotionConfig:
         """Reject cross-field inconsistencies. Raises SchemaError."""
         if self.backend not in BACKENDS:
             raise SchemaError(path, "backend", f"must be one of {BACKENDS}")
-        expected = f"/fruser/traj/motion_{self.name}.txt"
+        expected = controller_program(self.name)
         if self.controller_file != expected:
             raise SchemaError(path, "controller_file", f"must be {expected}")
-        expected_tpd = f"traj/motion_{self.name}"
-        if self.tpd_name != expected_tpd:
-            raise SchemaError(path, "tpd_name", f"must be {expected_tpd}")
         if self.num_points < 2:
             raise SchemaError(path, "num_points", "needs at least 2 points")
         expected_duration = (self.num_points - 1) * self.sample_period_ms / 1000.0
@@ -538,6 +544,8 @@ class MotionConfig:
             )
         if len(self.start_joints) != 6:
             raise SchemaError(path, "start_joints", "expected 6 values")
+        if len(self.end_joints) != 6:
+            raise SchemaError(path, "end_joints", "expected 6 values")
         if len(self.start_pose) != 6:
             raise SchemaError(path, "start_pose", "expected 6 values")
         if self.format not in CAMERA_ROLL_DEG:
@@ -546,9 +554,16 @@ class MotionConfig:
             )
 
 
+def controller_program(name: str) -> str:
+    """Where a motion's Lua program lives on the controller."""
+    return f"/fruser/motion_{name}.lua"
+
+
 def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
     if not isinstance(raw, dict):
         raise SchemaError(path, "<root>", "must be a mapping")
+    if raw.get("backend") == "tpd":
+        raise SchemaError(path, "backend", TPD_REPUBLISH)
     missing = [k for k in MOTION_FILE_KEYS if k not in raw]
     if missing:
         raise SchemaError(path, "<root>", f"missing key(s): {', '.join(missing)}")
@@ -556,13 +571,13 @@ def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
         name=str(raw["name"]),
         backend=str(raw["backend"]),
         controller_file=str(raw["controller_file"]),
-        tpd_name=str(raw["tpd_name"]),
         md5=str(raw["md5"]),
         num_points=int(raw["num_points"]),
         sample_period_ms=int(raw["sample_period_ms"]),
         duration_s=float(raw["duration_s"]),
         design_duration_s=float(raw["design_duration_s"]),
         start_joints=_vec(raw["start_joints"], 6, path, "start_joints"),
+        end_joints=_vec(raw["end_joints"], 6, path, "end_joints"),
         start_pose=_vec(raw["start_pose"], 6, path, "start_pose"),
         tool_id=int(raw["tool_id"]),
         approved_ovl=int(raw["approved_ovl"]),
@@ -576,7 +591,7 @@ def motion_config_from_dict(raw: Any, path: object = "<dict>") -> MotionConfig:
 
 def motion_config_to_dict(config: MotionConfig) -> dict[str, Any]:
     out = {k: getattr(config, k) for k in MOTION_FILE_KEYS}
-    for key in ("start_joints", "start_pose"):
+    for key in ("start_joints", "end_joints", "start_pose"):
         out[key] = list(out[key])
     out["format"] = config.format  # optional key, not in MOTION_FILE_KEYS
     return out
@@ -609,7 +624,7 @@ def load_motion_configs(motions_dir: Path) -> dict[str, MotionConfig]:
 @dataclass(frozen=True)
 class RobotSettings:
     ip: str = "192.168.58.2"
-    backend: str = "tpd"
+    backend: str = "lua"
     start_tolerance_deg: float = 0.5
     move_to_start_speed_pct: int = 25
     safe_default_speed_pct: int = 10
@@ -618,6 +633,11 @@ class RobotSettings:
     auto_stop_after_motion: bool = True
 
     def __post_init__(self) -> None:
+        if self.backend == "tpd":
+            raise ValueError(
+                "backend 'tpd' (MoveTPD) is no longer supported: use 'lua' "
+                "or remove the key"
+            )
         if self.backend not in BACKENDS:
             raise ValueError(f"backend must be one of {BACKENDS}")
         for key in ("move_to_start_speed_pct", "safe_default_speed_pct"):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -59,6 +60,21 @@ def _seed_ik_fk(client):
 
     client.GetInverseKinRef = ik
     client.GetForwardKin = fk
+
+
+def _stub_program_upload(connect, monkeypatch, uploads=None):
+    """FR5.upload_file stand-in for Lua programs: stores the program under
+    /fruser/ the way the controller does, rewritten (so its MD5 differs)."""
+    from pathlib import Path
+
+    def fake_upload_file(self, local_path, file_type=20):
+        if uploads is not None:
+            uploads.append((file_type, local_path))
+        remote = f"/fruser/{Path(local_path).name}"
+        connect.files[remote] = b"-- registered\n" + Path(local_path).read_bytes()
+        return remote
+
+    monkeypatch.setattr(fr5.FR5, "upload_file", fake_upload_file)
 
 
 # -- new --------------------------------------------------------------------
@@ -172,6 +188,23 @@ def test_simplay_compiles_automatically_if_missing(connect, _redirect_dirs):
 # -- upload -------------------------------------------------------------
 
 
+def test_upload_writes_and_uploads_the_lua_program(
+    connect, _redirect_dirs, monkeypatch
+):
+    _motions, build = _redirect_dirs
+    _seed_ik_fk(connect)
+    _run(["new", "demo", "--template", "first_test"])
+    _run(["validate", "demo"])
+    uploads = []
+    _stub_program_upload(connect, monkeypatch, uploads)
+    assert _run(["upload", "demo", "--ovl", "50"]) == 0
+    lua = build / "motion_demo.lua"
+    assert uploads == [(motionctl.LUA_UPLOAD_TYPE, str(lua))]
+    rows = tpd_file.read(build / "motion_demo.txt").joints
+    assert lua.read_text().count("\n{") == 2 * (len(rows) - 1) + 1  # ovl 50
+    assert not [c for c in connect.calls if c[0] in ("LoadTPD", "MoveTPD")]
+
+
 def test_upload_refuses_the_sim_ip(connect, _redirect_dirs):
     _seed_ik_fk(connect)
     _run(["new", "demo", "--template", "first_test"])
@@ -179,37 +212,6 @@ def test_upload_refuses_the_sim_ip(connect, _redirect_dirs):
     _run(["compile", "demo"])
     code = _run(["upload", "demo", "--ip", motionctl.SIM_IP])
     assert code == 1
-
-
-def test_upload_calls_upload_file_then_load_tpd(connect, _redirect_dirs, monkeypatch):
-    """The real upload wire protocol (FileUpload + port 20010 + MD5 verify) is
-    covered by sw/tests/test_robot_fr5.py against a real local listener.
-    Here we only need the call *sequence*: upload_file, then LoadTPD with the
-    matching start pose, so FR5.upload_file is stubbed directly."""
-    _redirect_dirs_, build = _redirect_dirs
-    _seed_ik_fk(connect)
-    _run(["new", "demo", "--template", "first_test"])
-    _run(["validate", "demo"])
-    _run(["compile", "demo"])
-
-    out = build / "motion_demo.txt"
-    tpd = tpd_file.read(out)
-    connect.tpd_start_poses["traj/motion_demo"] = tpd.poses[0]
-
-    calls = []
-
-    def fake_upload_file(self, local_path, file_type=20):
-        calls.append((file_type, local_path))
-        connect.file_upload_calls.append((file_type, "motion_demo.txt"))
-        return "/fruser/traj/motion_demo.txt"
-
-    monkeypatch.setattr(fr5.FR5, "upload_file", fake_upload_file)
-
-    code = _run(["upload", "demo", "--ip", motionctl.ROBOT_IP])
-    assert code == 0
-    assert connect.file_upload_calls == [(20, "motion_demo.txt")]
-    assert connect.tpd_loaded == "traj/motion_demo"
-    assert calls == [(20, str(out))]
 
 
 # -- play ---------------------------------------------------------------
@@ -222,89 +224,6 @@ def test_play_refuses_the_sim_ip(connect, _redirect_dirs):
     _run(["compile", "demo"])
     code = _run(["play", "demo", "--ip", motionctl.SIM_IP])
     assert code == 1
-
-
-def test_play_without_matching_remote_md5_refuses(connect, _redirect_dirs):
-    _seed_ik_fk(connect)
-    _run(["new", "demo", "--template", "first_test"])
-    _run(["validate", "demo"])
-    _run(["compile", "demo"])
-    # No file registered in connect.files, so file_md5 returns None.
-    code = _run(["play", "demo", "--ip", motionctl.ROBOT_IP])
-    assert code == 1
-    assert connect.move_j_calls == []
-    assert connect.move_tpd_calls == []
-
-
-def test_play_aborts_without_yes_and_never_moves(connect, _redirect_dirs, monkeypatch):
-    _redirect_dirs_, build = _redirect_dirs
-    _seed_ik_fk(connect)
-    _run(["new", "demo", "--template", "first_test"])
-    _run(["validate", "demo"])
-    _run(["compile", "demo"])
-    out = build / "motion_demo.txt"
-    data = out.read_bytes()
-    connect.files["/fruser/traj/motion_demo.txt"] = data
-    tpd = tpd_file.read(out)
-    connect.tpd_start_poses["traj/motion_demo"] = tpd.poses[0]
-
-    monkeypatch.setattr("builtins.input", lambda prompt="": "no")
-    code = _run(["play", "demo", "--ip", motionctl.ROBOT_IP])
-    assert code == 0  # aborting is not an error
-    assert connect.move_j_calls == []
-    assert connect.move_tpd_calls == []
-
-
-def test_play_with_yes_calls_mode_movej_movetpd_in_order(
-    connect, _redirect_dirs, monkeypatch
-):
-    _redirect_dirs_, build = _redirect_dirs
-    _seed_ik_fk(connect)
-    _run(["new", "demo", "--template", "first_test"])
-    _run(["validate", "demo"])
-    _run(["compile", "demo"])
-    out = build / "motion_demo.txt"
-    connect.files["/fruser/traj/motion_demo.txt"] = out.read_bytes()
-    tpd = tpd_file.read(out)
-    connect.tpd_start_poses["traj/motion_demo"] = tpd.poses[0]
-    connect.robot_state_pkg.motion_done = 1  # completes immediately
-
-    inputs = iter(["YES", ""])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
-    monkeypatch.setattr(motionctl.time, "sleep", lambda s: None)
-
-    code = _run(["play", "demo", "--ip", motionctl.ROBOT_IP, "--ovl", "50"])
-    assert code == 0
-
-    names = [c[0] for c in connect.calls]
-    assert "Mode" in names
-    assert "MoveJ" in names
-    assert "MoveTPD" in names
-    assert names.index("Mode") < names.index("MoveJ") < names.index("MoveTPD")
-    # global speed = the playback speed, MoveTPD at 100% (speeds multiply)
-    assert connect.move_tpd_calls == [("traj/motion_demo", 1, 100)]  # smoothed
-    assert 50 in connect.speeds
-    assert connect.speeds[-1] == 10  # safe default restored afterwards
-
-
-def test_play_ctrl_c_calls_stop_motion(connect, _redirect_dirs, monkeypatch):
-    _redirect_dirs_, build = _redirect_dirs
-    _seed_ik_fk(connect)
-    _run(["new", "demo", "--template", "first_test"])
-    _run(["validate", "demo"])
-    _run(["compile", "demo"])
-    out = build / "motion_demo.txt"
-    connect.files["/fruser/traj/motion_demo.txt"] = out.read_bytes()
-    tpd = tpd_file.read(out)
-    connect.tpd_start_poses["traj/motion_demo"] = tpd.poses[0]
-
-    def raise_interrupt(prompt=""):
-        raise KeyboardInterrupt()
-
-    monkeypatch.setattr("builtins.input", raise_interrupt)
-    code = _run(["play", "demo", "--ip", motionctl.ROBOT_IP])
-    assert code == 0
-    assert "StopMotion" in [c[0] for c in connect.calls]
 
 
 # -- interpolation: joint, and fit ---------------------------------------------
@@ -472,18 +391,7 @@ def _published_setup(connect, motions, monkeypatch):
     _seed_ik_fk(connect)
     _write_design(motions, JOINT_DESIGN)
     assert _run(["validate", "crane"]) == 0
-
-    def fake_upload(self, local_path, file_type=20):
-        from pathlib import Path
-
-        data = Path(local_path).read_bytes()
-        connect.files[f"/fruser/traj/{Path(local_path).name}"] = data
-        connect.tpd_start_poses["traj/motion_crane"] = tpd_file.read(local_path).poses[
-            0
-        ]
-        return f"/fruser/traj/{Path(local_path).name}"
-
-    monkeypatch.setattr(fr5.FR5, "upload_file", fake_upload)
+    _stub_program_upload(connect, monkeypatch)
 
 
 def test_publish_writes_a_consistent_motion_json(connect, _redirect_dirs, monkeypatch):
@@ -492,10 +400,16 @@ def test_publish_writes_a_consistent_motion_json(connect, _redirect_dirs, monkey
     assert _run(["publish", "crane", "--ovl", "40", "--ip", motionctl.ROBOT_IP]) == 0
     config = schema.load_motion_config(motions / "crane" / "motion.json")
     validated = json.loads((motions / "crane" / "validated.json").read_text())
-    assert config.md5 == tpd_file.md5(build / "motion_crane.txt")
+    remote = "/fruser/motion_crane.lua"
+    assert config.backend == "lua" and config.controller_file == remote
+    assert config.md5 == hashlib.md5(connect.files[remote]).hexdigest()  # controller's
     assert config.approved_ovl == 40
-    assert list(config.start_joints) == validated["samples"]["joints"][0]
-    assert config.tpd_name == "traj/motion_crane"
+    rows = validated["samples"]["joints"]
+    assert list(config.start_joints) == pytest.approx(rows[0])
+    assert list(config.end_joints) == pytest.approx(rows[-1])
+    n = round((len(rows) - 1) * 100 / 40) + 1  # resampled at the approved ovl
+    assert config.num_points == n
+    assert config.duration_s == pytest.approx((n - 1) * 0.008)
     assert not (motions / "crane" / "motion.json.tmp").exists()
 
 
@@ -509,29 +423,6 @@ def test_publish_refuses_the_sim_ip_and_a_stale_design(
     design.write_text(design.read_text() + "\n# edited\n")
     assert _run(["publish", "crane", "--ovl", "40", "--ip", motionctl.ROBOT_IP]) == 1
     assert not (motions / "crane" / "motion.json").exists()
-
-
-def test_publish_skip_upload_checks_a_manual_upload_by_md5(
-    connect, _redirect_dirs, monkeypatch
-):
-    motions, build = _redirect_dirs
-    _published_setup(connect, motions, monkeypatch)
-    args = [
-        "publish",
-        "crane",
-        "--ovl",
-        "40",
-        "--skip-upload",
-        "--ip",
-        motionctl.ROBOT_IP,
-    ]
-    assert _run(args) == 1  # nothing on the controller yet
-    motionctl.compile_motion("crane")
-    out = build / "motion_crane.txt"
-    connect.files["/fruser/traj/motion_crane.txt"] = out.read_bytes()
-    connect.tpd_start_poses["traj/motion_crane"] = tpd_file.read(out).poses[0]
-    assert _run(args) == 0
-    assert connect.file_upload_calls == []
 
 
 def test_list_shows_published_and_draft_motions(
@@ -571,58 +462,6 @@ def test_upload_refuses_a_file_from_other_kinematics(connect, _redirect_dirs, ca
     assert _run(["upload", "crane", "--ip", motionctl.ROBOT_IP]) == 1
     assert "another controller's kinematics" in capsys.readouterr().err
     assert connect.file_upload_calls == []
-
-
-def _ready_to_play(connect, motions, build, monkeypatch):
-    _compiled_crane(connect, motions)
-    out = build / "motion_crane.txt"
-    connect.files["/fruser/traj/motion_crane.txt"] = out.read_bytes()
-    connect.tpd_start_poses["traj/motion_crane"] = tpd_file.read(out).poses[0]
-    connect.robot_state_pkg.robot_mode = 0
-    inputs = iter(["YES", ""])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
-    monkeypatch.setattr("sw.robot.fr5.time.sleep", lambda s: None)
-
-
-def test_play_waits_for_the_motion_to_start_and_finish(
-    connect, _redirect_dirs, monkeypatch, capsys
-):
-    motions, build = _redirect_dirs
-    _ready_to_play(connect, motions, build, monkeypatch)
-    capsys.readouterr()
-    assert _run(["play", "crane", "--ip", motionctl.ROBOT_IP, "--ovl", "100"]) == 0
-    assert "Motion finished" in capsys.readouterr().out
-
-
-def test_play_reports_and_stops_on_a_robot_error(
-    connect, _redirect_dirs, monkeypatch, capsys
-):
-    motions, build = _redirect_dirs
-    _ready_to_play(connect, motions, build, monkeypatch)
-    connect.move_tpd_script = [0]
-    real_move_tpd = connect.MoveTPD
-
-    def failing_move_tpd(name, blend, ovl):  # the controller faults once playing
-        rtn = real_move_tpd(name, blend, ovl)
-        connect.robot_state_pkg.main_code, connect.robot_state_pkg.sub_code = 1, 10
-        return rtn
-
-    connect.MoveTPD = failing_move_tpd
-    capsys.readouterr()
-    _run(["play", "crane", "--ip", motionctl.ROBOT_IP, "--ovl", "100"])
-    out = capsys.readouterr().out
-    assert "main 1, sub 10" in out
-    assert "StopMotion" in [c[0] for c in connect.calls]
-
-
-def test_play_no_smooth_passes_blend_0_to_move_tpd(
-    connect, _redirect_dirs, monkeypatch
-):
-    motions, build = _redirect_dirs
-    _ready_to_play(connect, motions, build, monkeypatch)
-    args = ["play", "crane", "--ip", motionctl.ROBOT_IP, "--ovl", "100", "--no-smooth"]
-    assert _run(args) == 0
-    assert connect.move_tpd_calls == [("traj/motion_crane", 0, 100)]
 
 
 # -- portrait (D11) -----------------------------------------------------------------
@@ -757,19 +596,11 @@ def test_compile_and_publish_refuse_a_format_mismatch(
 def test_publish_writes_format_from_validated_json(
     connect, _redirect_dirs, monkeypatch
 ):
-    from pathlib import Path
 
     motions, _build = _redirect_dirs
     _validated_portrait(connect, motions)
 
-    def fake_upload(self, local_path, file_type=20):
-        connect.files[f"/fruser/traj/{Path(local_path).name}"] = Path(
-            local_path
-        ).read_bytes()
-        connect.tpd_start_poses["traj/motion_port"] = tpd_file.read(local_path).poses[0]
-        return f"/fruser/traj/{Path(local_path).name}"
-
-    monkeypatch.setattr(fr5.FR5, "upload_file", fake_upload)
+    _stub_program_upload(connect, monkeypatch)
     assert _run(["publish", "port", "--ovl", "60", "--ip", motionctl.ROBOT_IP]) == 0
     config = schema.load_motion_config(motions / "port" / "motion.json")
     assert config.format == "portrait"
@@ -919,12 +750,7 @@ def _luaplay_ready(connect, monkeypatch):
     _run(["validate", "demo"])
     _run(["compile", "demo"])
     uploads = []
-
-    def fake_upload_file(self, local_path, file_type=20):
-        uploads.append((file_type, local_path))
-        return "/fruser/motion_demo.lua"
-
-    monkeypatch.setattr(fr5.FR5, "upload_file", fake_upload_file)
+    _stub_program_upload(connect, monkeypatch, uploads)
     return uploads
 
 

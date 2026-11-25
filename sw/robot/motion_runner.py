@@ -1,21 +1,24 @@
-"""MotionRunner: load, move to start and play published motions (Phase 5).
+"""MotionRunner: load, move to start and play published motions.
 
 Used by the livestream app. One daemon worker thread runs jobs in order; each
 public method except stop(), at_start() and close() queues a job and returns
 a concurrent.futures.Future. Daemon on purpose: an SDK call can block forever
 on a dropped network and must not keep the app alive.
 
-Robot access: one FR5 connection; every RPC call holds `_rpc_lock` only for
-the call itself. Motions are started with calls that return at once
-(MoveJ with blendT=0, MoveTPD) and completion is polled from the SDK's state
-cache, which needs no lock. stop() takes the lock for StopMotion; if it
-cannot get it within STOP_LOCK_TIMEOUT_S (the worker is stuck inside an RPC,
-e.g. if MoveTPD turns out to block until the motion ends), it opens a fresh
-connection just to send StopMotion. The Phase 4 robot test tells which case
-applies; both are handled.
+A motion is a controller Lua program that replays the joint rows with ServoJ
+(design doc fairino-control-2.md, "Lua playback for every motion"); the
+controller does the timing, so a slow or lost network cannot stall it.
+MoveTPD is not used: it refuses paths at the wrist singularity.
 
-The app never generates trajectories: it only plays files already published
-with `motionctl publish` (motion.json + the controller file).
+Robot access: one FR5 connection; every RPC call holds `_rpc_lock` only for
+the call itself. Motions are started with calls that return at once (MoveJ
+with blendT=0, ProgramRun) and completion is polled from the SDK's state
+cache, which needs no lock. stop() takes the lock for ProgramStop and
+StopMotion; if it cannot get it within STOP_LOCK_TIMEOUT_S (the worker is
+stuck inside an RPC), it opens a fresh connection just to stop.
+
+The app never generates trajectories: it only plays programs already
+published with `motionctl publish` (motion.json + the controller program).
 """
 
 from __future__ import annotations
@@ -29,10 +32,12 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
-from sw.robot.fr5 import FR5, TPD_BLEND_SMOOTH, FairinoError
+from sw.robot.fr5 import FR5, FairinoError
 from sw.robot.schema import MotionConfig, RobotSettings, SchemaError
 
-POSE_TOLERANCE = 0.01  # GetTPDStartPose vs motion.json (float32 precision)
+PROGRAM_RUNNING = 2  # state cache robot_state while a program runs
+END_TOLERANCE_DEG = 0.5  # arm vs end_joints when the program has ended
+END_WAIT_S = 2.0  # how long the arm may lag the program's end
 STOP_ATTEMPTS = 3
 STOP_RETRY_S = 0.1
 STOP_LOCK_TIMEOUT_S = 1.0
@@ -207,7 +212,8 @@ class MotionRunner:
     # -- motions -----------------------------------------------------------
 
     def load(self, name: str) -> Future:
-        """LoadTPD and check the start pose. Never moves the robot."""
+        """Check the controller program is still the published one and load
+        it (ProgramLoad). Never moves the robot."""
         config = self._config(name)
 
         def job() -> None:
@@ -216,15 +222,11 @@ class MotionRunner:
         return self._submit(job)
 
     def _load(self, config: MotionConfig) -> None:
-        self._call(lambda r: r.load_tpd(config.tpd_name))
-        pose = self._call(lambda r: r.tpd_start_pose(config.tpd_name))
-        diff = max(abs(a - b) for a, b in zip(pose, config.start_pose, strict=True))
-        if diff > POSE_TOLERANCE:
-            self.disabled[config.name] = "start pose differs from motion.json"
-            raise MotionError(
-                f"{config.name}: the loaded start pose differs from motion.json by "
-                f"{diff:.3f} (re-publish the motion)"
-            )
+        reason = self._check_motion(config)
+        if reason is not None:
+            self.disabled[config.name] = reason
+            raise MotionError(f"{config.name}: {reason} (re-publish the motion)")
+        self._call(lambda r: r.load_program(config.controller_file))
 
     def at_start(self, name: str) -> tuple[bool, float]:
         """(within tolerance, max joint error in deg). Reads the state cache
@@ -264,15 +266,15 @@ class MotionRunner:
         return self._submit(job)
 
     def run(self, name: str) -> Future:
-        """Play the motion at its approved ovl and wait for it to finish."""
+        """Play the motion's program (its speed is baked in at publish) and
+        wait until it has ended with the arm at the last row."""
         config = self._config(name)
 
         def job() -> None:
             self._stop_requested.clear()
             self._call(lambda r: r.ensure_auto())
-            self._load(config)  # cheap insurance: a MoveJ may have unloaded it
-            ovl = config.approved_ovl
-            deadline = 1.5 * config.duration_s * 100.0 / ovl + self._watchdog_margin_s
+            self._load(config)  # cheap insurance: the program may have changed
+            deadline = 1.5 * config.duration_s + self._watchdog_margin_s
             timed_out = threading.Event()
 
             def watchdog() -> None:
@@ -283,26 +285,67 @@ class MotionRunner:
             timer.daemon = True
             timer.start()
             try:
-                self._call(lambda r: r.set_speed(ovl))  # global = playback speed
-                self._call(
-                    lambda r: r.move_tpd(config.tpd_name, TPD_BLEND_SMOOTH, COMMAND_PCT)
-                )
-                self._wait_motion(deadline_s=deadline, timed_out=timed_out)
+                self._call(lambda r: r.start_program())
+                self._wait_program(config, deadline_s=deadline, timed_out=timed_out)
             finally:
                 timer.cancel()
-                self._restore_speed()
 
         return self._submit(job)
+
+    def _wait_program(
+        self, config: MotionConfig, *, deadline_s: float, timed_out: threading.Event
+    ) -> None:
+        """Poll the state cache: wait for the program state to go to running
+        (the cache is stale right after ProgramRun), then back, then for the
+        arm to reach end_joints (it may lag the last command slightly)."""
+        fr5 = self._fr5
+        assert fr5 is not None
+        start = time.monotonic()
+
+        def check() -> None:
+            if timed_out.is_set():
+                raise MotionTimeout("motion did not finish before its deadline")
+            if self._stop_requested.is_set():
+                raise MotionStopped("stopped")
+            main, sub = fr5.error_codes()
+            if main != 0:
+                self.stop()
+                raise FairinoError(main, f"robot error (sub code {sub})")
+            if time.monotonic() - start > deadline_s:
+                self.stop()
+                raise MotionTimeout("motion did not finish before its deadline")
+
+        while fr5.program_state() != PROGRAM_RUNNING:
+            check()
+            if time.monotonic() - start > self._start_timeout_s:
+                raise MotionError("program did not start")
+            time.sleep(self._poll_s)
+        while fr5.program_state() == PROGRAM_RUNNING:
+            check()
+            time.sleep(self._poll_s)
+        ended = time.monotonic()
+        while True:
+            check()
+            err = max(
+                abs(a - b) for a, b in zip(fr5.joints(), config.end_joints, strict=True)
+            )
+            if err <= END_TOLERANCE_DEG:
+                return
+            if time.monotonic() - ended > END_WAIT_S:
+                raise MotionError(
+                    f"program ended {err:.1f}deg away from the motion's end"
+                )
+            time.sleep(self._poll_s)
 
     def _wait_motion(
         self,
         *,
         deadline_s: float,
         must_start: bool = True,
-        timed_out: threading.Event | None = None,
     ) -> None:
-        """Poll the state cache: wait for motion_done to go 0 (started; the
-        cache is stale right after the command), then back to 1 (done)."""
+        """Poll the state cache for a MoveJ: wait for motion_done to go 0
+        (started; the cache is stale right after the command), then back to 1
+        (done)."""
         fr5 = self._fr5
         assert fr5 is not None
         start = time.monotonic()
@@ -317,8 +360,6 @@ class MotionRunner:
                 raise MotionError("motion did not start")
             return
         while True:
-            if timed_out is not None and timed_out.is_set():
-                raise MotionTimeout("motion did not finish before its deadline")
             if self._stop_requested.is_set():
                 raise MotionStopped("stopped")
             main, sub = fr5.error_codes()
@@ -341,8 +382,9 @@ class MotionRunner:
     # -- stop and close --------------------------------------------------
 
     def stop(self) -> bool:
-        """StopMotion now. Never raises; safe to call repeatedly and from any
-        thread. Returns True if a StopMotion call succeeded."""
+        """ProgramStop and StopMotion now. Never raises; safe to call
+        repeatedly and from any thread. Returns True if a StopMotion call
+        succeeded."""
         self._stop_requested.set()
         if self._fr5 is None:
             return False
@@ -360,6 +402,10 @@ class MotionRunner:
 
     @staticmethod
     def _stop_with(fr5: FR5) -> bool:
+        try:
+            fr5.stop_program()  # ends the ServoJ loop; StopMotion stops the arm
+        except Exception:  # noqa: BLE001 - StopMotion below still runs
+            pass
         for attempt in range(STOP_ATTEMPTS):
             try:
                 fr5.stop()

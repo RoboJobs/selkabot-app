@@ -583,11 +583,13 @@ def test_cartesian_roundtrip_still_fails_a_real_rotation_error():
     assert report.peaks.max_fk_rot_err_deg == pytest.approx(0.5, abs=1e-3)
 
 
-def test_portrait_on_a_mount_that_makes_the_wrist_singular_is_rejected():
+def test_joint_mode_has_no_wrist_singularity_check():
+    """Lua ServoJ playback plays J5 = 0 paths (MoveTPD refused them); joint
+    speed/acceleration/step checks still bound J4/J6."""
     design = _design(PORTRAIT_JOINT)
     report = validate.validate(design, [], WristFK(mount=SINGULAR_PORTRAIT_MOUNT))
-    assert not report.passed
-    assert not _check(report, "check_wrist_singularity").passed
+    assert "check_wrist_singularity" not in [c.name for c in report.checks]
+    assert _check(report, "check_joint_speed_acc") is not None
 
 
 def test_validated_json_records_format_and_tool():
@@ -623,9 +625,9 @@ def test_level_wrist_false_blends_joints_and_still_checks_the_roll():
     assert report.joints == [list(q) for q in blend]  # no wrist solve
 
 
-def test_level_wrist_false_at_the_wrist_singularity_is_rejected():
-    """The controller will not play a TPD at J5 = 0 (main 10 'singular pose',
-    or joint overspeed without smoothing), so the check applies here too."""
+def test_level_wrist_false_at_the_wrist_singularity_validates():
+    """A level path held at J5 = 0 (the real up_down_portrait case) passes:
+    it plays with Lua ServoJ."""
     kin = WristFK(mount=SINGULAR_PORTRAIT_MOUNT)
     a = _singular_portrait_joints(kin, 0, 0, (600.0, -300.0, 450.0))
     assert abs(a[4]) < 1.0
@@ -633,8 +635,8 @@ def test_level_wrist_false_at_the_wrist_singularity_is_rejected():
     raw = {**PORTRAIT_JOINT, "level_wrist": False,
            "keyframes": [{"t": 0.0, "joints": a}, {"t": 2.0, "joints": b}]}  # fmt: skip
     report = validate.validate(_design(raw), [], kin)
-    assert not _check(report, "check_wrist_singularity").passed
-    assert _check(report, "check_roll").passed  # level, but unplayable
+    assert report.passed, [c for c in report.checks if not c.passed]
+    assert _check(report, "check_roll").passed
 
 
 def test_level_wrist_false_fails_check_roll_when_the_blend_rolls():

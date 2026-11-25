@@ -90,11 +90,11 @@ def test_state_readers_use_the_cache_not_an_rpc(robot, client):
 
 
 def test_nonzero_code_raises_fairino_error_with_call_name(robot, client):
-    client.errors["LoadTPD"] = 8
+    client.errors["ProgramLoad"] = 8
     with pytest.raises(fr5.FairinoError) as exc:
-        robot.load_tpd("traj/missing")
+        robot.load_program("/fruser/missing.lua")
     assert exc.value.code == 8
-    assert exc.value.call == "LoadTPD"
+    assert exc.value.call == "ProgramLoad"
 
 
 def test_plain_int_return_raises_on_nonzero(robot, client):
@@ -166,11 +166,6 @@ def test_move_j_calls_with_tool_and_user_zero(robot, client):
     assert name == "MoveJ"
     assert args == ([1, 2, 3, 4, 5, 6], 3, 0)
     assert kwargs == {"vel": 25}
-
-
-def test_move_tpd_calls_with_blend_and_ovl(robot, client):
-    robot.move_tpd("traj/motion_demo", 0, 50)
-    assert client.move_tpd_calls == [("traj/motion_demo", 0, 50)]
 
 
 # -- Lua programs ------------------------------------------------------------
@@ -258,17 +253,10 @@ def test_stream_joints_never_calls_servo_jt(robot, client, monkeypatch):
 # -- TPD loading --------------------------------------------------------
 
 
-def test_load_tpd_and_start_pose(robot, client):
-    client.tpd_start_poses["traj/motion_demo"] = [1, 2, 3, 4, 5, 6]
-    robot.load_tpd("traj/motion_demo")
-    assert client.tpd_loaded == "traj/motion_demo"
-    assert robot.tpd_start_pose("traj/motion_demo") == [1, 2, 3, 4, 5, 6]
-
-
-def test_load_tpd_missing_file_raises_with_code_8(robot):
-    with pytest.raises(fr5.FairinoError) as exc:
-        robot.load_tpd("traj/nope")
-    assert exc.value.code == 8
+def test_robot_has_no_movetpd_calls(robot):
+    """Every motion is a Lua program; MoveTPD refuses the wrist singularity."""
+    for name in ("move_tpd", "load_tpd", "tpd_start_pose"):
+        assert not hasattr(robot, name)
 
 
 # -- file_md5 -------------------------------------------------------------

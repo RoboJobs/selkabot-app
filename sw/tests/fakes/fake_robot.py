@@ -122,6 +122,9 @@ class FakeRobotClient:
         self.program_stops = 0
         # robot_state values a ProgramRun produces (running, then stopped).
         self.program_run_script: list[int] = [2, 2, 1]
+        # Where ProgramRun leaves the arm (None: it does not move the fake).
+        self.program_end_joints: list[float] | None = None
+        self.program_run_block: Any = None  # a threading.Event to block on
 
         self.install_angle: list[float] = [0.0, 0.0]
         self.soft_limits: list[float] = [
@@ -331,7 +334,11 @@ class FakeRobotClient:
         if code:
             return code
         self.program_runs += 1
+        if self.program_run_block is not None:
+            self.program_run_block.wait()
         self.robot_state_pkg.program_script = list(self.program_run_script)
+        if self.program_end_joints is not None:
+            self.robot_state_pkg.jt_cur_pos = list(self.program_end_joints)
         return 0
 
     def ProgramStop(self) -> int:

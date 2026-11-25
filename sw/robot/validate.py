@@ -657,10 +657,9 @@ def _validate_joint(design: Design, kin: Kinematics) -> ValidationReport:
     ]
 
     peaks = _compute_peaks(design, samples, joints)
-    # Always, also with level_wrist false: the controller refuses to play a
-    # TPD at the wrist singularity (main 10 "singular pose" with smoothing,
-    # main 1 sub 24 joint overspeed without; real robot, 2026-11-25).
-    checks.append(check_wrist_singularity(design, samples, joints))
+    # No wrist-singularity check in joint mode: it existed because MoveTPD
+    # refuses paths at J5 = 0; the Lua ServoJ playback plays them (real robot,
+    # 2026-11-25). The joint speed/acceleration/step checks bound J4/J6.
     roll_result, peaks.max_roll_deg = check_roll(
         poses, design.limits.max_roll_deg, design.camera_roll_deg
     )

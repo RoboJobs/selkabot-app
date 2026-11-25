@@ -65,7 +65,8 @@ def solve_wrist(
     roll about its optical axis (0 = landscape, 90 = portrait), keeping J1-J3
     of `joints`. Returns the full joint vector; raises LevelError when the
     orientation cannot be reached. A singular wrist (J5 near 0/180) may still
-    succeed here: rejecting it is validate.check_wrist_singularity's job."""
+    succeed here; a wrist that spins there is caught by the validator's joint
+    speed/acceleration/step checks."""
     if abs(tilt) > MAX_ABS_TILT_DEG:
         raise LevelError(
             f"tilt {tilt:.1f}deg is too close to vertical for a level horizon"

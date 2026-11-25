@@ -1,9 +1,11 @@
 """CLI for designing, validating, compiling and running robot motions.
 
 Usage: `uv run python -m sw.robot.motionctl <cmd> ...`. See `--help` on each
-command. Defaults to the simulator (192.168.50.2); `upload` and `play` need
---ip 192.168.58.2 explicitly and are meant to be run by the operator with the
-cell clear and the e-stop in hand. See the design doc's "Read this first"
+command. Defaults to the simulator (192.168.50.2); `upload`, `play`,
+`publish` and `list` default to the real robot (192.168.58.2), and `play` is
+meant to be run by the operator with the cell clear and the e-stop in hand.
+Motions are played as controller Lua programs (ServoJ over the joint rows);
+MoveTPD is not used. See the design doc's "Read this first"
 and "Simulator vs real robot" sections before changing this file.
 """
 
@@ -20,13 +22,7 @@ import yaml
 
 from sw.robot import lua_program, schema, templates, tpd_file, validate
 from sw.robot import path as path_module
-from sw.robot.fr5 import (
-    FR5,
-    TPD_BLEND_NONE,
-    TPD_BLEND_SMOOTH,
-    FairinoError,
-    FileTransferError,
-)
+from sw.robot.fr5 import FR5, FairinoError, FileTransferError
 from sw.robot.frames import base_to_authoring
 from sw.robot.level import LevelError, level_keyframe
 from sw.robot.pose import (
@@ -40,10 +36,9 @@ SIM_IP = "192.168.50.2"
 ROBOT_IP = "192.168.58.2"
 MOTIONS_DIR = Path(__file__).resolve().parent / "motions"
 BUILD_DIR = Path(__file__).resolve().parent / "build"
-POSE_TOLERANCE = 0.01
 MOVE_TO_START_SPEED_PCT = 25
 # The controller's actual speed is max x global speed (SetSpeed) x the
-# command's own speed (MoveJ vel, MoveTPD ovl) -- manual 1.3.9.5. We use the
+# command's own speed (MoveJ vel) -- manual 1.3.9.5. We use the
 # global speed as the one speed control and give commands 100%.
 COMMAND_PCT = 100
 
@@ -72,20 +67,8 @@ def _build_path(name: str) -> Path:
     return BUILD_DIR / f"motion_{name}.txt"
 
 
-def _controller_file(name: str) -> str:
-    return f"/fruser/traj/motion_{name}.txt"
-
-
-def _tpd_name(name: str) -> str:
-    return f"traj/motion_{name}"
-
-
 def _lua_build_path(name: str) -> Path:
     return BUILD_DIR / f"motion_{name}.lua"
-
-
-def _lua_controller_file(name: str) -> str:
-    return f"/fruser/motion_{name}.lua"
 
 
 def load_design(name: str) -> schema.Design:
@@ -574,15 +557,18 @@ def cmd_simplay(args: argparse.Namespace) -> None:
         robot.close()
 
 
-# -- upload (real robot only) --------------------------------------------
+# -- controller programs (real robot only) ----------------------------------
 
 
 def _refuse_sim(command: str, ip: str) -> None:
     if ip == SIM_IP:
         raise CommandError(
             f"{command} needs the real robot (--ip {ROBOT_IP}); the simulator "
-            "does not store uploaded files or play TPD trajectories"
+            "does not store uploaded programs"
         )
+
+
+LUA_UPLOAD_TYPE = 0  # FileUpload type for Lua programs (stored in /fruser/)
 
 
 KINEMATICS_TOLERANCE_MM = 1.0
@@ -594,8 +580,9 @@ def _check_same_kinematics(robot: FR5, out: Path, rows: int = 12) -> None:
 
     A file computed with another controller's kinematics (the simulator's arm
     model differs from the real FR5 by ~28 mm) has joints and poses that
-    disagree on this robot; the controller rejects it with "TPD command point
-    error" (main 1, sub 10). Read-only: FK calls only.
+    disagree on this robot: the camera would not be where the design put it
+    (with MoveTPD the controller rejected such files with "TPD command point
+    error", main 1 sub 10). Read-only: FK calls only.
     """
     tpd = tpd_file.read(out)
     step = max(1, len(tpd.joints) // rows)
@@ -613,90 +600,91 @@ def _check_same_kinematics(robot: FR5, out: Path, rows: int = 12) -> None:
             )
 
 
-def _put_on_controller(robot: FR5, name: str, out: Path, skip_upload: bool) -> str:
-    """Check the file matches this robot's kinematics, upload it (or, with
-    skip_upload, check a manual upload by MD5), then LoadTPD and compare the
-    start pose with the file. Returns the controller's MD5 of the file."""
+def _put_program(
+    robot: FR5, name: str, ovl: int, pace: str = "queue"
+) -> tuple[str, str, list[list[float]]]:
+    """Check the compiled file matches this robot's kinematics, write the Lua
+    program at `ovl` and upload it. Returns the controller path, the
+    controller's MD5 of the registered program and the rows it plays."""
+    out = _ensure_compiled(name)
     _check_same_kinematics(robot, out)
-    remote = _controller_file(name)
-    local_md5 = tpd_file.md5(out)
-    if skip_upload:
-        remote_md5 = robot.file_md5(remote)
-        if remote_md5 is None or remote_md5.lower() != local_md5.lower():
-            raise CommandError(
-                f"{remote} on the controller does not match {out} "
-                f"(controller MD5 {remote_md5}, local {local_md5})"
-            )
-        print(f"Controller copy of {remote} matches (MD5 {local_md5}).")
-    else:
-        try:
-            robot.upload_file(str(out), file_type=20)
-        except FileTransferError as exc:
-            raise CommandError(
-                f"upload failed at stage '{exc.stage}' ({exc.detail!r}). "
-                f"Ask the operator to upload {out} to the controller manually "
-                "(teach pendant or web UI trajectory import), then re-run with "
-                "--skip-upload."
-            ) from exc
-        print(f"Uploaded to {remote} (MD5 verified).")
-
-    tpd_name = _tpd_name(name)
-    robot.load_tpd(tpd_name)
-    start_pose = robot.tpd_start_pose(tpd_name)
-    expected = tpd_file.read(out).poses[0]
-    diff = max(abs(a - b) for a, b in zip(start_pose, expected, strict=True))
-    if diff > POSE_TOLERANCE:
+    lua, rows = write_lua(name, ovl, pace)
+    period_ms = _load_validated(name)["sample_period_ms"]
+    print(
+        f"Wrote {lua} ({len(rows)} rows, ovl {ovl}, pace {pace}, about "
+        f"{(len(rows) - 1) * period_ms / 1000.0:.2f}s)."
+    )
+    try:
+        remote = robot.upload_file(str(lua), file_type=LUA_UPLOAD_TYPE)
+    except FileTransferError as exc:
         raise CommandError(
-            f"start pose differs from the file by {diff}, more than "
-            f"the tolerance ({POSE_TOLERANCE})"
-        )
-    print(f"LoadTPD({tpd_name!r}) OK. Start pose matches file (diff {diff:.6f}).")
-    return local_md5
+            f"upload of {lua} failed at stage '{exc.stage}' ({exc.detail!r})"
+        ) from exc
+    md5 = robot.file_md5(remote)
+    if md5 is None:
+        raise CommandError(f"{remote} not found on the controller after upload")
+    print(f"Uploaded to {remote} (controller MD5 {md5}).")
+    return remote, md5, rows
+
+
+def _check_ovl(ovl: int) -> None:
+    if not 1 <= ovl <= 100:
+        raise CommandError("--ovl must be 1..100")
 
 
 def cmd_upload(args: argparse.Namespace) -> None:
     _refuse_sim("upload", args.ip)
-    out = _ensure_compiled(args.name)
+    _check_ovl(args.ovl)
     robot = FR5.connect(args.ip)
     try:
-        _put_on_controller(robot, args.name, out, args.skip_upload)
+        _put_program(robot, args.name, args.ovl, args.pace)
     finally:
         robot.close()
+
+
+def write_lua(name: str, ovl: int, pace: str) -> tuple[Path, list[list[float]]]:
+    """Write the Lua program for the compiled file at `ovl`. Returns the path
+    and the rows it plays (one per sample period)."""
+    out = _ensure_compiled(name)
+    validated = _load_validated(name)
+    rows = lua_program.resample(tpd_file.read(out).joints, ovl)
+    lua = _lua_build_path(name)
+    lua.write_text(lua_program.render(rows, validated["sample_period_ms"], name, pace))
+    return lua, rows
 
 
 # -- publish / list (real robot only for publish) ---------------------------
 
 
 def cmd_publish(args: argparse.Namespace) -> None:
-    """Recompile from the current validated.json, put the file on the
-    controller, and write motion.json (what the livestream app reads)."""
+    """Recompile from the current validated.json, upload the program at the
+    approved speed, and write motion.json (what the livestream app reads)."""
     import datetime
     import os
 
     _refuse_sim("publish", args.ip)
-    if not 1 <= args.ovl <= 100:
-        raise CommandError("--ovl must be 1..100")
-    out = compile_motion(args.name)  # refuses a missing or stale validated.json
+    _check_ovl(args.ovl)
+    compile_motion(args.name)  # refuses a missing or stale validated.json
     validated = _load_validated(args.name)
     robot = FR5.connect(args.ip)
     try:
-        md5 = _put_on_controller(robot, args.name, out, args.skip_upload)
+        remote, md5, rows = _put_program(robot, args.name, args.ovl)
     finally:
         robot.close()
 
-    samples = validated["samples"]
+    period_ms = validated["sample_period_ms"]
     raw = {
         "name": args.name,
-        "backend": "tpd",
-        "controller_file": _controller_file(args.name),
-        "tpd_name": _tpd_name(args.name),
+        "backend": "lua",
+        "controller_file": remote,
         "md5": md5,
-        "num_points": validated["num_points"],
-        "sample_period_ms": validated["sample_period_ms"],
-        "duration_s": validated["duration_s"],
+        "num_points": len(rows),
+        "sample_period_ms": period_ms,
+        "duration_s": (len(rows) - 1) * period_ms / 1000.0,
         "design_duration_s": validated["design_duration_s"],
-        "start_joints": samples["joints"][0],
-        "start_pose": samples["pose"][0],
+        "start_joints": rows[0],
+        "end_joints": rows[-1],
+        "start_pose": validated["samples"]["pose"][0],
         "tool_id": validated["tool_id"],
         "approved_ovl": args.ovl,
         "design_sha256": validated["design_sha256"],
@@ -751,40 +739,20 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def cmd_play(args: argparse.Namespace) -> None:
-    if args.ip == SIM_IP:
-        raise CommandError(
-            "play needs the real robot (--ip 192.168.58.2); MoveTPD does not "
-            "play trajectories on the simulator"
-        )
+    """Upload the program at --ovl, move to the start and run it."""
+    _refuse_sim("play", args.ip)
+    _check_ovl(args.ovl)
     out = _ensure_compiled(args.name)
-    local_md5 = tpd_file.md5(out)
-    remote_path = _controller_file(args.name)
-    tpd_name = _tpd_name(args.name)
+    validated = _load_validated(args.name)
+    period_ms = validated["sample_period_ms"]
 
     robot = FR5.connect(args.ip)
     try:
-        _check_same_kinematics(robot, out)
-        remote_md5 = robot.file_md5(remote_path)
-        if remote_md5 is None or remote_md5.lower() != local_md5.lower():
-            raise CommandError(
-                f"controller copy of {remote_path} does not match the "
-                f"compiled file; run 'upload {args.name}' first"
-            )
-
-        robot.load_tpd(tpd_name)
-        start_pose = robot.tpd_start_pose(tpd_name)
-        expected = tpd_file.read(out).poses[0]
-        diff = max(abs(a - b) for a, b in zip(start_pose, expected, strict=True))
-        if diff > POSE_TOLERANCE:
-            raise CommandError(
-                f"GetTPDStartPose differs from the file by {diff}; run 'upload' again"
-            )
-
-        validated = _load_validated(args.name)
-        start_joints = validated["samples"]["joints"][0]
+        remote, _md5, rows = _put_program(robot, args.name, args.ovl, args.pace)
+        expected = (len(rows) - 1) * period_ms / 1000.0
         print("Current joints:", [round(v, 2) for v in robot.joints()])
-        print("Start joints:  ", [round(v, 2) for v in start_joints])
-        print("\nThe robot will MOVE to the start pose, then play the motion.")
+        print("Start joints:  ", [round(v, 2) for v in rows[0]])
+        print("\nThe robot will MOVE to the start pose, then run the program.")
         print("Cell must be clear and the e-stop in hand.")
         if input("Type YES to continue: ").strip() != "YES":
             print("Aborted.")
@@ -792,25 +760,19 @@ def cmd_play(args: argparse.Namespace) -> None:
 
         robot.ensure_auto()
         with robot.speed(MOVE_TO_START_SPEED_PCT):
-            robot.move_j(start_joints, validated["tool_id"], COMMAND_PCT)
+            robot.move_j(rows[0], validated["tool_id"], COMMAND_PCT)
         input("Press Enter to play: ")
 
-        robot.load_tpd(tpd_name)  # cheap insurance against a stale load
-        expected_duration = validated["duration_s"] * 100.0 / args.ovl
-        with robot.speed(args.ovl):  # global speed = playback speed (see COMMAND_PCT)
-            start = time.monotonic()
-            blend = TPD_BLEND_NONE if args.no_smooth else TPD_BLEND_SMOOTH
-            robot.move_tpd(tpd_name, blend, COMMAND_PCT)
-            print(f"move_tpd returned after {time.monotonic() - start:.3f}s")
-            outcome = _wait_for_motion(robot, expected_duration * 1.5 + 3.0)
-            elapsed = time.monotonic() - start
-        print(f"{outcome}. Elapsed: {elapsed:.2f}s (expected about "
-              f"{expected_duration:.2f}s)")  # fmt: skip
-        if not outcome.startswith("Motion finished"):
-            print(_progress(robot, out, validated["sample_period_ms"], elapsed))
+        start = time.monotonic()
+        robot.run_program(remote)
+        outcome = _wait_for_program(robot, rows[-1], expected * 1.5 + 3.0)
+        elapsed = time.monotonic() - start
+        print(f"{outcome}. Elapsed: {elapsed:.2f}s (expected about {expected:.2f}s)")
+        if not outcome.startswith("Program finished"):
+            print(_progress(robot, out, period_ms, elapsed, rows))
     except KeyboardInterrupt:
         print("\nInterrupted; stopping.")
-        robot.stop()
+        _stop_program(robot)
     finally:
         robot.close()
 
@@ -835,100 +797,6 @@ def _progress(
         f"Stopped near row {i} of {len(rows)} (planned t={planned:.2f}s): "
         f"effective playback speed about {rate:.1f}% of planned"
     )
-
-
-def _wait_for_motion(robot: FR5, deadline_s: float, start_s: float = 2.0) -> str:
-    """Wait for motion_done to go 0 (started; the state cache is stale right
-    after the command) and back to 1, watching the robot's error code.
-    Stops the robot on an error or a timeout. Returns a one-line outcome."""
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < start_s:
-        main, sub = robot.error_codes()
-        if main:
-            robot.stop()
-            return f"Robot error before the motion started: main {main}, sub {sub}"
-        if not robot.motion_done():
-            break
-        time.sleep(0.02)
-    else:
-        return "Motion did not start (motion_done never went to 0)"
-    while time.monotonic() - t0 < deadline_s:
-        main, sub = robot.error_codes()
-        if main:
-            robot.stop()
-            return f"Robot error during the motion: main {main}, sub {sub}"
-        if robot.motion_done():
-            return "Motion finished"
-        time.sleep(0.02)
-    robot.stop()
-    return "Motion did not finish before the deadline; stopped"
-
-
-# -- luaplay (real robot; joint playback on the controller) ------------------
-
-LUA_UPLOAD_TYPE = 0  # FileUpload type for Lua programs (stored in /fruser/)
-
-
-def write_lua(name: str, ovl: int, pace: str) -> tuple[Path, list[list[float]]]:
-    """Write the Lua program for the compiled file at `ovl`. Returns the path
-    and the rows it plays (one per sample period)."""
-    out = _ensure_compiled(name)
-    validated = _load_validated(name)
-    rows = lua_program.resample(tpd_file.read(out).joints, ovl)
-    lua = _lua_build_path(name)
-    lua.write_text(lua_program.render(rows, validated["sample_period_ms"], name, pace))
-    return lua, rows
-
-
-def cmd_luaplay(args: argparse.Namespace) -> None:
-    _refuse_sim("luaplay", args.ip)
-    if not 1 <= args.ovl <= 100:
-        raise CommandError("--ovl must be 1..100")
-    out = _ensure_compiled(args.name)
-    validated = _load_validated(args.name)
-    period_ms = validated["sample_period_ms"]
-    lua, rows = write_lua(args.name, args.ovl, args.pace)
-    expected = (len(rows) - 1) * period_ms / 1000.0
-    print(f"Wrote {lua} ({len(rows)} rows, pace {args.pace}, about {expected:.2f}s).")
-
-    robot = FR5.connect(args.ip)
-    try:
-        _check_same_kinematics(robot, out)
-        try:
-            remote = robot.upload_file(str(lua), file_type=LUA_UPLOAD_TYPE)
-        except FileTransferError as exc:
-            raise CommandError(
-                f"upload of {lua} failed at stage '{exc.stage}' ({exc.detail!r})"
-            ) from exc
-        print(f"Uploaded to {remote} (controller MD5 {robot.file_md5(remote)}).")
-
-        start_joints = validated["samples"]["joints"][0]
-        print("Current joints:", [round(v, 2) for v in robot.joints()])
-        print("Start joints:  ", [round(v, 2) for v in start_joints])
-        print("\nThe robot will MOVE to the start pose, then run the program.")
-        print("Cell must be clear and the e-stop in hand.")
-        if input("Type YES to continue: ").strip() != "YES":
-            print("Aborted.")
-            return
-
-        robot.ensure_auto()
-        with robot.speed(MOVE_TO_START_SPEED_PCT):
-            robot.move_j(start_joints, validated["tool_id"], COMMAND_PCT)
-        input("Press Enter to play: ")
-
-        start = time.monotonic()
-        robot.run_program(remote)
-        end_joints = validated["samples"]["joints"][-1]
-        outcome = _wait_for_program(robot, end_joints, expected * 1.5 + 3.0)
-        elapsed = time.monotonic() - start
-        print(f"{outcome}. Elapsed: {elapsed:.2f}s (expected about {expected:.2f}s)")
-        if not outcome.startswith("Program finished"):
-            print(_progress(robot, out, period_ms, elapsed, rows))
-    except KeyboardInterrupt:
-        print("\nInterrupted; stopping.")
-        _stop_program(robot)
-    finally:
-        robot.close()
 
 
 def _stop_program(robot: FR5) -> None:
@@ -1071,30 +939,24 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ip(p)
     p.set_defaults(func=cmd_simplay)
 
-    p = sub.add_parser(
-        "luaplay", help="play joints with ServoJ in a controller Lua program"
-    )
-    p.add_argument("name")
-    p.add_argument("--ovl", type=int, default=50, help="playback speed, 1..100")
-    p.add_argument(
-        "--pace",
-        choices=lua_program.PACES,
-        default="queue",
-        help="queue: ServoJ paces itself (measured); wait: also WaitMs(period)",
-    )
-    _add_ip(p, default=ROBOT_IP)
-    p.set_defaults(func=cmd_luaplay)
+    def add_pace(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--pace",
+            choices=lua_program.PACES,
+            default="queue",
+            help="queue: ServoJ paces itself (measured); wait: also WaitMs(period)",
+        )
 
-    p = sub.add_parser("upload")
+    p = sub.add_parser("upload", help="upload the motion's Lua program")
     p.add_argument("name")
-    p.add_argument("--skip-upload", action="store_true", help="only verify by MD5")
+    p.add_argument("--ovl", type=int, default=100, help="playback speed, 1..100")
+    add_pace(p)
     _add_ip(p, default=ROBOT_IP)
     p.set_defaults(func=cmd_upload)
 
     p = sub.add_parser("publish")
     p.add_argument("name")
     p.add_argument("--ovl", type=int, required=True, help="approved speed, 1..100")
-    p.add_argument("--skip-upload", action="store_true", help="file already uploaded")
     _add_ip(p, default=ROBOT_IP)
     p.set_defaults(func=cmd_publish)
 
@@ -1103,16 +965,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ip(p, default=ROBOT_IP)
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("play")
-    p.add_argument("name")
-    p.add_argument("--ovl", type=int, default=50)
-    p.add_argument(
-        "--no-smooth",
-        action="store_true",
-        help="MoveTPD blend=0 (no controller smoothing; for comparison only)",
-    )
-    _add_ip(p, default=ROBOT_IP)
-    p.set_defaults(func=cmd_play)
+    for cmd in ("play", "luaplay"):  # luaplay: the name used while testing
+        p = sub.add_parser(cmd, help="upload the Lua program, move to start, run it")
+        p.add_argument("name")
+        p.add_argument("--ovl", type=int, default=50, help="playback speed, 1..100")
+        add_pace(p)
+        _add_ip(p, default=ROBOT_IP)
+        p.set_defaults(func=cmd_play)
 
     return parser
 
