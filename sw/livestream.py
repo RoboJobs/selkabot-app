@@ -107,6 +107,14 @@ MOTIONS_DIR = Path(__file__).resolve().parent / "robot" / "motions"
 ROBOT_CHECK_TIMEOUT_S = 20.0  # startup check; the SDK can hang on a dead link
 ROBOT_REFRESH_TICKS = 30  # re-evaluate "at start" every ~0.5 s of _poll
 DISPLAY_WIDTH = 960
+VIDEO_MIN_HEIGHT = (
+    180  # the preview never shrinks below this, so the controls stay visible
+)
+FLOW_PAD = 6  # gap between widgets in a _Flow
+WINDOW_GUTTER = 8  # outer padding of the window's rows (padx=8)
+# Narrowest the window may go: at this width every control row is at most two rows
+# tall, which leaves room for the preview on a 480 px high screen.
+MIN_WINDOW_WIDTH = 560
 KEEP_ALIVE_PERIOD_S = 3.0
 
 
@@ -621,6 +629,65 @@ def load_motions(motions_dir: Path) -> tuple[dict[str, MotionConfig], dict[str, 
     return configs, broken
 
 
+class _Flow(ttk.Frame):
+    """Lays its children out left to right and wraps them onto a new row when the
+    frame is too narrow.
+
+    Each child keeps its natural size, so a narrow window wraps the controls
+    instead of squeezing them into unreadable slivers.
+    """
+
+    def __init__(self, master: tk.Misc) -> None:
+        super().__init__(master)
+        self._items: list[tk.Widget] = []
+        self.bind("<Configure>", lambda event: self._relayout(event.width))
+
+    def add(self, widget: tk.Widget) -> None:
+        self._items.append(widget)
+        # A child that changes size (e.g. "Move to Start" -> "Stop robot") re-wraps.
+        widget.bind(
+            "<Configure>", lambda _e: self._relayout(self.winfo_width()), add="+"
+        )
+        self._relayout(self.winfo_width())
+
+    def min_width(self) -> int:
+        """The narrowest the frame can be: its widest child on a row of its own."""
+        widest = max((w.winfo_reqwidth() for w in self._items), default=0)
+        return widest + 2 * FLOW_PAD
+
+    def height_for(self, width: int) -> int:
+        return self._positions(width)[1]
+
+    def _positions(self, width: int) -> tuple[list[tuple[tk.Widget, int, int]], int]:
+        placed: list[tuple[tk.Widget, int, int]] = []
+        x = y = row_height = 0
+        for widget in self._items:
+            w, h = widget.winfo_reqwidth(), widget.winfo_reqheight()
+            if x > 0 and x + w > width:
+                x, y, row_height = 0, y + row_height + FLOW_PAD, 0
+            placed.append((widget, x, y))
+            x += w + FLOW_PAD
+            row_height = max(row_height, h)
+        return placed, y + row_height
+
+    def _relayout(self, width: int) -> None:
+        if width <= 1:  # not mapped yet; the first real Configure lays it out
+            return
+        placed, height = self._positions(width)
+        for widget, x, y in placed:
+            widget.place(x=x, y=y)
+        self.configure(height=height)
+
+
+def _wrap_label(label: ttk.Label, container: tk.Misc) -> None:
+    """Re-wrap a long status line whenever its container changes width."""
+    container.bind(
+        "<Configure>",
+        lambda e: label.configure(wraplength=max(120, e.width - 2 * WINDOW_GUTTER)),
+        add="+",
+    )
+
+
 class LivestreamApp:
     """Tkinter window with the live preview, resolution selector, folder box and record
     button."""
@@ -674,76 +741,99 @@ class LivestreamApp:
         root.title("GoPro Livestream")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.video = ttk.Label(root, anchor="center")
-        self.video.pack(fill="both", expand=True, padx=8, pady=8)
+        # The window is a grid: the preview row takes all spare height and shrinks
+        # first, so the controls below always keep the room they need.
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+        self._video_host = ttk.Frame(
+            root, width=DISPLAY_WIDTH, height=DISPLAY_WIDTH * 9 // 16
+        )
+        self._video_host.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.video = ttk.Label(self._video_host, anchor="center")
+        self.video.place(x=0, y=0, relwidth=1, relheight=1)
         self._show_message("Connecting to GoPro...")
 
         self.picker = ModePicker(
             controller.catalog,
             load_mode(config_file, controller.catalog),
         )
+        row = 1
         modes_frame = ttk.Frame(root)
-        modes_frame.pack(fill="x", padx=8, pady=(0, 4))
+        modes_frame.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 4))
         self._build_mode_rows(modes_frame)
+        row += 1
 
         if self.motion_runner is not None:
             motion_frame = ttk.Frame(root)
-            motion_frame.pack(fill="x", padx=8, pady=(0, 4))
+            motion_frame.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 4))
             self._build_motion_row(motion_frame)
+            row += 1
 
         controls = ttk.Frame(root)
-        controls.pack(fill="x", padx=8, pady=(0, 8))
+        controls.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 8))
+        controls_flow = _Flow(controls)
+        controls_flow.pack(fill="x")
+        row += 1
 
-        self.record_button = tk.Button(
-            controls, text="Start recording", width=16, command=self._on_record
-        )
-        self.record_button.pack(side="right")
-        if self.motion_runner is not None:
-            self.robot_button = tk.Button(
-                controls, text="Move to Start", width=14, command=self._on_robot_button
-            )
-            self.robot_button.pack(side="right", padx=(0, 8))
-
-        # Packed right-to-left, so the label sits left of the box, which sits left
-        # of the button.
-        self.folder = tk.StringVar(value=folder)
-        self.folder_entry = ttk.Entry(controls, textvariable=self.folder, width=16)
-        self.folder_entry.pack(side="right", padx=(0, 8))
-        self.folder_entry.bind("<Return>", self._on_config_commit)
-        self.folder_entry.bind("<FocusOut>", self._on_config_commit)
-        ttk.Label(controls, text="Folder:").pack(side="right", padx=(8, 4))
-
+        # Wrapping rows: label + box pairs, then the buttons.
         self.image = tk.StringVar(value=image)
-        self.image_entry = ttk.Entry(controls, textvariable=self.image, width=14)
-        self.image_entry.pack(side="right", padx=(0, 8))
+        image_box = ttk.Frame(controls_flow)
+        ttk.Label(image_box, text="Image:").pack(side="left", padx=(0, 4))
+        self.image_entry = ttk.Entry(image_box, textvariable=self.image, width=14)
+        self.image_entry.pack(side="left")
         self.image_entry.bind("<Return>", self._on_config_commit)
         self.image_entry.bind("<FocusOut>", self._on_config_commit)
-        ttk.Label(controls, text="Image:").pack(side="right", padx=(8, 4))
+        controls_flow.add(image_box)
+
+        self.folder = tk.StringVar(value=folder)
+        folder_box = ttk.Frame(controls_flow)
+        ttk.Label(folder_box, text="Folder:").pack(side="left", padx=(0, 4))
+        self.folder_entry = ttk.Entry(folder_box, textvariable=self.folder, width=16)
+        self.folder_entry.pack(side="left")
+        self.folder_entry.bind("<Return>", self._on_config_commit)
+        self.folder_entry.bind("<FocusOut>", self._on_config_commit)
+        controls_flow.add(folder_box)
+
+        if self.motion_runner is not None:
+            self.robot_button = tk.Button(
+                controls_flow,
+                text="Move to Start",
+                width=14,
+                command=self._on_robot_button,
+            )
+            controls_flow.add(self.robot_button)
+        self.record_button = tk.Button(
+            controls_flow, text="Start recording", width=16, command=self._on_record
+        )
+        controls_flow.add(self.record_button)
 
         effects = ttk.Frame(root)
-        effects.pack(fill="x", padx=8, pady=(0, 4))
+        effects.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 4))
+        effects_flow = _Flow(effects)
+        effects_flow.pack(fill="x")
+        row += 1
         self.flash_enabled_var = tk.BooleanVar(value=flash_enabled)
         self.fades_enabled_var = tk.BooleanVar(value=fades_enabled)
         self._flash_checkbutton = ttk.Checkbutton(
-            effects,
+            effects_flow,
             text="Enable camera flash effect",
             variable=self.flash_enabled_var,
             command=self._on_config_commit,
         )
-        self._flash_checkbutton.pack(side="left", padx=(0, 12))
+        effects_flow.add(self._flash_checkbutton)
         self._fades_checkbutton = ttk.Checkbutton(
-            effects,
+            effects_flow,
             text="Enable image fade effects",
             variable=self.fades_enabled_var,
             command=self._on_config_commit,
         )
-        self._fades_checkbutton.pack(side="left")
+        effects_flow.add(self._fades_checkbutton)
         self._saved_config = (folder, image, flash_enabled, fades_enabled)
 
         self.status = tk.StringVar()
-        ttk.Label(root, textvariable=self.status, anchor="w").pack(
-            fill="x", padx=8, pady=(0, 8)
-        )
+        status_label = ttk.Label(root, textvariable=self.status, anchor="w")
+        status_label.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 8))
+        _wrap_label(status_label, root)
 
         self._update_controls()
         self._run(
@@ -753,7 +843,32 @@ class LivestreamApp:
         )
         if self.motion_runner is not None:
             self._start_robot_check()
+        self._set_minimum_size()
         root.after(15, self._poll)
+
+    def _set_minimum_size(self) -> None:
+        """Stop the window shrinking below what the controls need. The preview can
+        shrink to VIDEO_MIN_HEIGHT; everything else stays fully visible."""
+        self.root.update_idletasks()
+        flows = [w for w in self._all_children(self.root) if isinstance(w, _Flow)]
+        min_w = max(
+            MIN_WINDOW_WIDTH,
+            max((f.min_width() for f in flows), default=0) + 2 * WINDOW_GUTTER,
+        )
+        # Height of the controls when every flow wraps to its narrowest width.
+        flow_heights_now = sum(f.winfo_reqheight() for f in flows)
+        flow_heights_min = sum(f.height_for(min_w) for f in flows)
+        other = self.root.winfo_reqheight() - self._video_host.winfo_reqheight()
+        min_h = VIDEO_MIN_HEIGHT + other - flow_heights_now + flow_heights_min
+        self.root.minsize(min_w, min_h)
+
+    @classmethod
+    def _all_children(cls, widget: tk.Misc) -> list[tk.Misc]:
+        found: list[tk.Misc] = []
+        for child in widget.winfo_children():
+            found.append(child)
+            found.extend(cls._all_children(child))
+        return found
 
     # Camera operations ------------------------------------------------------
 
@@ -803,44 +918,51 @@ class LivestreamApp:
         Zoom is continuous: the slider moves freely, and the camera is only
         changed when the user lets go of it.
         """
+        # Each axis is a labelled group with its options side by side; the groups
+        # wrap onto a second row on a narrow screen.
+        flow = _Flow(parent)
+        flow.pack(fill="x")
         self._mode_vars: dict[str, tk.StringVar] = {}
         self._mode_buttons: dict[str, list[ttk.Radiobutton]] = {}
-        for row, axis in enumerate(DISCRETE_AXES):
-            ttk.Label(parent, text=MODE_AXIS_TITLES[axis], width=10, anchor="w").grid(
-                row=row, column=0, sticky="w"
+        for axis in DISCRETE_AXES:
+            group = ttk.LabelFrame(
+                flow, text=MODE_AXIS_TITLES[axis], padding=(6, 0, 6, 4)
             )
             var = tk.StringVar(value=self.picker.selected_text(axis))
             self._mode_vars[axis] = var
-            self._mode_buttons[axis] = [
-                ttk.Radiobutton(
-                    parent,
+            self._mode_buttons[axis] = []
+            for opt in self.picker.options(axis):
+                button = ttk.Radiobutton(
+                    group,
                     text=opt.text,
                     value=opt.text,
                     variable=var,
                     command=functools.partial(self._on_mode_pick, axis),
                 )
-                for opt in self.picker.options(axis)
-            ]
-            for column, button in enumerate(self._mode_buttons[axis], start=1):
-                button.grid(row=row, column=column, sticky="w", padx=4)
+                button.pack(side="left", padx=2)
+                self._mode_buttons[axis].append(button)
+            flow.add(group)
 
-        zoom_row = len(DISCRETE_AXES)
-        ttk.Label(parent, text=MODE_AXIS_TITLES["zoom"], width=10, anchor="w").grid(
-            row=zoom_row, column=0, sticky="w"
+        zoom_group = ttk.LabelFrame(
+            flow, text=MODE_AXIS_TITLES["zoom"], padding=(6, 0, 6, 4)
         )
         self._zoom_var = tk.DoubleVar(value=self.picker.mode.zoom)
         self._zoom_scale = ttk.Scale(
-            parent,
+            zoom_group,
             from_=0,
             to=ZOOM_MAX_PERCENT,
             variable=self._zoom_var,
             command=self._on_zoom_drag,
+            length=200,
         )
-        self._zoom_scale.grid(row=zoom_row, column=1, columnspan=6, sticky="we", padx=4)
+        self._zoom_scale.pack(side="left", padx=2)
         self._zoom_scale.bind("<ButtonRelease-1>", self._on_zoom_release)
         self._zoom_scale.bind("<KeyRelease>", self._on_zoom_release)
-        self._zoom_label = ttk.Label(parent, text=f"{self.picker.mode.zoom}%", width=6)
-        self._zoom_label.grid(row=zoom_row, column=7, sticky="w")
+        self._zoom_label = ttk.Label(
+            zoom_group, text=f"{self.picker.mode.zoom}%", width=6
+        )
+        self._zoom_label.pack(side="left", padx=2)
+        flow.add(zoom_group)
         self._update_mode_states()
 
     def _on_mode_pick(self, axis: str) -> None:
@@ -1141,21 +1263,24 @@ class LivestreamApp:
     def _build_motion_row(self, parent: ttk.Frame) -> None:
         """One button per motion plus "No motion"; disabled motions stay visible
         and show their reason on mouse-over."""
-        ttk.Label(parent, text="Motion", width=10, anchor="w").pack(side="left")
+        flow = _Flow(parent)
+        flow.pack(fill="x")
+        flow.add(ttk.Label(flow, text="Motion", width=10, anchor="w"))
         names: list[str | None] = [None]
         names += sorted(set(self.motions) | set(self._motion_reasons))
         for name in names:
             button = tk.Button(
-                parent,
+                flow,
                 text=self._motion_label(name),
                 command=functools.partial(self._on_motion_click, name),
             )
-            button.pack(side="left", padx=2)
             button.bind("<Enter>", functools.partial(self._on_motion_hover, name))
             self.motion_buttons[name] = button
-        ttk.Label(parent, textvariable=self.robot_status, anchor="w").pack(
-            side="left", fill="x", expand=True, padx=(8, 0)
-        )
+            flow.add(button)
+        # The reason line sits under the buttons, wrapped to the window width.
+        status = ttk.Label(parent, textvariable=self.robot_status, anchor="w")
+        status.pack(fill="x", pady=(4, 0))
+        _wrap_label(status, parent)
 
     def _motion_label(self, name: str | None) -> str:
         """Button text; portrait motions are marked (D11)."""
@@ -1474,12 +1599,22 @@ class LivestreamApp:
         frame = self.reader.latest_frame()
         # Ignore frames still buffered from before the preview was paused.
         if frame is not None and not self._recording:
-            height, width = frame.shape[:2]
-            scale = DISPLAY_WIDTH / width
-            self._last_frame = cv2.resize(frame, (DISPLAY_WIDTH, int(height * scale)))
+            self._last_frame = self._fit_to_video(frame)
             self._show_frame(self._last_frame)
 
         self.root.after(15, self._poll)
+
+    def _fit_to_video(self, frame: Any) -> Any:
+        """Scale a camera frame to fill the preview area, keeping its aspect ratio."""
+        height, width = frame.shape[:2]
+        avail_w = self._video_host.winfo_width()
+        avail_h = self._video_host.winfo_height()
+        if avail_w <= 1 or avail_h <= 1:  # not laid out yet
+            scale = DISPLAY_WIDTH / width
+        else:
+            scale = min(avail_w / width, avail_h / height)
+        size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return cv2.resize(frame, size)
 
     def _show_frame(self, frame: Any) -> None:
         image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
