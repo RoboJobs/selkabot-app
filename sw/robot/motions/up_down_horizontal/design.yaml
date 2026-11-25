@@ -36,20 +36,21 @@ keyframes:
   - 29.6695
   - -89.5659
   - 45.7689
-- t: 2.03
+- t: 1.7
   pos:
   - 129.857
-  - -758.337
-  - -509.722
+  - -889
+  - -397
   pan: -90.0
-  tilt: 20.0
+  tilt: 25.0
   seed:
-  - 90.0
-  - 71.0
+  - 89.0
+  - 60.0
   - 0.0
-  - -181.0
+  - -175.0
   - -90.0
   - 45.0
 limits:
-  max_tcp_speed_mm_s: 1500.0
-  max_joint_speed_deg_s: 170.0
+  max_tcp_speed_mm_s: 1800.0
+  max_joint_speed_deg_s: 200.0
+  max_joint_acc_deg_s2: 800
