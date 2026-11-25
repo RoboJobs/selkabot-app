@@ -69,6 +69,10 @@ class _FakeProxy:
         self._outer.file_upload_calls.append((file_type, name))
         return self._outer.file_upload_rtn
 
+    def LuaUpLoadUpdate(self, name: str) -> list:
+        self._outer.lua_registered.append(name)
+        return [self._outer.lua_update_rtn, ""]
+
 
 class FakeRobotClient:
     """Records every call. `errors[name] = code` injects a failure for `name`."""
@@ -83,6 +87,8 @@ class FakeRobotClient:
 
         self.file_upload_rtn = 0
         self.file_upload_calls: list[tuple[int, str]] = []
+        self.lua_registered: list[str] = []  # names passed to LuaUpLoadUpdate
+        self.lua_update_rtn = 0
         self.files: dict[str, bytes] = {}  # remote path -> bytes, for ComputeFileMD5
         self.deleted_files: list[str] = []
         self.tpd_loaded: str | None = None

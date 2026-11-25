@@ -18,7 +18,8 @@ from contextlib import contextmanager
 from typing import Any, Protocol
 
 DATA_PORT = 20010
-ALLOWED_UPLOAD_TYPES = (0, 20)  # 0 = Lua, 20 = Trajectory J (TPD files use this)
+LUA_FILE_TYPE = 0
+ALLOWED_UPLOAD_TYPES = (LUA_FILE_TYPE, 20)  # 0 = Lua, 20 = Trajectory J (TPD files)
 TRAJ_DIR = "/fruser/traj"
 # MoveTPD blend: 1 = controller smoothing. Default for every motion: without
 # it the joints were audibly rough at low playback speeds (2026-11-25).
@@ -36,7 +37,10 @@ class FairinoError(RuntimeError):
 
 
 class FileTransferError(RuntimeError):
-    """A controller file upload failed. `stage` is request/connect/transfer/verify."""
+    """A controller file upload failed.
+
+    `stage` is request/connect/transfer/register/verify.
+    """
 
     def __init__(self, stage: str, detail: Any = None) -> None:
         self.stage = stage
@@ -311,6 +315,14 @@ class FR5:
             sock.close()
         if reply[:7] != b"SUCCESS":
             raise FileTransferError("transfer", reply[:64])
+        if file_type == LUA_FILE_TYPE:
+            # The SDK's LuaUpload follows the transfer with LuaUpLoadUpdate,
+            # which registers the program in /fruser/; without it the file is
+            # not there (real robot, 2026-11-25: ComputeFileMD5 "not found").
+            rtn = self.client.robot.LuaUpLoadUpdate(name)
+            code = rtn[0] if isinstance(rtn, (list, tuple)) else rtn
+            if code != 0:
+                raise FileTransferError("register", rtn)
 
         remote = f"{TRAJ_DIR}/{name}" if file_type == 20 else f"/fruser/{name}"
         local_md5 = hashlib.md5(data).hexdigest()

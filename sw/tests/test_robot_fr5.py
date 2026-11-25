@@ -390,6 +390,41 @@ def test_upload_file_succeeds_when_listener_starts_late(client, data_port, tmp_p
     assert server.received.endswith(data + b"/b/f")
 
 
+def test_upload_lua_registers_the_program_before_verifying(client, data_port, tmp_path):
+    local = tmp_path / "motion_demo.lua"
+    local.write_text("P = {}\n")
+    server = data_port(store_as=(client, "/fruser/motion_demo.lua"))
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+
+    remote = robot.upload_file(str(local), file_type=0)
+
+    assert remote == "/fruser/motion_demo.lua"
+    assert client.file_upload_calls == [(0, "motion_demo.lua")]
+    assert client.lua_registered == ["motion_demo.lua"]
+
+
+def test_upload_lua_raises_register_when_the_controller_refuses(
+    client, data_port, tmp_path
+):
+    local = tmp_path / "motion_demo.lua"
+    local.write_text("P = {}\n")
+    server = data_port(store_as=(client, "/fruser/motion_demo.lua"))
+    client.lua_update_rtn = 7
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+    with pytest.raises(fr5.FileTransferError) as exc:
+        robot.upload_file(str(local), file_type=0)
+    assert exc.value.stage == "register"
+
+
+def test_upload_traj_does_not_register_a_program(client, data_port, tmp_path):
+    local = tmp_path / "motion_demo.txt"
+    local.write_text("1,1,8,0,0,0\n")
+    server = data_port(store_as=(client, "/fruser/traj/motion_demo.txt"))
+    robot = _robot_for_upload(client, server.port, poll_step_s=0.02)
+    robot.upload_file(str(local), file_type=20)
+    assert client.lua_registered == []
+
+
 def test_upload_file_raises_connect_when_listener_never_starts(client, tmp_path):
     local = tmp_path / "motion_demo.txt"
     local.write_text("x")
